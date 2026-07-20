@@ -42,7 +42,7 @@ bot roster model (is_bot → bots map, users.info for unknowns)
 - [x] History pagination — up to **5×100** on slow queue; accumulate → chronological flush  
 - [x] Members pagination — up to **3×200** on slow queue  
 - [x] Unknown members → **`users.info`** (slow, capped); no stub nicks  
-- [x] Nicklist **Here / Away** groups (presence); bots purged  
+- [x] Nicklist **Here / Away** groups + **`presence_sub`** (RTM); bots purged  
 - [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe)  
 - [x] Buflist trigger includes `weeslack` (export conf)  
 - [~] Buffer close keeps model (by design)  
