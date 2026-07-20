@@ -1733,7 +1733,8 @@ static void slack_event_history_cb(struct t_weeslack_workspace *workspace,
 static int
 slack_event_history_request(struct t_weeslack_workspace *workspace,
                             struct t_slack_history_ctx *ctx,
-                            const char *cursor)
+                            const char *cursor,
+                            const char *latest)
 {
     struct json_object *params;
     const char *method;
@@ -1764,6 +1765,14 @@ slack_event_history_request(struct t_weeslack_workspace *workspace,
     if (cursor && cursor[0])
         json_object_object_add(params, "cursor",
                                json_object_new_string(cursor));
+    else if (latest && latest[0])
+    {
+        /* older API shape: page older than this ts (exclusive) */
+        json_object_object_add(params, "latest",
+                               json_object_new_string(latest));
+        json_object_object_add(params, "inclusive",
+                               json_object_new_boolean(0));
+    }
 
     if (!slack_http_request_new_flags(workspace, method, params,
                                       SLACK_HTTP_SLOW,
@@ -1867,25 +1876,60 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
 
     ctx->page++;
 
-    if ((has_more || next_cursor) && ctx->page < SLACK_HISTORY_MAX_PAGES &&
-        next_cursor)
     {
-        char *cursor_copy = strdup(next_cursor);
-        json_object_put(json);
-        if (cursor_copy &&
-            slack_event_history_request(workspace, ctx, cursor_copy))
+        char latest_buf[64];
+        const char *page_cursor = next_cursor;
+        const char *page_latest = NULL;
+
+        latest_buf[0] = '\0';
+        /* Prefer cursor; fall back to oldest message ts as latest= for older
+         * responses that only set has_more. */
+        if (!page_cursor && has_more && messages_obj)
         {
+            int mcount = json_object_array_length(messages_obj);
+            if (mcount > 0)
+            {
+                struct json_object *oldest =
+                    json_object_array_get_idx(messages_obj, mcount - 1);
+                struct json_object *ots;
+                if (oldest &&
+                    json_object_object_get_ex(oldest, "ts", &ots))
+                {
+                    const char *ots_s = json_object_get_string(ots);
+                    if (ots_s && ots_s[0])
+                    {
+                        snprintf(latest_buf, sizeof(latest_buf), "%s", ots_s);
+                        page_latest = latest_buf;
+                    }
+                }
+            }
+        }
+
+        if ((page_cursor || page_latest) &&
+            ctx->page < SLACK_HISTORY_MAX_PAGES)
+        {
+            char *cursor_copy = page_cursor ? strdup(page_cursor) : NULL;
+            char *latest_copy = page_latest ? strdup(page_latest) : NULL;
+
+            json_object_put(json);
+            if (slack_event_history_request(workspace, ctx,
+                                            cursor_copy, latest_copy))
+            {
+                free(cursor_copy);
+                free(latest_copy);
+                return;
+            }
             free(cursor_copy);
+            free(latest_copy);
+            ctx->truncated = 1;
+            slack_event_history_flush(workspace, ctx);
             return;
         }
-        free(cursor_copy);
-        /* fall through to flush what we have */
-        ctx->truncated = 1;
-        slack_event_history_flush(workspace, ctx);
-        return;
     }
 
     if ((has_more || next_cursor) && ctx->page >= SLACK_HISTORY_MAX_PAGES)
+        ctx->truncated = 1;
+    else if (has_more || next_cursor)
         ctx->truncated = 1;
 
     json_object_put(json);
@@ -1940,7 +1984,7 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
         }
     }
 
-    if (!slack_event_history_request(workspace, ctx, NULL))
+    if (!slack_event_history_request(workspace, ctx, NULL, NULL))
     {
         channel->history_state = 0;
         slack_event_history_ctx_free(ctx);
