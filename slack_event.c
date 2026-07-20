@@ -1037,10 +1037,49 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
     if (strcmp(type, "hello") == 0)
     {
         workspace->connected = 1;
+        if (workspace->ws)
+            workspace->ws->reconnect_delay = 1;
         SLACK_WS_PRINTF(workspace, "%sweeslack: connected to %s as %s",
                         weechat_prefix("network"),
                         workspace->name,
                         workspace->my_user_id ? workspace->my_user_id : "?");
+        return;
+    }
+
+    /* Server asks client to disconnect and open a new RTM session */
+    if (strcmp(type, "goodbye") == 0)
+    {
+        SLACK_WS_PRINTF(workspace, "%sweeslack: server goodbye — reconnecting…",
+                        weechat_prefix("network"));
+        workspace->connected = 0;
+        if (workspace->ws)
+            slack_ws_reconnect(workspace->ws);
+        return;
+    }
+
+    if (strcmp(type, "error") == 0)
+    {
+        struct json_object *err_obj, *code_obj, *msg_obj;
+        int code = 0;
+        const char *emsg = NULL;
+
+        if (json_object_object_get_ex(json, "error", &err_obj))
+        {
+            if (json_object_object_get_ex(err_obj, "code", &code_obj))
+                code = json_object_get_int(code_obj);
+            if (json_object_object_get_ex(err_obj, "msg", &msg_obj))
+                emsg = json_object_get_string(msg_obj);
+        }
+        SLACK_WS_PRINTF(workspace, "%sweeslack: RTM error %d: %s",
+                        weechat_prefix("error"), code,
+                        emsg ? emsg : "(no message)");
+        /* fatal-ish codes: force reconnect with fresh rtm.connect */
+        if (code == 1 || code == 2 || code == 3)
+        {
+            workspace->connected = 0;
+            if (workspace->ws)
+                slack_ws_reconnect(workspace->ws);
+        }
         return;
     }
 
@@ -5010,6 +5049,17 @@ slack_event_leave_channel(struct t_weeslack_workspace *workspace,
     json_object_put(params);
 }
 
+struct t_slack_whois_ctx
+{
+    char *user_id;
+    struct t_gui_buffer *buffer;
+};
+
+/* defined later — live presence for whois */
+static void slack_event_presence_cb(struct t_weeslack_workspace *workspace,
+                                    int return_code, const char *output,
+                                    void *user_data);
+
 void
 slack_event_whois(struct t_weeslack_workspace *workspace,
                   const char *name_or_id,
@@ -5019,7 +5069,6 @@ slack_event_whois(struct t_weeslack_workspace *workspace,
     struct t_gui_buffer *out;
     const char *presence;
 
-    (void) workspace;
     out = buffer ? buffer : NULL;
 
     if (!name_or_id || !name_or_id[0])
@@ -5137,4 +5186,230 @@ slack_event_whois(struct t_weeslack_workspace *workspace,
     if (user->deleted)
         weechat_printf(out, "%s  (deleted)",
                         weechat_prefix("network"));
+
+    /* live presence via users.getPresence */
+    if (workspace && user->id && user->id[0])
+    {
+        struct t_slack_whois_ctx *ctx = calloc(1, sizeof(*ctx));
+        struct json_object *params;
+
+        if (ctx)
+        {
+            ctx->user_id = strdup(user->id);
+            ctx->buffer = out;
+            params = json_object_new_object();
+            json_object_object_add(params, "user",
+                                   json_object_new_string(user->id));
+            slack_http_request_new(workspace, "users.getPresence", params,
+                                   slack_event_presence_cb, ctx);
+            json_object_put(params);
+        }
+    }
+}
+
+/* ============================================================
+ * RTM reconnect (fresh rtm.connect URL — no full bootstrap)
+ * ============================================================ */
+
+static void
+slack_event_rtm_reconnect_cb(struct t_weeslack_workspace *workspace,
+                             int return_code, const char *output,
+                             void *user_data)
+{
+    struct json_object *json, *url_obj;
+
+    (void) user_data;
+
+    if (return_code != 0 || !output)
+    {
+        SLACK_WS_PRINTF(workspace,
+                        "%sweeslack: rtm.connect (reconnect) failed (rc=%d)",
+                        weechat_prefix("error"), return_code);
+        if (workspace && workspace->ws)
+            slack_ws_reconnect(workspace->ws);
+        return;
+    }
+
+    json = slack_json_decode(output);
+    if (!json)
+    {
+        if (workspace && workspace->ws)
+            slack_ws_reconnect(workspace->ws);
+        return;
+    }
+
+    if (slack_api_check_error(workspace, json, "rtm.connect"))
+    {
+        json_object_put(json);
+        if (workspace && workspace->ws)
+            slack_ws_reconnect(workspace->ws);
+        return;
+    }
+
+    if (json_object_object_get_ex(json, "url", &url_obj))
+    {
+        const char *ws_url = json_object_get_string(url_obj);
+        if (!workspace->ws)
+            workspace->ws = slack_ws_new(workspace);
+        if (workspace->ws && ws_url)
+        {
+            SLACK_WS_PRINTF(workspace,
+                            "%sweeslack: reconnected session — new websocket URL",
+                            weechat_prefix("network"));
+            slack_ws_connect(workspace->ws, ws_url);
+        }
+    }
+
+    json_object_put(json);
+}
+
+void
+slack_event_rtm_reconnect(struct t_weeslack_workspace *workspace)
+{
+    struct json_object *params;
+
+    if (!workspace || !workspace->token || !workspace->token[0])
+        return;
+
+    workspace->connected = 0;
+    params = json_object_new_object();
+    json_object_object_add(params, "batch_presence_aware",
+                           json_object_new_int(1));
+    slack_http_request_new(workspace, "rtm.connect", params,
+                           slack_event_rtm_reconnect_cb, NULL);
+    json_object_put(params);
+}
+
+/* ============================================================
+ * Directory refresh (users + emoji, no channel re-list)
+ * ============================================================ */
+
+static void
+slack_event_refresh_users_cb(struct t_weeslack_workspace *workspace,
+                             int return_code, const char *output,
+                             void *user_data)
+{
+    (void) user_data;
+
+    /* Reuse users.list parsing by calling the normal users path without
+     * continuing bootstrap: parse here lightly then fetch emoji. */
+    if (return_code == 0 && output)
+    {
+        struct json_object *json = slack_json_decode(output);
+        if (json && !slack_api_check_error(workspace, json, "users.list"))
+        {
+            struct json_object *members_obj;
+            if (json_object_object_get_ex(json, "members", &members_obj))
+            {
+                int count = json_object_array_length(members_obj);
+                int i;
+                for (i = 0; i < count; i++)
+                {
+                    struct json_object *u_obj =
+                        json_object_array_get_idx(members_obj, i);
+                    struct json_object *id_obj, *name_obj;
+                    const char *uid = NULL, *uname = NULL;
+                    if (json_object_object_get_ex(u_obj, "id", &id_obj))
+                        uid = json_object_get_string(id_obj);
+                    if (json_object_object_get_ex(u_obj, "name", &name_obj))
+                        uname = json_object_get_string(name_obj);
+                    if (!uid)
+                        continue;
+                    if (!uname || !uname[0])
+                        uname = uid;
+                    {
+                        struct t_slack_user *user = slack_user_new(uid, uname,
+                                                                   NULL);
+                        if (user)
+                            slack_user_update(user, u_obj);
+                    }
+                }
+            }
+            {
+                int total = 0;
+                struct t_slack_user *u;
+                for (u = slack_user_list_global(); u; u = u->next)
+                    total++;
+                SLACK_WS_PRINTF(workspace, "%sweeslack: refreshed %d users",
+                                weechat_prefix("network"), total);
+            }
+        }
+        if (json)
+            json_object_put(json);
+    }
+    else
+    {
+        SLACK_WS_PRINTF(workspace, "%sweeslack: users refresh failed (rc=%d)",
+                        weechat_prefix("error"), return_code);
+    }
+
+    /* refresh emoji map only (no bootstrap chain) */
+    slack_event_fetch_emoji(workspace);
+}
+
+void
+slack_event_refresh_directory(struct t_weeslack_workspace *workspace)
+{
+    struct json_object *params;
+
+    if (!workspace)
+        return;
+
+    params = json_object_new_object();
+    json_object_object_add(params, "limit", json_object_new_int(200));
+    slack_http_request_new(workspace, "users.list", params,
+                           slack_event_refresh_users_cb, NULL);
+    json_object_put(params);
+}
+
+/* ============================================================
+ * Presence for whois
+ * ============================================================ */
+
+static void
+slack_event_presence_cb(struct t_weeslack_workspace *workspace,
+                        int return_code, const char *output,
+                        void *user_data)
+{
+    struct t_slack_whois_ctx *ctx = user_data;
+    struct json_object *json, *pres_obj, *online_obj;
+    const char *presence = NULL;
+    int online = -1;
+    struct t_slack_user *user;
+
+    (void) workspace;
+
+    if (!ctx)
+        return;
+
+    if (return_code == 0 && output)
+    {
+        json = slack_json_decode(output);
+        if (json && !slack_api_check_error(workspace, json, "users.getPresence"))
+        {
+            if (json_object_object_get_ex(json, "presence", &pres_obj))
+                presence = json_object_get_string(pres_obj);
+            if (json_object_object_get_ex(json, "online", &online_obj))
+                online = json_object_get_boolean(online_obj) ? 1 : 0;
+
+            user = ctx->user_id ? slack_user_search(ctx->user_id) : NULL;
+            if (user && presence && presence[0])
+            {
+                free(user->presence);
+                user->presence = strdup(presence);
+            }
+
+            weechat_printf(ctx->buffer,
+                            "%s  presence (live): %s%s%s",
+                            weechat_prefix("network"),
+                            presence ? presence : "?",
+                            online >= 0 ? (online ? " (online)" : " (away)") : "",
+                            "");
+        }
+        if (json)
+            json_object_put(json);
+    }
+
+    free(ctx->user_id);
+    free(ctx);
 }

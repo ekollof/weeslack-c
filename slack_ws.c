@@ -489,8 +489,17 @@ slack_ws_reconnect_cb(const void *pointer, void *data,
 
     ws->hook_reconnect = NULL;
 
-    if (ws->workspace->ws_url)
-        slack_ws_connect(ws, ws->workspace->ws_url);
+    /*
+     * RTM WebSocket URLs from rtm.connect expire quickly. Always re-issue
+     * rtm.connect for a fresh URL instead of reusing workspace->ws_url.
+     */
+    if (ws->workspace)
+    {
+        if (ws->workspace->token && ws->workspace->token[0])
+            slack_event_rtm_reconnect(ws->workspace);
+        else if (ws->workspace->ws_url)
+            slack_ws_connect(ws, ws->workspace->ws_url);
+    }
 
     return WEECHAT_RC_OK;
 }

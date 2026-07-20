@@ -1,6 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — HTML unescape, whois/join/leave, dnd/deleted RTM
+**Last update:** 2026-07-20 — fresh rtm reconnect, goodbye/error RTM,
+whois presence, /cslack refresh
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -9,6 +10,8 @@
 ## Phase 1: Core Connectivity
 
 - [x] WebSocket RTM — TLS+SNI, masking, ping/pong, reconnect backoff  
+- [x] Reconnect re-issues **`rtm.connect`** (fresh URL; stale WS URLs expire)  
+- [x] RTM `goodbye` / `error` → reconnect path  
 - [x] HTTP — `hook_url`, Bearer + cookie, `ipresolve=v4`, POST form bodies  
 - [x] **Request queue (wee-slack model)**  
   - Fast queue + **slow queue** (history/members; ≤1 promote/sec)  
@@ -75,7 +78,7 @@
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
 - [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
-- [x] **`whois`**, **`join`**, **`leave`/`part`**  
+- [x] **`whois`** (+ live `users.getPresence`), **`join`**, **`leave`/`part`**, **`refresh`**  
 - [x] Stars list — resolve channel/user names, format text (cap 40 shown)  
 - [x] Search list — resolve names, format text (cap 20 shown)  
 - [~] subscribe = local thread notify only  

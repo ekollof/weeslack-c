@@ -98,5 +98,9 @@ extern void slack_event_leave_channel(struct t_weeslack_workspace *workspace,
 extern void slack_event_whois(struct t_weeslack_workspace *workspace,
                               const char *name_or_id,
                               struct t_gui_buffer *buffer);
+/* Re-issue rtm.connect for a fresh WebSocket URL (after drop / goodbye). */
+extern void slack_event_rtm_reconnect(struct t_weeslack_workspace *workspace);
+/* Refresh users.list + emoji.list without full connect bootstrap. */
+extern void slack_event_refresh_directory(struct t_weeslack_workspace *workspace);
 
 #endif

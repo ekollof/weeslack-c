@@ -1071,6 +1071,20 @@ weeslack_command_cslack(const void *pointer, void *data,
         }
         slack_event_whois(ws, argv[2], weeslack_cmd_buffer(buffer));
     }
+    else if (weechat_strcasecmp(argv[1], "refresh") == 0)
+    {
+        struct t_weeslack_workspace *ws;
+        ws = weeslack_workspace_search("default");
+        if (!ws || !ws->connected)
+        {
+            weechat_printf(buffer, "%sweeslack: not connected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        weechat_printf(buffer, "%sweeslack: refreshing users + emoji…",
+                        weechat_prefix("network"));
+        slack_event_refresh_directory(ws);
+    }
     else if (weechat_strcasecmp(argv[1], "join") == 0)
     {
         struct t_weeslack_workspace *ws;
@@ -1202,11 +1216,13 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %ssearch%s <query> Search messages",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %swhois%s <user>  User info",
+        weechat_printf(buffer, "  %swhois%s <user>  User info (+ live presence)",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sjoin%s <#ch|id> Join a channel",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sleave%s [id]    Leave channel (alias: part)",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %srefresh%s       Re-fetch users + emoji",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %shelp%s         Show this help",
                         weechat_color("cyan"), weechat_color("reset"));
@@ -1968,7 +1984,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_command(
         "cslack",
         "Slack protocol commands",
-        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || help",
+        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || help",
         "connect:      Connect to Slack using configured token\n"
         "disconnect:   Disconnect from Slack\n"
         "migrate:      Import token from wee-slack (python) config\n"
@@ -2004,11 +2020,12 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "stars:        List starred items\n"
         "star:         Star a message ([ts]; default last msg)\n"
         "unstar:       Unstar a message\n"
-        "whois:        Show local user info by name or id\n"
+        "whois:        Show user info by name or id (live presence)\n"
         "join:         Join a channel by name or id\n"
         "leave / part: Leave current (or given) channel\n"
+        "refresh:      Re-fetch users.list + emoji.list (no re-bootstrap)\n"
         "help:         Show help",
-        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join|leave|part|help",
+        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join|leave|part|refresh|help",
         &weeslack_command_cslack,
         NULL,
         NULL);
