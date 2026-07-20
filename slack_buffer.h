@@ -41,5 +41,11 @@ extern void slack_buffer_clear_hotlist(struct t_gui_buffer *buffer);
 extern void slack_buffer_set_typing(struct t_slack_channel *channel,
                                      const char *user_name);
 extern void slack_buffer_update_user_presence(struct t_slack_user *user);
+/*
+ * In-place rewrite of a printed line matching tag slack_ts_<ts>
+ * (wee-slack modify_buffer_line via hdata_update). Returns 1 if updated.
+ */
+extern int slack_buffer_modify_line(struct t_gui_buffer *buffer, SlackTS ts,
+                                     const char *new_message);
 
 #endif

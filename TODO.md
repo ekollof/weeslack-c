@@ -30,8 +30,8 @@ never_away, /me → chat.meMessage; weemoji.json
 - [x] Workspace stable `id` vs display `name`  
 - [x] Custom emoji map via **`emoji.list`** (+ **refresh-only** on `emoji_changed`; no re-bootstrap)  
 - [x] Bots — `is_bot` / `is_app_user` registered in bot map; **hidden from nicklist** (wee-slack style)  
-- [~] SlackMessage — list model; edit not in-place line rewrite  
-- [x] Reaction list maintained on RTM add/remove (notice lines; no in-place rewrite)  
+- [x] SlackMessage — list model + **in-place line rewrite** via `hdata_update`  
+- [x] Reaction list maintained; **rewrites line** on RTM add/remove (notice fallback)  
 
 ---
 
@@ -61,7 +61,9 @@ never_away, /me → chat.meMessage; weemoji.json
 - [x] **weemoji.json** from WeeChat data/sharedir (standard unicode map + completion)  
 - [x] Bold/italic/strikethrough honor config (`render_*_as`)  
 - [x] Thread-in-channel uses `thread_broadcast_prefix`  
-- [~] Edit/delete — notice lines (WeeChat has no public line-edit API)  
+- [x] Edit/delete — **in-place** `hdata_update` on `line_data` (wee-slack style; notice fallback)  
+- [x] Input **`s/old/new/[gi]`** / `s///` delete → `chat.update` / `chat.delete`  
+- [x] Input **`+emoji` / `-emoji`** reaction shortcuts on last (or Nth) message  
 - [x] Files — display (size/mime/download URL) + **`/cslack download <url>`**  
 - [x] Message markdown render uses capacity-tracked `snprintf` (no `sprintf`)  
 - [x] Join/leave show resolved names  
@@ -158,13 +160,13 @@ rtm.connect
 
 ## Intentionally remaining (low ROI / platform limits)
 
-1. True in-place buffer line rewrite (no WeeChat plugin API)  
-2. Full custom-emoji image rendering in TUI (URLs only)  
-3. Real Slack slash-command protocol for user tokens  
-4. Multi-workspace UI beyond one `default` id  
-5. Auto-open every thread on live reply (rejected — rate-limit / buffer storm)  
-6. Unlimited history/members pagination (hard caps keep the queue healthy)  
-7. Binary upload via `hook_url` (raw PUT still needs curl/process)  
+1. Full custom-emoji image rendering in TUI (URLs only)  
+2. Real Slack slash-command protocol for user tokens  
+3. Multi-workspace UI beyond one `default` id  
+4. Auto-open every thread on live reply (rejected — rate-limit / buffer storm)  
+5. Unlimited history/members pagination (hard caps keep the queue healthy)  
+6. Binary upload via `hook_url` (raw PUT still needs curl/process)  
+7. Message `$hash` short-ids (wee-slack hashed_messages) for s/// / reactions  
 
 ---
 
@@ -191,3 +193,5 @@ rtm.connect
 | No create/invite/showmuted | conversations.create / invite + muted list |
 | Appear away while idle | optional `look.never_away` timer |
 | `/me` posted as plain text | `chat.meMessage` |
+| Edit/delete/reaction only notices | `hdata_update` on line with `slack_ts_*` tag |
+| No s/// message edit | input `s/old/new/[gi]` + `s///` delete via chat API |

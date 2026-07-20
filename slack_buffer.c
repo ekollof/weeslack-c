@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <regex.h>
 
 #include "weeslack.h"
 #include "slack_buffer.h"
@@ -107,6 +109,373 @@ slack_buffer_close_cb(const void *pointer, void *data,
     return WEECHAT_RC_OK;
 }
 
+/*
+ * Nth most recent message by us (1 = last). messages list is newest-first.
+ */
+static struct t_slack_message *
+slack_buffer_nth_own_message(struct t_slack_channel *channel,
+                              struct t_weeslack_workspace *workspace,
+                              int n)
+{
+    struct t_slack_message *m;
+    const char *my_id;
+
+    if (!channel || !workspace || !workspace->my_user_id || n < 1)
+        return NULL;
+    my_id = workspace->my_user_id;
+    for (m = channel->messages; m; m = m->next)
+    {
+        if (m->is_deleted)
+            continue;
+        if (!m->user_id || strcmp(m->user_id, my_id) != 0)
+            continue;
+        if (--n == 0)
+            return m;
+    }
+    return NULL;
+}
+
+/* Unescape \/ → / in sed pattern/replacement fragments. */
+static char *
+slack_buffer_unescape_slashes(const char *s, size_t len)
+{
+    char *out;
+    size_t i, j;
+
+    out = malloc(len + 1);
+    if (!out)
+        return NULL;
+    for (i = 0, j = 0; i < len; i++)
+    {
+        if (s[i] == '\\' && i + 1 < len && s[i + 1] == '/')
+        {
+            out[j++] = '/';
+            i++;
+        }
+        else
+            out[j++] = s[i];
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/*
+ * wee-slack style: [N]s/old/new/[flags]
+ * empty old+new → chat.delete; else chat.update with POSIX ERE replace.
+ * flags: g (global), i (ignore case). Returns 1 if handled.
+ */
+static int
+slack_buffer_try_sed_edit(struct t_slack_buffer *sbuf,
+                           const char *channel_id,
+                           const char *input)
+{
+    const char *p = input;
+    int msg_index = 1;
+    const char *s_start;
+    char *old_pat = NULL, *new_pat = NULL, *result = NULL;
+    const char *flags = "";
+    const char *slash1, *slash2;
+    struct t_slack_message *msg;
+    char *ts_str;
+    int cflags = REG_EXTENDED;
+    regex_t re;
+    int global = 0;
+    int handled = 0;
+
+    if (!sbuf || !sbuf->workspace || !channel_id || !input)
+        return 0;
+
+    /* optional leading message index digits */
+    if (isdigit((unsigned char)p[0]))
+    {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end && end > p && v > 0 && v < 10000)
+        {
+            msg_index = (int)v;
+            p = end;
+        }
+    }
+
+    if (p[0] != 's' || p[1] != '/')
+        return 0;
+
+    s_start = p + 2;
+    /* split on unescaped / → old / new / flags */
+    slash1 = NULL;
+    for (p = s_start; *p; p++)
+    {
+        if (*p == '/' && (p == s_start || p[-1] != '\\'))
+        {
+            slash1 = p;
+            break;
+        }
+    }
+    if (!slash1)
+    {
+        weechat_printf(sbuf->buffer,
+                        "%sweeslack: incomplete s/// (use s/old/new/)",
+                        weechat_prefix("error"));
+        return 1;
+    }
+    slash2 = NULL;
+    for (p = slash1 + 1; *p; p++)
+    {
+        if (*p == '/' && p[-1] != '\\')
+        {
+            slash2 = p;
+            break;
+        }
+    }
+    if (!slash2)
+    {
+        weechat_printf(sbuf->buffer,
+                        "%sweeslack: incomplete s/// (use s/old/new/)",
+                        weechat_prefix("error"));
+        return 1;
+    }
+    flags = slash2 + 1;
+
+    old_pat = slack_buffer_unescape_slashes(s_start,
+                                             (size_t)(slash1 - s_start));
+    new_pat = slack_buffer_unescape_slashes(slash1 + 1,
+                                             (size_t)(slash2 - slash1 - 1));
+    if (!old_pat || !new_pat)
+        goto done;
+
+    msg = slack_buffer_nth_own_message(sbuf->channel, sbuf->workspace,
+                                        msg_index);
+    if (!msg || !msg->text)
+    {
+        weechat_printf(sbuf->buffer,
+                        "%sweeslack: no matching own message to edit",
+                        weechat_prefix("error"));
+        handled = 1;
+        goto done;
+    }
+
+    ts_str = slack_ts_to_string(msg->ts);
+    if (!ts_str)
+        goto done;
+
+    /* s/// or s//  with empty old+new → delete */
+    if (old_pat[0] == '\0' && new_pat[0] == '\0')
+    {
+        slack_event_delete_message(sbuf->workspace, channel_id, ts_str);
+        free(ts_str);
+        handled = 1;
+        goto done;
+    }
+
+    if (strchr(flags, 'i') || strchr(flags, 'I'))
+        cflags |= REG_ICASE;
+    if (strchr(flags, 'g') || strchr(flags, 'G'))
+        global = 1;
+
+    if (regcomp(&re, old_pat, cflags) != 0)
+    {
+        weechat_printf(sbuf->buffer,
+                        "%sweeslack: invalid regex in s///",
+                        weechat_prefix("error"));
+        free(ts_str);
+        handled = 1;
+        goto done;
+    }
+
+    {
+        const char *src = msg->text;
+        size_t cap = strlen(src) * 2 + strlen(new_pat) + 64;
+        size_t pos = 0;
+        int matches = 0;
+
+        result = malloc(cap);
+        if (!result)
+        {
+            regfree(&re);
+            free(ts_str);
+            goto done;
+        }
+        result[0] = '\0';
+
+        while (*src)
+        {
+            regmatch_t m;
+            size_t before, mid, after_need;
+            if (regexec(&re, src, 1, &m, 0) != 0)
+            {
+                size_t rest = strlen(src);
+                if (pos + rest + 1 > cap)
+                {
+                    char *n = realloc(result, pos + rest + 1);
+                    if (!n)
+                        break;
+                    result = n;
+                    cap = pos + rest + 1;
+                }
+                memcpy(result + pos, src, rest);
+                pos += rest;
+                result[pos] = '\0';
+                break;
+            }
+            matches++;
+            before = (size_t)m.rm_so;
+            mid = strlen(new_pat);
+            after_need = pos + before + mid + 1;
+            if (after_need > cap)
+            {
+                char *n = realloc(result, after_need + 256);
+                if (!n)
+                    break;
+                result = n;
+                cap = after_need + 256;
+            }
+            if (before)
+            {
+                memcpy(result + pos, src, before);
+                pos += before;
+            }
+            memcpy(result + pos, new_pat, mid);
+            pos += mid;
+            result[pos] = '\0';
+            src += m.rm_eo;
+            if (!global || m.rm_eo == 0)
+            {
+                /* append rest after first match if not global */
+                if (!global)
+                {
+                    size_t rest = strlen(src);
+                    if (pos + rest + 1 > cap)
+                    {
+                        char *n = realloc(result, pos + rest + 1);
+                        if (n)
+                        {
+                            result = n;
+                            memcpy(result + pos, src, rest);
+                            pos += rest;
+                            result[pos] = '\0';
+                        }
+                    }
+                    else
+                    {
+                        memcpy(result + pos, src, rest);
+                        pos += rest;
+                        result[pos] = '\0';
+                    }
+                }
+                if (m.rm_eo == 0 && global)
+                    src++; /* avoid infinite empty match */
+                if (!global)
+                    break;
+            }
+        }
+        regfree(&re);
+
+        if (matches == 0)
+        {
+            weechat_printf(sbuf->buffer,
+                            "%sweeslack: regex did not match the message",
+                            weechat_prefix("error"));
+            free(ts_str);
+            handled = 1;
+            goto done;
+        }
+
+        if (strcmp(result, msg->text) != 0)
+            slack_event_update_message(sbuf->workspace, channel_id, ts_str,
+                                        result);
+        free(ts_str);
+        handled = 1;
+    }
+
+done:
+    free(old_pat);
+    free(new_pat);
+    free(result);
+    return handled;
+}
+
+/*
+ * +emoji / -emoji on last message (optional leading index like 2+:thumbsup:).
+ * Returns 1 if handled.
+ */
+static int
+slack_buffer_try_reaction_input(struct t_slack_buffer *sbuf,
+                                 const char *channel_id,
+                                 const char *input)
+{
+    const char *p = input;
+    int msg_index = 1;
+    int add = 0;
+    const char *emoji;
+    struct t_slack_message *msg;
+    char *ts_str;
+    char name[64];
+
+    if (!sbuf || !channel_id || !input)
+        return 0;
+
+    if (isdigit((unsigned char)p[0]))
+    {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end && end > p && v > 0 && v < 10000)
+        {
+            msg_index = (int)v;
+            p = end;
+        }
+    }
+    if (p[0] == '+')
+        add = 1;
+    else if (p[0] == '-')
+        add = 0;
+    else
+        return 0;
+    p++;
+    if (!*p)
+        return 0;
+
+    /* require :name: or bare name / leave unicode as-is for API */
+    emoji = p;
+    if (emoji[0] == ':')
+    {
+        size_t n = strlen(emoji);
+        if (n >= 3 && emoji[n - 1] == ':' && n - 2 < sizeof(name))
+        {
+            memcpy(name, emoji + 1, n - 2);
+            name[n - 2] = '\0';
+            emoji = name;
+        }
+    }
+
+    /* Prefer own message for index, else any message in channel */
+    msg = slack_buffer_nth_own_message(sbuf->channel, sbuf->workspace,
+                                        msg_index);
+    if (!msg)
+    {
+        struct t_slack_message *m;
+        int n = msg_index;
+        for (m = sbuf->channel->messages; m; m = m->next)
+        {
+            if (m->is_deleted)
+                continue;
+            if (--n == 0)
+            {
+                msg = m;
+                break;
+            }
+        }
+    }
+    if (!msg)
+        return 0;
+
+    ts_str = slack_ts_to_string(msg->ts);
+    if (!ts_str)
+        return 1;
+    slack_event_react(sbuf->workspace, channel_id, ts_str, emoji, add);
+    free(ts_str);
+    return 1;
+}
+
 static int
 slack_buffer_input_cb(const void *pointer, void *data,
                       struct t_gui_buffer *buffer,
@@ -116,6 +485,9 @@ slack_buffer_input_cb(const void *pointer, void *data,
     (void) buffer;
 
     struct t_slack_buffer *sbuf = (struct t_slack_buffer *)pointer;
+    const char *thread_ts = NULL;
+    const char *channel_id;
+    char *processed;
 
     if (!sbuf || !sbuf->channel || !input_data || !input_data[0])
         return WEECHAT_RC_OK;
@@ -127,18 +499,10 @@ slack_buffer_input_cb(const void *pointer, void *data,
         return WEECHAT_RC_OK;
     }
 
-    /* replace emoji shortcodes with unicode before sending */
-    char *processed = slack_event_replace_emoji(input_data);
-    if (!processed)
-        return WEECHAT_RC_OK;
-
-    /* for thread buffers, find the parent channel and use thread_ts */
-    const char *thread_ts = NULL;
-    const char *channel_id = sbuf->channel->id;
+    channel_id = sbuf->channel->id;
 
     if (sbuf->channel->type == SLACK_CHANNEL_TYPE_THREAD)
     {
-        /* thread channel IDs are "thread_<parent_id>_<thread_ts>" */
         const char *prefix = "thread_";
         if (strncmp(channel_id, prefix, strlen(prefix)) == 0)
         {
@@ -161,6 +525,19 @@ slack_buffer_input_cb(const void *pointer, void *data,
             }
         }
     }
+
+    /* sed-like edit / delete before emoji expansion (patterns are raw text) */
+    if (slack_buffer_try_sed_edit(sbuf, channel_id, input_data))
+        return WEECHAT_RC_OK;
+
+    /* +emoji / -emoji reaction shortcuts */
+    if (slack_buffer_try_reaction_input(sbuf, channel_id, input_data))
+        return WEECHAT_RC_OK;
+
+    /* replace emoji shortcodes with unicode before sending */
+    processed = slack_event_replace_emoji(input_data);
+    if (!processed)
+        return WEECHAT_RC_OK;
 
     /* /me action → chat.meMessage (wee-slack style) */
     if (strncmp(processed, "/me ", 4) == 0 && processed[4])
@@ -514,6 +891,93 @@ slack_buffer_print_message(struct t_slack_buffer *sbuf,
         "%s\t%s",
         display_nick,
         message);
+}
+
+/*
+ * Walk buffer own_lines for tag slack_ts_<sec.usec> and rewrite "message"
+ * via hdata_update (same technique as Python wee-slack modify_buffer_line).
+ * WeeChat ≥ 4 can rewrite a multi-line message with one update.
+ */
+int
+slack_buffer_modify_line(struct t_gui_buffer *buffer, SlackTS ts,
+                          const char *new_message)
+{
+    struct t_hdata *h_buffer, *h_lines, *h_line, *h_line_data;
+    void *own_lines, *line_ptr;
+    char want_tag[64];
+    char *ts_str;
+    int found = 0;
+
+    if (!buffer || !new_message)
+        return 0;
+
+    ts_str = slack_ts_to_string(ts);
+    if (!ts_str)
+        return 0;
+    snprintf(want_tag, sizeof(want_tag), "slack_ts_%s", ts_str);
+    free(ts_str);
+
+    h_buffer = weechat_hdata_get("buffer");
+    h_lines = weechat_hdata_get("lines");
+    h_line = weechat_hdata_get("line");
+    h_line_data = weechat_hdata_get("line_data");
+    if (!h_buffer || !h_lines || !h_line || !h_line_data)
+        return 0;
+
+    own_lines = weechat_hdata_pointer(h_buffer, buffer, "own_lines");
+    if (!own_lines)
+        return 0;
+
+    line_ptr = weechat_hdata_pointer(h_lines, own_lines, "last_line");
+    while (line_ptr)
+    {
+        void *data = weechat_hdata_pointer(h_line, line_ptr, "data");
+        int tags_count, i, match = 0;
+
+        if (!data)
+        {
+            line_ptr = weechat_hdata_move(h_line, line_ptr, -1);
+            continue;
+        }
+
+        tags_count = weechat_hdata_integer(h_line_data, data, "tags_count");
+        for (i = 0; i < tags_count; i++)
+        {
+            char key[32];
+            const char *tag;
+
+            snprintf(key, sizeof(key), "%d|tags_array", i);
+            tag = weechat_hdata_string(h_line_data, data, key);
+            if (tag && strcmp(tag, want_tag) == 0)
+            {
+                match = 1;
+                break;
+            }
+        }
+
+        if (match)
+        {
+            struct t_hashtable *ht;
+
+            ht = weechat_hashtable_new(8,
+                                        WEECHAT_HASHTABLE_STRING,
+                                        WEECHAT_HASHTABLE_STRING,
+                                        NULL, NULL);
+            if (ht)
+            {
+                weechat_hashtable_set(ht, "message", new_message);
+                weechat_hdata_update(h_line_data, data, ht);
+                weechat_hashtable_free(ht);
+                found = 1;
+            }
+            /* WeeChat 4+: one update rewrites the whole logical line set */
+            break;
+        }
+
+        line_ptr = weechat_hdata_move(h_line, line_ptr, -1);
+    }
+
+    return found;
 }
 
 static const char *

@@ -100,6 +100,14 @@ extern void slack_event_send_me_message(struct t_weeslack_workspace *workspace,
                                          const char *channel_id,
                                          const char *text,
                                          const char *thread_ts);
+/* chat.update / chat.delete — used by s/old/new/ input edits */
+extern void slack_event_update_message(struct t_weeslack_workspace *workspace,
+                                        const char *channel_id,
+                                        const char *timestamp,
+                                        const char *text);
+extern void slack_event_delete_message(struct t_weeslack_workspace *workspace,
+                                        const char *channel_id,
+                                        const char *timestamp);
 extern void slack_event_set_mute(struct t_weeslack_workspace *workspace,
                                   const char *channel_id, int mute);
 extern void slack_event_get_permalink(struct t_weeslack_workspace *workspace,

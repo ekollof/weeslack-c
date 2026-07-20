@@ -861,6 +861,158 @@ slack_event_format_reactions(struct t_weeslack_workspace *workspace,
     return out;
 }
 
+/* Reactions from the in-memory message model (RTM add/remove). Caller frees. */
+static char *
+slack_event_format_reactions_msg(struct t_weeslack_workspace *workspace,
+                                  struct t_slack_message *msg)
+{
+    SlackReaction *r;
+    size_t cap = 512;
+    char *out;
+    size_t pos = 0;
+    int any = 0;
+    const char *my_id;
+
+    if (!msg || !msg->reactions)
+        return NULL;
+
+    out = malloc(cap);
+    if (!out)
+        return NULL;
+    out[0] = '\0';
+    my_id = (workspace && workspace->my_user_id) ? workspace->my_user_id : NULL;
+
+    pos += (size_t)snprintf(out + pos, cap - pos, " %s[",
+                            weechat_color("darkgray"));
+
+    for (r = msg->reactions; r; r = r->next)
+    {
+        int mine = 0, j, written;
+
+        if (!r->name || r->users_count <= 0)
+            continue;
+        if (my_id)
+        {
+            for (j = 0; j < r->users_count; j++)
+            {
+                if (r->users[j] && strcmp(r->users[j], my_id) == 0)
+                {
+                    mine = 1;
+                    break;
+                }
+            }
+        }
+        if (pos + 64 >= cap)
+        {
+            char *n = realloc(out, cap * 2);
+            if (!n)
+                break;
+            out = n;
+            cap *= 2;
+        }
+        if (mine)
+            written = snprintf(out + pos, cap - pos, "%s%s:%s:%d%s",
+                               any ? " " : "",
+                               weechat_color("lightgreen"),
+                               r->name, r->users_count,
+                               weechat_color("darkgray"));
+        else
+            written = snprintf(out + pos, cap - pos, "%s:%s:%d",
+                               any ? " " : "", r->name, r->users_count);
+        if (written > 0)
+            pos += (size_t)written < cap - pos ? (size_t)written : 0;
+        any = 1;
+    }
+
+    if (!any)
+    {
+        free(out);
+        return NULL;
+    }
+    if (pos + 8 < cap)
+        snprintf(out + pos, cap - pos, "]%s", weechat_color("reset"));
+    return out;
+}
+
+/*
+ * Build message-column text and hdata_update the buffer line for msg->ts.
+ * Returns 1 if a line was rewritten.
+ */
+static int
+slack_event_rewrite_message_line(struct t_weeslack_workspace *workspace,
+                                  struct t_slack_channel *channel,
+                                  struct t_slack_message *msg)
+{
+    char *formatted_text = NULL;
+    char *emoji_text = NULL;
+    char *formatted = NULL;
+    char *reactions = NULL;
+    char *body = NULL;
+    size_t body_len;
+    int ok = 0;
+    const char *edit_color, *del_color;
+
+    if (!channel || !channel->buffer || !msg)
+        return 0;
+
+    if (msg->is_deleted)
+    {
+        del_color = weechat_config_string(weeslack_config.color_deleted);
+        if (!del_color || !del_color[0])
+            del_color = "red";
+        body_len = 64;
+        body = malloc(body_len);
+        if (!body)
+            return 0;
+        snprintf(body, body_len, "%s(deleted)%s",
+                 weechat_color(del_color), weechat_color("reset"));
+        ok = slack_buffer_modify_line(channel->buffer, msg->ts, body);
+        free(body);
+        return ok;
+    }
+
+    formatted_text = slack_event_render_formatting(msg->text ? msg->text : "");
+    emoji_text = slack_event_apply_emoji_mode(
+        formatted_text ? formatted_text : (msg->text ? msg->text : ""));
+    formatted = slack_event_format_mentions(
+        workspace, emoji_text ? emoji_text : "", channel);
+    reactions = slack_event_format_reactions_msg(workspace, msg);
+
+    body_len = (formatted ? strlen(formatted) : 0) +
+               (reactions ? strlen(reactions) : 0) + 64;
+    body = malloc(body_len);
+    if (!body)
+        goto out;
+
+    if (msg->is_edited)
+    {
+        edit_color = weechat_config_string(weeslack_config.color_edited_suffix);
+        if (!edit_color || !edit_color[0])
+            edit_color = "yellow";
+        snprintf(body, body_len, "%s%s %s(edited)%s",
+                 formatted ? formatted : "",
+                 reactions ? reactions : "",
+                 weechat_color(edit_color),
+                 weechat_color("reset"));
+    }
+    else
+    {
+        snprintf(body, body_len, "%s%s",
+                 formatted ? formatted : "",
+                 reactions ? reactions : "");
+    }
+
+    ok = slack_buffer_modify_line(channel->buffer, msg->ts, body);
+
+out:
+    free(formatted_text);
+    free(emoji_text);
+    free(formatted);
+    free(reactions);
+    free(body);
+    return ok;
+}
+
 /* notify_* tags: highlight when message mentions this workspace user. */
 static const char *
 slack_event_notify_tags(struct t_weeslack_workspace *workspace,
@@ -990,7 +1142,6 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             char *new_text_owned;
             const char *new_ts_str = NULL;
             const char *new_text = "";
-            const char *edit_color;
 
             json_object_object_get_ex(message_obj, "ts", &new_ts_obj);
             if (new_ts_obj)
@@ -1007,27 +1158,31 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                 msg->text = strdup(new_text);
                 msg->is_edited = 1;
                 slack_message_update(msg, message_obj);
-            }
-            if (channel->buffer)
-            {
-                char *rendered = slack_event_render_formatting(new_text);
-                char *with_emoji = slack_event_apply_emoji_mode(
-                    rendered ? rendered : new_text);
-                edit_color = weechat_config_string(weeslack_config.color_edited_suffix);
-                if (!edit_color || !edit_color[0])
-                    edit_color = "yellow";
-                weechat_printf_date_tags(
-                    channel->buffer,
-                    new_ts.sec,
-                    "no_highlight,notify_none,slack_edited",
-                    "%s(edited)%s\t%s %s(edited)%s",
-                    weechat_color(edit_color),
-                    weechat_color("reset"),
-                    with_emoji ? with_emoji : new_text,
-                    weechat_color(edit_color),
-                    weechat_color("reset"));
-                free(rendered);
-                free(with_emoji);
+                /* Prefer in-place rewrite (wee-slack hdata_update). */
+                if (!slack_event_rewrite_message_line(workspace, channel, msg) &&
+                    channel->buffer)
+                {
+                    const char *edit_color;
+                    char *rendered = slack_event_render_formatting(new_text);
+                    char *with_emoji = slack_event_apply_emoji_mode(
+                        rendered ? rendered : new_text);
+                    edit_color = weechat_config_string(
+                        weeslack_config.color_edited_suffix);
+                    if (!edit_color || !edit_color[0])
+                        edit_color = "yellow";
+                    weechat_printf_date_tags(
+                        channel->buffer,
+                        new_ts.sec,
+                        "no_highlight,notify_none,slack_edited",
+                        "%s(edited)%s\t%s %s(edited)%s",
+                        weechat_color(edit_color),
+                        weechat_color("reset"),
+                        with_emoji ? with_emoji : new_text,
+                        weechat_color(edit_color),
+                        weechat_color("reset"));
+                    free(rendered);
+                    free(with_emoji);
+                }
             }
             free(new_text_owned);
         }
@@ -1045,22 +1200,25 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             struct t_slack_message *msg = slack_message_search(
                 channel->messages, deleted_ts);
             if (msg)
-                msg->is_deleted = 1;
-            if (channel->buffer)
             {
-                const char *del_color = weechat_config_string(
-                    weeslack_config.color_deleted);
-                if (!del_color || !del_color[0])
-                    del_color = "red";
-                weechat_printf_date_tags(
-                    channel->buffer,
-                    deleted_ts.sec,
-                    "no_highlight,notify_none,slack_deleted",
-                    "%s(deleted)%s\t%smessage deleted%s",
-                    weechat_color(del_color),
-                    weechat_color("reset"),
-                    weechat_color(del_color),
-                    weechat_color("reset"));
+                msg->is_deleted = 1;
+                if (!slack_event_rewrite_message_line(workspace, channel, msg) &&
+                    channel->buffer)
+                {
+                    const char *del_color = weechat_config_string(
+                        weeslack_config.color_deleted);
+                    if (!del_color || !del_color[0])
+                        del_color = "red";
+                    weechat_printf_date_tags(
+                        channel->buffer,
+                        deleted_ts.sec,
+                        "no_highlight,notify_none,slack_deleted",
+                        "%s(deleted)%s\t%smessage deleted%s",
+                        weechat_color(del_color),
+                        weechat_color("reset"),
+                        weechat_color(del_color),
+                        weechat_color("reset"));
+                }
             }
         }
         return;
@@ -2375,8 +2533,12 @@ slack_event_handle_reaction(struct t_weeslack_workspace *workspace,
             slack_message_reaction_remove(msg, reaction_name, reaction_user_id);
         else
             slack_message_reaction_add(msg, reaction_name, reaction_user_id);
+        /* In-place suffix update like wee-slack change_message */
+        if (slack_event_rewrite_message_line(workspace, channel, msg))
+            return;
     }
 
+    /* Fallback notice if the original line was not found (scrolled off / no history) */
     weechat_printf_date_tags(
         channel->buffer,
         ts.sec,
@@ -5208,6 +5370,49 @@ slack_event_send_me_message(struct t_weeslack_workspace *workspace,
     }
     slack_http_request_new(workspace, "chat.meMessage", params,
                            slack_event_send_message_cb, NULL);
+    json_object_put(params);
+}
+
+void
+slack_event_update_message(struct t_weeslack_workspace *workspace,
+                            const char *channel_id,
+                            const char *timestamp,
+                            const char *text)
+{
+    struct json_object *params;
+
+    if (!workspace || !channel_id || !timestamp || !text)
+        return;
+
+    params = json_object_new_object();
+    json_object_object_add(params, "channel",
+                           json_object_new_string(channel_id));
+    json_object_object_add(params, "ts",
+                           json_object_new_string(timestamp));
+    json_object_object_add(params, "text",
+                           json_object_new_string(text));
+    slack_http_request_new(workspace, "chat.update", params,
+                           slack_event_simple_api_cb, (void *)"chat.update");
+    json_object_put(params);
+}
+
+void
+slack_event_delete_message(struct t_weeslack_workspace *workspace,
+                            const char *channel_id,
+                            const char *timestamp)
+{
+    struct json_object *params;
+
+    if (!workspace || !channel_id || !timestamp)
+        return;
+
+    params = json_object_new_object();
+    json_object_object_add(params, "channel",
+                           json_object_new_string(channel_id));
+    json_object_object_add(params, "ts",
+                           json_object_new_string(timestamp));
+    slack_http_request_new(workspace, "chat.delete", params,
+                           slack_event_simple_api_cb, (void *)"chat.delete");
     json_object_put(params);
 }
 
