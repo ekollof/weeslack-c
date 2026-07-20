@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
+#include <openssl/sha.h>
 
 #include "weeslack.h"
 #include "slack_data.h"
@@ -683,6 +685,169 @@ slack_message_search(struct t_slack_message *list, SlackTS ts)
     return NULL;
 }
 
+static void
+slack_sha1_hex(const char *s, char out_hex[SHA_DIGEST_LENGTH * 2 + 1])
+{
+    unsigned char md[SHA_DIGEST_LENGTH];
+    int i;
+
+    SHA1((const unsigned char *)(s ? s : ""), s ? strlen(s) : 0, md);
+    for (i = 0; i < SHA_DIGEST_LENGTH; i++)
+        snprintf(out_hex + i * 2, 3, "%02x", md[i]);
+    out_hex[SHA_DIGEST_LENGTH * 2] = '\0';
+}
+
+void
+slack_message_assign_hash(struct t_slack_message *list,
+                          struct t_slack_message *msg)
+{
+    char *ts_str;
+    char full[SHA_DIGEST_LENGTH * 2 + 1];
+    char candidate[SHA_DIGEST_LENGTH * 2 + 1];
+    int len;
+    struct t_slack_message *m;
+
+    if (!msg)
+        return;
+    if (msg->hash)
+        return;
+
+    ts_str = slack_ts_to_string(msg->ts);
+    if (!ts_str)
+        return;
+    slack_sha1_hex(ts_str, full);
+    free(ts_str);
+
+    /* wee-slack: start at 3 hex chars, grow until unique among short hashes */
+    for (len = 3; len <= SHA_DIGEST_LENGTH * 2; len++)
+    {
+        int conflict = 0;
+
+        memcpy(candidate, full, (size_t)len);
+        candidate[len] = '\0';
+
+        for (m = list; m; m = m->next)
+        {
+            if (m == msg || !m->hash)
+                continue;
+            /* collide if either is a prefix of the other at this length */
+            if (strncmp(m->hash, candidate, (size_t)len) == 0 ||
+                strncmp(candidate, m->hash, strlen(m->hash)) == 0)
+            {
+                conflict = 1;
+                break;
+            }
+        }
+        if (!conflict)
+        {
+            free(msg->hash);
+            msg->hash = strdup(candidate);
+            return;
+        }
+    }
+    /* fallback full hash */
+    free(msg->hash);
+    msg->hash = strdup(full);
+}
+
+struct t_slack_message *
+slack_message_search_hash(struct t_slack_message *list,
+                           const char *hash_or_dollar)
+{
+    const char *h;
+    size_t hlen;
+    struct t_slack_message *m, *found = NULL;
+    int matches = 0;
+
+    if (!hash_or_dollar || !hash_or_dollar[0])
+        return NULL;
+    h = hash_or_dollar;
+    if (h[0] == '$')
+        h++;
+    if (!h[0])
+        return NULL;
+    hlen = strlen(h);
+
+    /* exact or unique prefix among assigned hashes */
+    for (m = list; m; m = m->next)
+    {
+        if (!m->hash)
+            continue;
+        if (strcmp(m->hash, h) == 0)
+            return m;
+        if (strncmp(m->hash, h, hlen) == 0)
+        {
+            found = m;
+            matches++;
+        }
+    }
+    return (matches == 1) ? found : NULL;
+}
+
+struct t_slack_message *
+slack_message_from_ref(struct t_slack_message *list, const char *ref,
+                        t_slack_msg_filter filter, void *filter_data)
+{
+    struct t_slack_message *m;
+    int index, n;
+
+    if (!list)
+        return NULL;
+
+    if (ref && ref[0])
+    {
+        /* full timestamp seconds.microseconds */
+        if (strchr(ref, '.') && ref[0] >= '0' && ref[0] <= '9')
+        {
+            SlackTS ts = slack_ts_new(ref);
+            m = slack_message_search(list, ts);
+            if (m && (!filter || filter(m, filter_data)))
+                return m;
+        }
+
+        /* $hash or hex hash */
+        if (ref[0] == '$' || (isxdigit((unsigned char)ref[0]) &&
+                               !strchr(ref, '.') && strlen(ref) >= 3 &&
+                               strspn(ref, "0123456789abcdefABCDEF$") == strlen(ref)))
+        {
+            m = slack_message_search_hash(list, ref);
+            if (m && (!filter || filter(m, filter_data)))
+                return m;
+        }
+
+        /* numeric index (1 = newest matching) */
+        if (ref[0] >= '1' && ref[0] <= '9')
+        {
+            char *end = NULL;
+            long v = strtol(ref, &end, 10);
+            if (end && *end == '\0' && v > 0 && v < 100000)
+            {
+                index = (int)v;
+                n = 0;
+                for (m = list; m; m = m->next)
+                {
+                    if (filter && !filter(m, filter_data))
+                        continue;
+                    if (++n == index)
+                        return m;
+                }
+                return NULL;
+            }
+        }
+
+        return NULL;
+    }
+
+    /* no ref → first matching (newest) */
+    for (m = list; m; m = m->next)
+    {
+        if (filter && !filter(m, filter_data))
+            continue;
+        return m;
+    }
+    return NULL;
+}
+
 void
 slack_message_free(struct t_slack_message *msg)
 {
@@ -693,6 +858,7 @@ slack_message_free(struct t_slack_message *msg)
     free(msg->text);
     free(msg->subtype);
     free(msg->thread_ts);
+    free(msg->hash);
     if (msg->json)
         json_object_put(msg->json);
 
@@ -815,6 +981,11 @@ slack_message_prepend(struct t_slack_message *list, struct t_slack_message *msg)
     msg->prev = NULL;
     if (list)
         list->prev = msg;
+
+    /* Short hash after link (msg is list head; uniqueness scans next) */
+    free(msg->hash);
+    msg->hash = NULL;
+    slack_message_assign_hash(msg, msg);
 
     return msg;
 }

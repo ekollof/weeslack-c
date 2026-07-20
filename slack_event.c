@@ -1757,6 +1757,7 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
     {
         struct json_object *presence_obj, *user_obj, *users_obj;
         const char *presence = NULL;
+        int is_manual = (strcmp(type, "manual_presence_change") == 0);
 
         if (json_object_object_get_ex(json, "presence", &presence_obj))
             presence = json_object_get_string(presence_obj);
@@ -1780,6 +1781,17 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                 free(user->presence);
                 user->presence = strdup(presence);
                 slack_buffer_update_user_presence(user);
+                if (workspace->my_user_id && user_id &&
+                    strcmp(user_id, workspace->my_user_id) == 0)
+                {
+                    free(workspace->my_presence);
+                    workspace->my_presence = strdup(presence);
+                    if (is_manual)
+                        workspace->my_manual_away =
+                            (strcmp(presence, "away") == 0);
+                    weechat_bar_item_update("away");
+                    weechat_bar_item_update("slack_away");
+                }
             }
         }
 
@@ -1794,6 +1806,17 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                 free(user->presence);
                 user->presence = strdup(presence);
                 slack_buffer_update_user_presence(user);
+            }
+            if (workspace->my_user_id && user_id &&
+                strcmp(user_id, workspace->my_user_id) == 0)
+            {
+                free(workspace->my_presence);
+                workspace->my_presence = strdup(presence);
+                if (is_manual)
+                    workspace->my_manual_away =
+                        (strcmp(presence, "away") == 0);
+                weechat_bar_item_update("away");
+                weechat_bar_item_update("slack_away");
             }
         }
         return;

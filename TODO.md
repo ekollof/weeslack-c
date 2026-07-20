@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — profile status, create/invite/showmuted,
-never_away, /me → chat.meMessage; weemoji.json
+**Last update:** 2026-07-20 — $hash message ids, thread default, rehistory,
+send_typing_notice, away bar items; hdata line rewrite
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -32,6 +32,7 @@ never_away, /me → chat.meMessage; weemoji.json
 - [x] Bots — `is_bot` / `is_app_user` registered in bot map; **hidden from nicklist** (wee-slack style)  
 - [x] SlackMessage — list model + **in-place line rewrite** via `hdata_update`  
 - [x] Reaction list maintained; **rewrites line** on RTM add/remove (notice fallback)  
+- [x] Message **`$hash` short-ids** (SHA1 of ts, min 3 hex, wee-slack style)  
 
 ---
 
@@ -44,6 +45,7 @@ never_away, /me → chat.meMessage; weemoji.json
 - [x] Unknown members → **`users.info`** (slow, capped); no stub nicks  
 - [x] Nicklist **Here / Away** groups + **`presence_sub`** (RTM); bots purged  
 - [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe)  
+- [x] `/cslack thread` without args → last parent with replies; accepts `$hash`/N/ts  
 - [x] Buflist trigger includes `weeslack` (export conf)  
 - [~] Buffer close keeps model (by design)  
 - [x] `short_buffer_names` — `#channel` vs `team.#channel`  
@@ -89,6 +91,7 @@ never_away, /me → chat.meMessage; weemoji.json
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
 - [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
 - [x] **`whois`** (+ live presence), **`join`**, **`leave`/`part`**, **`refresh`**, **`names`**  
+- [x] **`rehistory`** alias for loadhistory; reply/react/thread accept `$hash`  
 - [x] **`status`** profile emoji/text (`users.profile.set`) + `-delete`; legacy dnd/away/active  
 - [x] **`create`** (`conversations.create` [-private]), **`invite`**, **`showmuted`**  
 - [x] Stars / search list polish  
@@ -114,6 +117,8 @@ never_away, /me → chat.meMessage; weemoji.json
 - [x] color options (typing/deleted/edited/thread/muted)  
 - [x] `color.thread_suffix` = `multiple` uses nick color for reply count suffix  
 - [x] **`look.never_away`** — 5‑min timer sets presence `auto` when enabled  
+- [x] **`look.send_typing_notice`** — typing via `input_text_changed`  
+- [x] Bar items **`away`** / **`slack_away`** (manual vs auto)  
 
 ---
 
@@ -166,7 +171,10 @@ rtm.connect
 4. Auto-open every thread on live reply (rejected — rate-limit / buffer storm)  
 5. Unlimited history/members pagination (hard caps keep the queue healthy)  
 6. Binary upload via `hook_url` (raw PUT still needs curl/process)  
-7. Message `$hash` short-ids (wee-slack hashed_messages) for s/// / reactions  
+7. Cursor mouse bindings / line events for $hash insert (wee-slack line_event_cb)  
+8. distracting / nodistractions channel lists  
+9. Real `chat.command` slash protocol  
+10. `use_full_names` / `external_user_suffix` / `show_reaction_nicks` polish  
 
 ---
 
@@ -195,3 +203,7 @@ rtm.connect
 | `/me` posted as plain text | `chat.meMessage` |
 | Edit/delete/reaction only notices | `hdata_update` on line with `slack_ts_*` tag |
 | No s/// message edit | input `s/old/new/[gi]` + `s///` delete via chat API |
+| No $hash message ids | SHA1 short hash like wee-slack hashed_messages |
+| thread required raw ts | optional; default last thread parent; $hash/N |
+| No away bar item | `away` / `slack_away` bar items |
+| Typing only via /cslack typing | optional auto on input_text_changed |

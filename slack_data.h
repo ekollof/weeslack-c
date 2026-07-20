@@ -119,6 +119,8 @@ struct t_slack_message
     char *text;
     char *subtype;
     char *thread_ts;
+    /* Short id (wee-slack hashed_messages): "a1b" without leading $ */
+    char *hash;
     int reply_count;
     int reply_users_count;
     int subscribed;
@@ -135,6 +137,20 @@ extern struct t_slack_message *slack_message_new(SlackTS ts, const char *user_id
                                                   const char *text);
 extern struct t_slack_message *slack_message_search(struct t_slack_message *list,
                                                      SlackTS ts);
+/* Resolve $abc / abc short-hash (unique prefix match) within channel messages. */
+extern struct t_slack_message *slack_message_search_hash(
+    struct t_slack_message *list, const char *hash_or_dollar);
+/*
+ * Resolve message ref: full ts, $hash / hash, or 1-based index into list
+ * (newest first). message_filter: if non-NULL, only count msgs with filter(msg)!=0.
+ */
+typedef int (*t_slack_msg_filter)(struct t_slack_message *msg, void *data);
+extern struct t_slack_message *slack_message_from_ref(
+    struct t_slack_message *list, const char *ref,
+    t_slack_msg_filter filter, void *filter_data);
+/* Assign unique short hash from SHA1(ts) like wee-slack (min 3 hex chars). */
+extern void slack_message_assign_hash(struct t_slack_message *list,
+                                      struct t_slack_message *msg);
 extern void slack_message_free(struct t_slack_message *msg);
 extern void slack_message_update(struct t_slack_message *msg,
                                  struct json_object *json);

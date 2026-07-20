@@ -109,32 +109,6 @@ slack_buffer_close_cb(const void *pointer, void *data,
     return WEECHAT_RC_OK;
 }
 
-/*
- * Nth most recent message by us (1 = last). messages list is newest-first.
- */
-static struct t_slack_message *
-slack_buffer_nth_own_message(struct t_slack_channel *channel,
-                              struct t_weeslack_workspace *workspace,
-                              int n)
-{
-    struct t_slack_message *m;
-    const char *my_id;
-
-    if (!channel || !workspace || !workspace->my_user_id || n < 1)
-        return NULL;
-    my_id = workspace->my_user_id;
-    for (m = channel->messages; m; m = m->next)
-    {
-        if (m->is_deleted)
-            continue;
-        if (!m->user_id || strcmp(m->user_id, my_id) != 0)
-            continue;
-        if (--n == 0)
-            return m;
-    }
-    return NULL;
-}
-
 /* Unescape \/ → / in sed pattern/replacement fragments. */
 static char *
 slack_buffer_unescape_slashes(const char *s, size_t len)
@@ -159,8 +133,18 @@ slack_buffer_unescape_slashes(const char *s, size_t len)
     return out;
 }
 
+/* Own-message filter for sed edits */
+static int
+slack_buffer_filter_own(struct t_slack_message *msg, void *data)
+{
+    const char *my_id = data;
+    if (!msg || msg->is_deleted || !my_id)
+        return 0;
+    return (msg->user_id && strcmp(msg->user_id, my_id) == 0);
+}
+
 /*
- * wee-slack style: [N]s/old/new/[flags]
+ * wee-slack style: [$hash|N]s/old/new/[flags]
  * empty old+new → chat.delete; else chat.update with POSIX ERE replace.
  * flags: g (global), i (ignore case). Returns 1 if handled.
  */
@@ -170,7 +154,8 @@ slack_buffer_try_sed_edit(struct t_slack_buffer *sbuf,
                            const char *input)
 {
     const char *p = input;
-    int msg_index = 1;
+    char ref_buf[64];
+    const char *ref = NULL;
     const char *s_start;
     char *old_pat = NULL, *new_pat = NULL, *result = NULL;
     const char *flags = "";
@@ -185,16 +170,26 @@ slack_buffer_try_sed_edit(struct t_slack_buffer *sbuf,
     if (!sbuf || !sbuf->workspace || !channel_id || !input)
         return 0;
 
-    /* optional leading message index digits */
-    if (isdigit((unsigned char)p[0]))
+    /* optional leading $hash or index before s/ */
+    if (p[0] == '$' || isdigit((unsigned char)p[0]))
     {
-        char *end = NULL;
-        long v = strtol(p, &end, 10);
-        if (end && end > p && v > 0 && v < 10000)
+        size_t i = 0;
+        if (p[0] == '$')
         {
-            msg_index = (int)v;
-            p = end;
+            ref_buf[i++] = *p++;
+            while (i + 1 < sizeof(ref_buf) && isxdigit((unsigned char)*p))
+                ref_buf[i++] = *p++;
         }
+        else
+        {
+            while (i + 1 < sizeof(ref_buf) && isdigit((unsigned char)*p))
+                ref_buf[i++] = *p++;
+        }
+        ref_buf[i] = '\0';
+        if (p[0] == 's')
+            ref = ref_buf;
+        else
+            p = input; /* not sed with prefix */
     }
 
     if (p[0] != 's' || p[1] != '/')
@@ -243,8 +238,11 @@ slack_buffer_try_sed_edit(struct t_slack_buffer *sbuf,
     if (!old_pat || !new_pat)
         goto done;
 
-    msg = slack_buffer_nth_own_message(sbuf->channel, sbuf->workspace,
-                                        msg_index);
+    msg = slack_message_from_ref(
+        sbuf->channel->messages,
+        ref,
+        slack_buffer_filter_own,
+        (void *)sbuf->workspace->my_user_id);
     if (!msg || !msg->text)
     {
         weechat_printf(sbuf->buffer,
@@ -395,7 +393,7 @@ done:
 }
 
 /*
- * +emoji / -emoji on last message (optional leading index like 2+:thumbsup:).
+ * [$hash|N]+emoji / -emoji (wee-slack reaction shortcuts).
  * Returns 1 if handled.
  */
 static int
@@ -404,7 +402,8 @@ slack_buffer_try_reaction_input(struct t_slack_buffer *sbuf,
                                  const char *input)
 {
     const char *p = input;
-    int msg_index = 1;
+    char ref_buf[64];
+    const char *ref = NULL;
     int add = 0;
     const char *emoji;
     struct t_slack_message *msg;
@@ -414,15 +413,25 @@ slack_buffer_try_reaction_input(struct t_slack_buffer *sbuf,
     if (!sbuf || !channel_id || !input)
         return 0;
 
-    if (isdigit((unsigned char)p[0]))
+    if (p[0] == '$' || isdigit((unsigned char)p[0]))
     {
-        char *end = NULL;
-        long v = strtol(p, &end, 10);
-        if (end && end > p && v > 0 && v < 10000)
+        size_t i = 0;
+        if (p[0] == '$')
         {
-            msg_index = (int)v;
-            p = end;
+            ref_buf[i++] = *p++;
+            while (i + 1 < sizeof(ref_buf) && isxdigit((unsigned char)*p))
+                ref_buf[i++] = *p++;
         }
+        else
+        {
+            while (i + 1 < sizeof(ref_buf) && isdigit((unsigned char)*p))
+                ref_buf[i++] = *p++;
+        }
+        ref_buf[i] = '\0';
+        if (p[0] == '+' || p[0] == '-')
+            ref = ref_buf;
+        else
+            return 0;
     }
     if (p[0] == '+')
         add = 1;
@@ -434,7 +443,6 @@ slack_buffer_try_reaction_input(struct t_slack_buffer *sbuf,
     if (!*p)
         return 0;
 
-    /* require :name: or bare name / leave unicode as-is for API */
     emoji = p;
     if (emoji[0] == ':')
     {
@@ -447,24 +455,7 @@ slack_buffer_try_reaction_input(struct t_slack_buffer *sbuf,
         }
     }
 
-    /* Prefer own message for index, else any message in channel */
-    msg = slack_buffer_nth_own_message(sbuf->channel, sbuf->workspace,
-                                        msg_index);
-    if (!msg)
-    {
-        struct t_slack_message *m;
-        int n = msg_index;
-        for (m = sbuf->channel->messages; m; m = m->next)
-        {
-            if (m->is_deleted)
-                continue;
-            if (--n == 0)
-            {
-                msg = m;
-                break;
-            }
-        }
-    }
+    msg = slack_message_from_ref(sbuf->channel->messages, ref, NULL, NULL);
     if (!msg)
         return 0;
 

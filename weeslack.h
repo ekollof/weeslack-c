@@ -17,6 +17,9 @@ struct t_weeslack_workspace
     char *cookie;
     char *ws_url;
     char *my_user_id;
+    /* "active" / "away" from presence events; manual away from /cslack away */
+    char *my_presence;
+    int my_manual_away;
     int connected;
     int reconnect_delay;
     int max_reconnect_delay;
@@ -56,6 +59,7 @@ struct t_weeslack_config
     struct t_config_option *emoji_render_mode;
     struct t_config_option *download_path;
     struct t_config_option *never_away;
+    struct t_config_option *send_typing_notice;
 
     /* color */
     struct t_config_option *color_typing_notice;

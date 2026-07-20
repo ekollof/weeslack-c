@@ -207,7 +207,9 @@ weeslack_cmd_channel_id(struct t_gui_buffer *buffer)
     return weechat_buffer_get_string(buf, "localvar_slack_channel_id");
 }
 
-/* Resolve a message ts: explicit arg, else buffer localvar, else channel last. */
+/* Resolve a message ts: explicit arg (ts / $hash / index), else buffer, else last. */
+static char weeslack_cmd_ts_buf[64];
+
 static const char *
 weeslack_cmd_message_ts(struct t_gui_buffer *buffer, const char *channel_id,
                         const char *explicit_ts)
@@ -217,7 +219,36 @@ weeslack_cmd_message_ts(struct t_gui_buffer *buffer, const char *channel_id,
     struct t_slack_channel *ch;
 
     if (explicit_ts && explicit_ts[0])
+    {
+        /* Full Slack ts (digits.digits) — pass through */
+        if (strchr(explicit_ts, '.') && explicit_ts[0] >= '0' &&
+            explicit_ts[0] <= '9')
+            return explicit_ts;
+
+        if (channel_id)
+        {
+            ch = slack_channel_search(channel_id);
+            if (ch)
+            {
+                struct t_slack_message *m;
+
+                m = slack_message_from_ref(ch->messages, explicit_ts, NULL, NULL);
+                if (m)
+                {
+                    char *s = slack_ts_to_string(m->ts);
+                    if (s)
+                    {
+                        snprintf(weeslack_cmd_ts_buf, sizeof(weeslack_cmd_ts_buf),
+                                 "%s", s);
+                        free(s);
+                        return weeslack_cmd_ts_buf;
+                    }
+                }
+            }
+        }
+        /* Unknown hash/index — still return raw (may fail at API) */
         return explicit_ts;
+    }
 
     buf = weeslack_cmd_buffer(buffer);
     ts = weechat_buffer_get_string(buf, "localvar_slack_timestamp");
@@ -359,7 +390,8 @@ weeslack_command_cslack(const void *pointer, void *data,
         weechat_printf(buffer, "%sweeslack: refreshing channel list...",
                         weechat_prefix("network"));
     }
-    else if (weechat_strcasecmp(argv[1], "loadhistory") == 0)
+    else if (weechat_strcasecmp(argv[1], "loadhistory") == 0 ||
+             weechat_strcasecmp(argv[1], "rehistory") == 0)
     {
         struct t_weeslack_workspace *ws;
         ws = weeslack_workspace_search("default");
@@ -465,32 +497,35 @@ weeslack_command_cslack(const void *pointer, void *data,
         /*
          * /cslack reply <thread_ts> <message>
          * /cslack reply <message...>  → parent = last message ts
-         * (ts form is seconds.microseconds — all digits + one dot)
+         * Parent ref: full ts, $hash, or N — then message text.
          */
         {
-            int ts_form = 0;
+            int ref_form = 0;
             if (argc >= 4 && argv[2])
             {
                 const char *p = argv[2];
                 const char *dot = strchr(p, '.');
                 if (dot && dot > p && dot[1])
                 {
-                    ts_form = 1;
+                    ref_form = 1;
                     for (; *p; p++)
                     {
                         if (*p == '.')
                             continue;
                         if (*p < '0' || *p > '9')
                         {
-                            ts_form = 0;
+                            ref_form = 0;
                             break;
                         }
                     }
                 }
+                else if (p[0] == '$' ||
+                         (p[0] >= '1' && p[0] <= '9' && !strchr(p, ' ')))
+                    ref_form = 1;
             }
-            if (ts_form)
+            if (ref_form)
             {
-                thread_ts = argv[2];
+                thread_ts = weeslack_cmd_message_ts(buffer, channel_id, argv[2]);
                 msg = argv_eol[3];
             }
             else if (argc >= 3)
@@ -847,6 +882,11 @@ weeslack_command_cslack(const void *pointer, void *data,
         }
 
         slack_event_set_presence(ws, "away");
+        ws->my_manual_away = 1;
+        free(ws->my_presence);
+        ws->my_presence = strdup("away");
+        weechat_bar_item_update("away");
+        weechat_bar_item_update("slack_away");
         weechat_printf(buffer, "%sweeslack: marked as away",
                         weechat_prefix("network"));
     }
@@ -863,6 +903,11 @@ weeslack_command_cslack(const void *pointer, void *data,
 
         slack_event_set_presence(ws, "auto");
         slack_event_set_dnd(ws, 0);
+        ws->my_manual_away = 0;
+        free(ws->my_presence);
+        ws->my_presence = strdup("active");
+        weechat_bar_item_update("away");
+        weechat_bar_item_update("slack_away");
         weechat_printf(buffer, "%sweeslack: marked as active",
                         weechat_prefix("network"));
     }
@@ -893,6 +938,12 @@ weeslack_command_cslack(const void *pointer, void *data,
     else if (weechat_strcasecmp(argv[1], "thread") == 0)
     {
         struct t_weeslack_workspace *ws;
+        struct t_slack_channel *channel;
+        struct t_slack_message *parent = NULL;
+        const char *channel_id;
+        char *parent_ts = NULL;
+        const char *ref;
+
         ws = weeslack_workspace_search("default");
         if (!ws || !ws->connected)
         {
@@ -901,7 +952,7 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        const char *channel_id = weeslack_cmd_channel_id(buffer);
+        channel_id = weeslack_cmd_channel_id(buffer);
         if (!channel_id)
         {
             weechat_printf(buffer, "%sweeslack: no channel selected",
@@ -909,7 +960,7 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        struct t_slack_channel *channel = slack_channel_search(channel_id);
+        channel = slack_channel_search(channel_id);
         if (!channel)
         {
             weechat_printf(buffer, "%sweeslack: channel not found",
@@ -917,23 +968,61 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        if (argc < 3)
+        /*
+         * /cslack thread [$hash|N|ts]
+         * No arg → last message that has replies (wee-slack).
+         */
+        ref = (argc >= 3) ? argv[2] : NULL;
+        if (ref && ref[0])
+        {
+            parent = slack_message_from_ref(channel->messages, ref, NULL, NULL);
+            if (!parent)
+            {
+                /* raw ts string even if not in model yet */
+                if (strchr(ref, '.'))
+                    parent_ts = strdup(ref);
+            }
+        }
+        else
+        {
+            struct t_slack_message *m;
+            for (m = channel->messages; m; m = m->next)
+            {
+                if (m->reply_count > 0)
+                {
+                    parent = m;
+                    break;
+                }
+            }
+        }
+
+        if (parent)
+            parent_ts = slack_ts_to_string(parent->ts);
+
+        if (!parent_ts || !parent_ts[0])
         {
             weechat_printf(buffer,
-                            "%sweeslack: usage: /cslack thread <parent_ts>  "
-                            "(open a real Slack thread by message timestamp)",
+                            "%sweeslack: no thread found "
+                            "(usage: /cslack thread [$hash|N|ts])",
                             weechat_prefix("error"));
+            free(parent_ts);
             return WEECHAT_RC_OK;
         }
 
         {
             struct t_slack_channel *thread;
-            thread = slack_thread_channel_find(channel, argv[2]);
+            char topic_buf[256];
+
+            thread = slack_thread_channel_find(channel, parent_ts);
             if (!thread)
             {
-                char topic_buf[256];
-                snprintf(topic_buf, sizeof(topic_buf), "Thread: %s", argv[2]);
-                thread = slack_thread_channel_create(channel, argv[2],
+                if (parent && parent->hash)
+                    snprintf(topic_buf, sizeof(topic_buf),
+                             "Thread: $%s", parent->hash);
+                else
+                    snprintf(topic_buf, sizeof(topic_buf),
+                             "Thread: %s", parent_ts);
+                thread = slack_thread_channel_create(channel, parent_ts,
                                                      topic_buf);
                 if (thread)
                 {
@@ -947,6 +1036,7 @@ weeslack_command_cslack(const void *pointer, void *data,
                 weechat_printf(buffer, "%sweeslack: could not open thread",
                                 weechat_prefix("error"));
         }
+        free(parent_ts);
     }
     else if (weechat_strcasecmp(argv[1], "react") == 0 ||
              weechat_strcasecmp(argv[1], "unreact") == 0)
@@ -1556,6 +1646,15 @@ weeslack_config_init(void)
         NULL, NULL, NULL,
         NULL, NULL, NULL);
 
+    weeslack_config.send_typing_notice = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "send_typing_notice", "boolean",
+        "Send typing indicator to Slack while composing in a channel buffer",
+        NULL, 0, 0, "on", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
     /* color section */
     weeslack_config.section_color = weechat_config_new_section(
         weeslack_config.file, "color",
@@ -1810,15 +1909,30 @@ weeslack_thread_completion_cb(const void *pointer, void *data,
 
     /* Only offer completions from thread-capable buffers */
     const char *channel_id = weeslack_cmd_channel_id(buffer);
+    struct t_slack_channel *parent;
+    struct t_slack_message *m;
+    struct t_slack_channel *ch;
+
     if (!channel_id)
         return WEECHAT_RC_OK;
 
-    struct t_slack_channel *parent = slack_channel_search(channel_id);
+    parent = slack_channel_search(channel_id);
     if (!parent)
         return WEECHAT_RC_OK;
 
+    /* Offer $hash for parents that have replies */
+    for (m = parent->messages; m; m = m->next)
+    {
+        if (m->reply_count > 0 && m->hash)
+        {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "$%s", m->hash);
+            weechat_completion_list_add(completion, buf, 0,
+                                         WEECHAT_LIST_POS_SORT);
+        }
+    }
+
     /* Search all channels for thread children of this parent */
-    struct t_slack_channel *ch;
     for (ch = slack_channel_list_global(); ch; ch = ch->next)
     {
         if (ch->type == SLACK_CHANNEL_TYPE_THREAD && ch->id)
@@ -1831,7 +1945,7 @@ weeslack_thread_completion_cb(const void *pointer, void *data,
                 const char *rest = ch->id + prefix_len;
                 const char *underscore = strchr(rest, '_');
                 if (underscore && strncmp(rest, channel_id,
-                                          underscore - rest) == 0)
+                                          (size_t)(underscore - rest)) == 0)
                 {
                     weechat_completion_list_add(completion, ch->id, 0,
                                                  WEECHAT_LIST_POS_SORT);
@@ -2212,6 +2326,87 @@ weeslack_never_away_cb(const void *pointer, void *data, int remaining_calls)
     return WEECHAT_RC_OK;
 }
 
+/* away / slack_away bar items (wee-slack) */
+static char *
+weeslack_away_bar_cb(const void *pointer, void *data,
+                     struct t_gui_bar_item *item,
+                     struct t_gui_window *window,
+                     struct t_gui_buffer *buffer,
+                     struct t_hashtable *extra_info)
+{
+    struct t_weeslack_workspace *ws;
+    const char *color;
+    char *out;
+    int away = 0;
+    int manual = 0;
+
+    (void)pointer;
+    (void)data;
+    (void)item;
+    (void)window;
+    (void)buffer;
+    (void)extra_info;
+
+    for (ws = weeslack_workspaces; ws; ws = ws->next_workspace)
+    {
+        if (!ws->connected)
+            continue;
+        if (ws->my_manual_away ||
+            (ws->my_presence && strcmp(ws->my_presence, "away") == 0))
+        {
+            away = 1;
+            manual = ws->my_manual_away;
+            break;
+        }
+    }
+    if (!away)
+        return NULL;
+
+    color = weechat_config_string(weechat_config_get("weechat.color.item_away"));
+    if (!color || !color[0])
+        color = "cyan";
+    out = malloc(64);
+    if (!out)
+        return NULL;
+    snprintf(out, 64, "%s%s%s",
+             weechat_color(color),
+             manual ? "manual away" : "auto away",
+             weechat_color("reset"));
+    return out;
+}
+
+/* Send typing notices while composing (throttled lightly by WeeChat signals). */
+static int
+weeslack_input_text_changed_cb(const void *pointer, void *data,
+                                const char *signal, const char *type_data,
+                                void *signal_data)
+{
+    struct t_gui_buffer *buf = signal_data;
+    const char *channel_id;
+    struct t_weeslack_workspace *ws;
+
+    (void)pointer;
+    (void)data;
+    (void)signal;
+    (void)type_data;
+
+    if (!weechat_config_boolean(weeslack_config.send_typing_notice))
+        return WEECHAT_RC_OK;
+    if (!buf)
+        return WEECHAT_RC_OK;
+
+    channel_id = weechat_buffer_get_string(buf, "localvar_slack_channel_id");
+    if (!channel_id || !channel_id[0])
+        return WEECHAT_RC_OK;
+
+    ws = weeslack_workspace_search("default");
+    if (!ws || !ws->connected)
+        return WEECHAT_RC_OK;
+
+    slack_event_send_typing(ws, channel_id);
+    return WEECHAT_RC_OK;
+}
+
 int
 weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
 {
@@ -2225,7 +2420,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_command(
         "cslack",
         "Slack protocol commands",
-        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || create || invite || showmuted || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
+        "connect || disconnect || migrate || list || channels || loadhistory || rehistory || typing || upload || reply || topic || talk || mute || unmute || status || create || invite || showmuted || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
         "connect:      Connect to Slack using configured token\n"
         "disconnect:   Disconnect from Slack\n"
         "migrate:      Import token from wee-slack (python) config\n"
@@ -2234,6 +2429,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "users:        List loaded users\n"
         "usergroups:   List user groups\n"
         "loadhistory:  Load message history for current channel\n"
+        "rehistory:    Alias for loadhistory\n"
         "typing:       Send typing notification for current channel\n"
         "upload:       Upload a file to current channel\n"
         "reply:        Reply in thread ([ts] msg; default last msg as parent)\n"
@@ -2270,7 +2466,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "refresh:      Re-fetch users.list + emoji.list (no re-bootstrap)\n"
         "names:        Refresh nicklist for the current channel\n"
         "help:         Show help",
-        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status -delete|%(slack_emoji)|dnd|away|active|create -private|invite %(slack_nicks)|showmuted|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
+        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|rehistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status -delete|%(slack_emoji)|dnd|away|active|create -private|invite %(slack_nicks)|showmuted|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
         &weeslack_command_cslack,
         NULL,
         NULL);
@@ -2288,6 +2484,11 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
 
     weechat_hook_signal("buffer_switch",
                          &weeslack_buffer_switch_cb, NULL, NULL);
+    weechat_hook_signal("input_text_changed",
+                         &weeslack_input_text_changed_cb, NULL, NULL);
+
+    weechat_bar_item_new("away", &weeslack_away_bar_cb, NULL, NULL);
+    weechat_bar_item_new("slack_away", &weeslack_away_bar_cb, NULL, NULL);
 
     weechat_hook_hdata("cslack_channel", "Slack channels",
                         &weeslack_hdata_channel_cb, NULL, NULL);
@@ -2475,6 +2676,8 @@ weeslack_workspace_new(const char *name, const char *token, const char *cookie)
     workspace->max_reconnect_delay = 60;
     workspace->ws = NULL;
     workspace->my_user_id = NULL;
+    workspace->my_presence = strdup("active");
+    workspace->my_manual_away = 0;
     workspace->next_workspace = weeslack_workspaces;
     workspace->prev_workspace = NULL;
 
@@ -2505,6 +2708,7 @@ weeslack_workspace_free(struct t_weeslack_workspace *workspace)
     free(workspace->cookie);
     free(workspace->ws_url);
     free(workspace->my_user_id);
+    free(workspace->my_presence);
     free(workspace);
 
     return WEECHAT_RC_OK;
