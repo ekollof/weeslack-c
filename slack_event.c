@@ -27,6 +27,9 @@ static void slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
                                  int return_code, const char *output,
                                  void *user_data);
 static void slack_event_presence_subscribe(struct t_weeslack_workspace *workspace);
+static void slack_event_try_icat_preview(struct t_gui_buffer *buffer,
+                                          const char *path,
+                                          const char *mimetype);
 static void slack_event_custom_emoji_icat(
     struct t_weeslack_workspace *workspace,
     struct t_gui_buffer *buffer,
@@ -6130,6 +6133,34 @@ slack_event_upload_complete_cb(struct t_weeslack_workspace *workspace,
                                   name, size_buf,
                                   (permalink && permalink[0]) ? " — " : "",
                                   (permalink && permalink[0]) ? permalink : "");
+
+        /*
+         * Own uploads: the file is already local — preview immediately.
+         * Self-DMs often skip RTM file_share, so auto_download never runs.
+         */
+        if (buf && ctx->file_path && ctx->file_path[0])
+            slack_event_try_icat_preview(buf, ctx->file_path, NULL);
+
+        /*
+         * If Slack returned private URLs, auth-download into the Xepher tree
+         * (completeUpload often only returns id/title — then this no-ops).
+         */
+        if (ch && files_obj &&
+            json_object_is_type(files_obj, json_type_array) &&
+            (weechat_config_boolean(weeslack_config.auto_download_files) ||
+             weechat_config_boolean(weeslack_config.icat_enabled)))
+        {
+            struct json_object *wrap = json_object_new_object();
+
+            if (wrap)
+            {
+                json_object_object_add(wrap, "files",
+                                       json_object_get(files_obj));
+                slack_event_auto_download_message_files(
+                    workspace, ch, wrap, buf);
+                json_object_put(wrap);
+            }
+        }
     }
 
     json_object_put(json);
@@ -7688,6 +7719,21 @@ slack_event_is_image_mime(const char *mime)
 }
 
 static int
+slack_event_is_image_filetype(const char *ft)
+{
+    if (!ft || !ft[0])
+        return 0;
+    return (weechat_strcasecmp(ft, "png") == 0 ||
+            weechat_strcasecmp(ft, "jpg") == 0 ||
+            weechat_strcasecmp(ft, "jpeg") == 0 ||
+            weechat_strcasecmp(ft, "gif") == 0 ||
+            weechat_strcasecmp(ft, "webp") == 0 ||
+            weechat_strcasecmp(ft, "bmp") == 0 ||
+            weechat_strcasecmp(ft, "heic") == 0 ||
+            weechat_strcasecmp(ft, "heif") == 0);
+}
+
+static int
 slack_event_is_image_path(const char *path)
 {
     const char *dot = NULL;
@@ -7710,7 +7756,8 @@ slack_event_is_image_path(const char *path)
     ext[n] = '\0';
     return (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
             strcmp(ext, ".png") == 0 || strcmp(ext, ".gif") == 0 ||
-            strcmp(ext, ".webp") == 0 || strcmp(ext, ".bmp") == 0);
+            strcmp(ext, ".webp") == 0 || strcmp(ext, ".bmp") == 0 ||
+            strcmp(ext, ".heic") == 0 || strcmp(ext, ".heif") == 0);
 }
 
 /* PNG / JPEG pixel size for /icat -columns/-rows (Xepher util). */
@@ -8341,7 +8388,9 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
                                          struct json_object *msg_json,
                                          struct t_gui_buffer *buffer)
 {
-    struct json_object *files_obj;
+    struct json_object *files_obj = NULL;
+    struct json_object *single_wrap = NULL;
+    int free_wrap = 0;
     int count, i;
     char origin[192];
     const char *team, *ch_name;
@@ -8359,12 +8408,36 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
     if (!auto_all && want_icat && !slack_event_icat_available(buffer))
         return;
 
-    if (!json_object_object_get_ex(msg_json, "files", &files_obj))
+    /*
+     * Live RTM file_share uses "file": {...}; API history uses "files": [...].
+     * Without the single-file path, auto-download + /icat never run for
+     * typical upload events.
+     */
+    if (json_object_object_get_ex(msg_json, "files", &files_obj) &&
+        json_object_is_type(files_obj, json_type_array))
+    {
+        /* as-is */
+    }
+    else if (json_object_object_get_ex(msg_json, "file", &files_obj) &&
+             json_object_is_type(files_obj, json_type_object))
+    {
+        single_wrap = json_object_new_array();
+        if (!single_wrap)
+            return;
+        json_object_array_add(single_wrap, json_object_get(files_obj));
+        files_obj = single_wrap;
+        free_wrap = 1;
+    }
+    else
         return;
 
     count = json_object_array_length(files_obj);
     if (count <= 0)
+    {
+        if (free_wrap)
+            json_object_put(single_wrap);
         return;
+    }
 
     team = workspace->name ? workspace->name : workspace->id;
     ch_name = (channel && channel->name) ? channel->name
@@ -8424,15 +8497,30 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
         }
 
         is_image = slack_event_is_image_mime(mimetype) ||
+                   slack_event_is_image_filetype(filetype) ||
                    slack_event_is_image_path(preferred[0] ? preferred : url);
 
         if (!auto_all && !is_image)
             continue;
 
+        /* Ensure download path has a recognizable image extension for icat. */
+        if (is_image && preferred[0] && !slack_event_is_image_path(preferred) &&
+            filetype && filetype[0] &&
+            !strstr(preferred, filetype))
+        {
+            char base[240];
+
+            snprintf(base, sizeof(base), "%s", preferred);
+            snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
+        }
+
         slack_event_download_file_ex(workspace, url, buffer, origin,
                                       preferred[0] ? preferred : NULL,
                                       mimetype, 1 /* quiet */);
     }
+
+    if (free_wrap)
+        json_object_put(single_wrap);
 }
 
 /* ============================================================
