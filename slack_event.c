@@ -417,6 +417,40 @@ slack_blocks_collect_text(struct json_object *node, char *out, size_t out_size,
     }
 }
 
+/* notify_* tags: highlight when message mentions this workspace user. */
+static const char *
+slack_event_notify_tags(struct t_weeslack_workspace *workspace,
+                        struct t_slack_channel *channel,
+                        const char *text,
+                        int history)
+{
+    if (history)
+        return "no_highlight,notify_none,no_log,logger_backlog";
+    if (channel && channel->is_muted)
+        return "no_highlight,notify_none,log1";
+
+    if (workspace && workspace->my_user_id && text && text[0])
+    {
+        char needle[80];
+        snprintf(needle, sizeof(needle), "<@%s", workspace->my_user_id);
+        if (strstr(text, needle) != NULL)
+            return "notify_highlight,log1,slack_mention";
+        /* also plain @display_name if we can resolve self */
+        {
+            struct t_slack_user *me = slack_user_search(workspace->my_user_id);
+            const char *dn = me ? slack_user_best_name(me) : NULL;
+            if (dn && dn[0])
+            {
+                char at[128];
+                snprintf(at, sizeof(at), "@%s", dn);
+                if (strstr(text, at) != NULL)
+                    return "notify_highlight,log1,slack_mention";
+            }
+        }
+    }
+    return "notify_message,log1";
+}
+
 static char *
 slack_event_message_text(struct json_object *msg_json)
 {
@@ -748,11 +782,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
 
             snprintf(tags, sizeof(tags),
                      "%s,slack_ts_%s",
-                     history
-                         ? "no_highlight,notify_none,no_log,logger_backlog"
-                         : (channel->is_muted
-                            ? "no_highlight,notify_none,log1"
-                            : "notify_message,log1"),
+                     slack_event_notify_tags(workspace, channel, text, history),
                      ts_tag ? ts_tag : "0");
 
             weechat_printf_date_tags(
@@ -831,11 +861,8 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
 
         snprintf(tags, sizeof(tags),
                  "%s,slack_ts_%s%s",
-                 history
-                     ? "no_highlight,notify_none,no_log,logger_backlog"
-                     : (display_channel->is_muted
-                        ? "no_highlight,notify_none,log1"
-                        : "notify_message,log1"),
+                 slack_event_notify_tags(workspace, display_channel, text,
+                                         history),
                  ts_tag ? ts_tag : "0",
                  is_me ? ",slack_me" : "");
 
@@ -1365,6 +1392,80 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                                 "%sweeslack: %s joined the team",
                                 weechat_prefix("network"),
                                 u ? slack_user_best_name(u) : uid);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, "pin_added") == 0 || strcmp(type, "pin_removed") == 0)
+    {
+        struct json_object *channel_obj, *item_obj, *user_obj;
+        const char *channel_id = NULL;
+        const char *user_id = NULL;
+        const char *item_ts = NULL;
+        int added = (strcmp(type, "pin_added") == 0);
+
+        if (json_object_object_get_ex(json, "channel_id", &channel_obj))
+            channel_id = json_object_get_string(channel_obj);
+        if (!channel_id &&
+            json_object_object_get_ex(json, "channel", &channel_obj))
+            channel_id = json_object_get_string(channel_obj);
+        if (json_object_object_get_ex(json, "user", &user_obj))
+            user_id = json_object_get_string(user_obj);
+        if (json_object_object_get_ex(json, "item", &item_obj))
+        {
+            struct json_object *msg_obj, *ts_obj;
+            if (json_object_object_get_ex(item_obj, "message", &msg_obj) &&
+                json_object_object_get_ex(msg_obj, "ts", &ts_obj))
+                item_ts = json_object_get_string(ts_obj);
+            else if (json_object_object_get_ex(item_obj, "ts", &ts_obj))
+                item_ts = json_object_get_string(ts_obj);
+        }
+
+        if (channel_id)
+        {
+            struct t_slack_channel *ch = slack_channel_search(channel_id);
+            struct t_slack_user *u = user_id ? slack_user_search(user_id) : NULL;
+            const char *who = u ? slack_user_best_name(u)
+                : (user_id ? user_id : "?");
+            if (ch && ch->buffer)
+            {
+                weechat_printf(ch->buffer,
+                                "%s%s pin by %s%s%s",
+                                weechat_prefix("network"),
+                                added ? "pinned" : "unpinned",
+                                who,
+                                item_ts ? " ts=" : "",
+                                item_ts ? item_ts : "");
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, "channel_left") == 0 ||
+        strcmp(type, "group_left") == 0 ||
+        strcmp(type, "im_close") == 0 ||
+        strcmp(type, "mpim_close") == 0)
+    {
+        struct json_object *channel_obj;
+        const char *channel_id = NULL;
+
+        if (json_object_object_get_ex(json, "channel", &channel_obj))
+            channel_id = json_object_get_string(channel_obj);
+        if (channel_id)
+        {
+            struct t_slack_channel *ch = slack_channel_search(channel_id);
+            if (ch)
+            {
+                ch->is_member = 0;
+                if (ch->buffer)
+                {
+                    weechat_printf(ch->buffer,
+                                    "%sleft this conversation%s",
+                                    weechat_prefix("network"),
+                                    weechat_color("reset"));
+                    weechat_buffer_set(ch->buffer, "notify", "none");
+                }
             }
         }
         return;
@@ -2074,8 +2175,8 @@ slack_event_in_bootstrap_quiet(void)
 /* History: up to HISTORY_MAX_PAGES pages of HISTORY_PAGE_SIZE on the slow
  * queue. Messages are accumulated then flushed oldest→newest so multi-page
  * loads stay in chronological buffer order without stampeding the API. */
-#define SLACK_HISTORY_PAGE_SIZE   50
-#define SLACK_HISTORY_MAX_PAGES   3
+#define SLACK_HISTORY_PAGE_SIZE  100
+#define SLACK_HISTORY_MAX_PAGES    5
 #define SLACK_MEMBERS_PAGE_SIZE  200
 #define SLACK_MEMBERS_MAX_PAGES    3
 

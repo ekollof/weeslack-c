@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — last-ts commands, blocks text, me_message,
-purpose, channel/im create, team_join
+**Last update:** 2026-07-20 — pin/leave RTM, mention highlights, reply default,
+history 5×100
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -37,7 +37,7 @@ purpose, channel/im create, team_join
 
 - [x] Server + child hierarchy, localvars  
 - [x] Lazy history + serial queue; members on focus  
-- [x] History pagination — up to **3×50** on slow queue; accumulate → chronological flush  
+- [x] History pagination — up to **5×100** on slow queue; accumulate → chronological flush  
 - [x] Members pagination — up to **3×200** on slow queue  
 - [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe)  
 - [x] Buflist trigger includes `weeslack` (export conf)  
@@ -75,7 +75,7 @@ purpose, channel/im create, team_join
 
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
-- [x] **`linkarchive` / pin / star / react** default to last printed message ts  
+- [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
 - [x] Stars list — resolve channel/user names, format text (cap 40 shown)  
 - [x] Search list — resolve names, format text (cap 20 shown)  
 - [~] subscribe = local thread notify only  
@@ -116,6 +116,8 @@ purpose, channel/im create, team_join
 - [x] `member_joined_channel` / `member_left_channel` (nicklist + notice)  
 - [x] `user_change`, `channel_rename` / `group_rename`, archive/unarchive  
 - [x] `channel_created` / `group_joined` / `im_created` / `mpim_joined` / `team_join`  
+- [x] `pin_added` / `pin_removed`, `channel_left` / `group_left` / `im_close` / `mpim_close`  
+- [x] Self-mention → `notify_highlight` (raw `<@U…>` or `@display_name`)  
 - [x] `me_message` (/me style), `channel_purpose`, Block Kit text fallback  
 - [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
 - [x] Rate-limit + auth messaging  

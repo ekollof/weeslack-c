@@ -442,6 +442,10 @@ weeslack_command_cslack(const void *pointer, void *data,
     else if (weechat_strcasecmp(argv[1], "reply") == 0)
     {
         struct t_weeslack_workspace *ws;
+        const char *channel_id;
+        const char *thread_ts;
+        const char *msg;
+
         ws = weeslack_workspace_search("default");
         if (!ws || !ws->connected)
         {
@@ -450,14 +454,7 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        if (argc < 4)
-        {
-            weechat_printf(buffer, "%sweeslack: usage: /cslack reply <thread_ts> <message>",
-                            weechat_prefix("error"));
-            return WEECHAT_RC_OK;
-        }
-
-        const char *channel_id = weeslack_cmd_channel_id(buffer);
+        channel_id = weeslack_cmd_channel_id(buffer);
         if (!channel_id)
         {
             weechat_printf(buffer, "%sweeslack: no channel selected",
@@ -465,7 +462,58 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        slack_event_send_message(ws, channel_id, argv_eol[3], argv[2]);
+        /*
+         * /cslack reply <thread_ts> <message>
+         * /cslack reply <message...>  → parent = last message ts
+         * (ts form is seconds.microseconds — all digits + one dot)
+         */
+        {
+            int ts_form = 0;
+            if (argc >= 4 && argv[2])
+            {
+                const char *p = argv[2];
+                const char *dot = strchr(p, '.');
+                if (dot && dot > p && dot[1])
+                {
+                    ts_form = 1;
+                    for (; *p; p++)
+                    {
+                        if (*p == '.')
+                            continue;
+                        if (*p < '0' || *p > '9')
+                        {
+                            ts_form = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (ts_form)
+            {
+                thread_ts = argv[2];
+                msg = argv_eol[3];
+            }
+            else if (argc >= 3)
+            {
+                thread_ts = weeslack_cmd_message_ts(buffer, channel_id, NULL);
+                msg = argv_eol[2];
+            }
+            else
+            {
+                thread_ts = NULL;
+                msg = NULL;
+            }
+        }
+
+        if (!msg || !msg[0] || !thread_ts || !thread_ts[0])
+        {
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack reply [thread_ts] <message>",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+
+        slack_event_send_message(ws, channel_id, msg, thread_ts);
     }
     else if (weechat_strcasecmp(argv[1], "topic") == 0)
     {
@@ -1029,7 +1077,7 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %supload%s <file> Upload a file",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %sreply%s <ts> <msg> Reply in thread",
+        weechat_printf(buffer, "  %sreply%s [ts] <msg> Reply in thread (default: last)",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %stopic%s <text>    Set channel topic",
                         weechat_color("cyan"), weechat_color("reset"));
@@ -1846,7 +1894,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "loadhistory:  Load message history for current channel\n"
         "typing:       Send typing notification for current channel\n"
         "upload:       Upload a file to current channel\n"
-        "reply:        Reply to a thread\n"
+        "reply:        Reply in thread ([ts] msg; default last msg as parent)\n"
         "topic:        Set channel topic\n"
         "talk:         Open DM with user id or name\n"
         "mute:         Mute current channel\n"
