@@ -493,6 +493,108 @@ slack_event_unescape_html(const char *text)
     return out;
 }
 
+/*
+ * Format message reactions like wee-slack: " [:thumbsup:2 :heart:1]"
+ * Own reactions use a brighter color. Caller frees.
+ */
+static char *
+slack_event_format_reactions(struct t_weeslack_workspace *workspace,
+                             struct json_object *msg_json)
+{
+    struct json_object *reactions_obj;
+    size_t cap = 512;
+    char *out;
+    size_t pos = 0;
+    int i, count, any = 0;
+    const char *my_id;
+
+    if (!msg_json ||
+        !json_object_object_get_ex(msg_json, "reactions", &reactions_obj) ||
+        !json_object_is_type(reactions_obj, json_type_array))
+        return NULL;
+
+    count = json_object_array_length(reactions_obj);
+    if (count <= 0)
+        return NULL;
+
+    out = malloc(cap);
+    if (!out)
+        return NULL;
+    out[0] = '\0';
+
+    my_id = (workspace && workspace->my_user_id) ? workspace->my_user_id : NULL;
+
+    pos += (size_t)snprintf(out + pos, cap - pos, " %s[",
+                            weechat_color("darkgray"));
+
+    for (i = 0; i < count; i++)
+    {
+        struct json_object *r = json_object_array_get_idx(reactions_obj, i);
+        struct json_object *name_obj, *count_obj, *users_obj;
+        const char *rname = NULL;
+        int rcount = 0;
+        int mine = 0;
+        int written;
+
+        if (!r)
+            continue;
+        if (json_object_object_get_ex(r, "name", &name_obj))
+            rname = json_object_get_string(name_obj);
+        if (json_object_object_get_ex(r, "count", &count_obj))
+            rcount = json_object_get_int(count_obj);
+        if (!rname || rcount <= 0)
+            continue;
+
+        if (my_id && json_object_object_get_ex(r, "users", &users_obj) &&
+            json_object_is_type(users_obj, json_type_array))
+        {
+            int j, un = json_object_array_length(users_obj);
+            for (j = 0; j < un; j++)
+            {
+                struct json_object *u = json_object_array_get_idx(users_obj, j);
+                const char *uid = json_object_get_string(u);
+                if (uid && strcmp(uid, my_id) == 0)
+                {
+                    mine = 1;
+                    break;
+                }
+            }
+        }
+
+        if (pos + 64 >= cap)
+        {
+            char *n = realloc(out, cap * 2);
+            if (!n)
+                break;
+            out = n;
+            cap *= 2;
+        }
+
+        if (mine)
+            written = snprintf(out + pos, cap - pos, "%s%s:%s:%d%s",
+                               any ? " " : "",
+                               weechat_color("lightgreen"),
+                               rname, rcount,
+                               weechat_color("darkgray"));
+        else
+            written = snprintf(out + pos, cap - pos, "%s:%s:%d",
+                               any ? " " : "", rname, rcount);
+        if (written > 0)
+            pos += (size_t)written < cap - pos ? (size_t)written : 0;
+        any = 1;
+    }
+
+    if (!any)
+    {
+        free(out);
+        return NULL;
+    }
+
+    if (pos + 8 < cap)
+        snprintf(out + pos, cap - pos, "]%s", weechat_color("reset"));
+    return out;
+}
+
 /* notify_* tags: highlight when message mentions this workspace user. */
 static const char *
 slack_event_notify_tags(struct t_weeslack_workspace *workspace,
@@ -903,6 +1005,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             char *formatted_text = slack_event_render_formatting(text);
             char *emoji_text = slack_event_apply_emoji_mode(formatted_text);
             char *formatted = slack_event_format_mentions(workspace, emoji_text, channel);
+            char *reactions = slack_event_format_reactions(workspace, msg_json);
             char tags[256];
             char *ts_tag = slack_ts_to_string(ts);
             const char *thread_color = weechat_config_string(
@@ -933,9 +1036,10 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                 channel->buffer,
                 ts.sec,
                 tags,
-                "%s\t%s  %s[%d replies]%s",
+                "%s\t%s%s  %s[%d replies]%s",
                 nick_str,
-                formatted,
+                formatted ? formatted : "",
+                reactions ? reactions : "",
                 weechat_color(suffix_color),
                 rc,
                 weechat_color("reset"));
@@ -953,6 +1057,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             free(formatted_text);
             free(emoji_text);
             free(formatted);
+            free(reactions);
         }
         free(text_owned);
         return;
@@ -969,23 +1074,26 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         char *formatted_text = slack_event_render_formatting(text);
         char *emoji_text = slack_event_apply_emoji_mode(formatted_text);
         char *formatted = slack_event_format_mentions(workspace, emoji_text, channel);
+        char *reactions = slack_event_format_reactions(workspace, msg_json);
         char *files = slack_event_format_files(msg_json);
         char *attachments = slack_event_format_attachments(msg_json);
         char tags[256];
         char *ts_tag = slack_ts_to_string(ts);
         const char *bcast = "";
         char bcast_buf[64];
-        char me_buf[512];
+        char me_buf[768];
+        int is_broadcast = (subtype &&
+                            strcmp(subtype, "thread_broadcast") == 0);
 
-        if (thread_ts && !is_parent &&
-            display_channel == channel)
+        if ((thread_ts && !is_parent && display_channel == channel) ||
+            is_broadcast)
         {
             const char *pfx = weechat_config_string(
                 weeslack_config.thread_broadcast_prefix);
             if (!pfx || !pfx[0])
-                pfx = "thread";
-            /* Prefix when showing a reply in the parent (either by config
-             * or because no dedicated thread buffer is open). */
+                pfx = is_broadcast ? "broadcast" : "thread";
+            /* Prefix when showing a reply in the parent (config, no open
+             * thread buffer, or explicit thread_broadcast). */
             snprintf(bcast_buf, sizeof(bcast_buf), " %s[%s]%s",
                      weechat_color("cyan"), pfx, weechat_color("reset"));
             bcast = bcast_buf;
@@ -996,10 +1104,11 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         {
             const char *plain_nick = user ? slack_user_best_name(user)
                 : (user_id ? user_id : "?");
-            snprintf(me_buf, sizeof(me_buf), "%s* %s %s%s",
+            snprintf(me_buf, sizeof(me_buf), "%s* %s %s%s%s",
                      weechat_color("magenta"),
                      plain_nick ? plain_nick : "?",
                      formatted ? formatted : "",
+                     reactions ? reactions : "",
                      weechat_color("reset"));
         }
 
@@ -1026,9 +1135,10 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                 display_channel->buffer,
                 ts.sec,
                 tags,
-                "%s\t%s%s",
+                "%s\t%s%s%s",
                 nick_str,
-                formatted,
+                formatted ? formatted : "",
+                reactions ? reactions : "",
                 bcast);
         }
 
@@ -1076,6 +1186,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         free(formatted_text);
         free(emoji_text);
         free(formatted);
+        free(reactions);
         free(files);
         free(attachments);
     }
@@ -1118,6 +1229,22 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
         workspace->connected = 0;
         if (workspace->ws)
             slack_ws_reconnect(workspace->ws);
+        return;
+    }
+
+    /* Prefer this URL on next reconnect (still re-issue rtm.connect as backup). */
+    if (strcmp(type, "reconnect_url") == 0)
+    {
+        struct json_object *url_obj;
+        if (json_object_object_get_ex(json, "url", &url_obj))
+        {
+            const char *url = json_object_get_string(url_obj);
+            if (url && url[0])
+            {
+                free(workspace->ws_url);
+                workspace->ws_url = strdup(url);
+            }
+        }
         return;
     }
 
@@ -1509,8 +1636,32 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                 }
                 if (user)
                 {
+                    struct t_slack_channel *ch;
+                    char status_title[512];
+
                     slack_user_update(user, user_obj);
                     slack_buffer_update_user_presence(user);
+
+                    /* wee-slack: mirror status onto the 1:1 DM title */
+                    for (ch = slack_channel_list_global(); ch; ch = ch->next)
+                    {
+                        if (ch->type != SLACK_CHANNEL_TYPE_DM || !ch->buffer ||
+                            !ch->user_id || strcmp(ch->user_id, uid) != 0)
+                            continue;
+                        if (user->status_text && user->status_text[0])
+                        {
+                            if (user->status_emoji && user->status_emoji[0])
+                                snprintf(status_title, sizeof(status_title),
+                                         "%s %s", user->status_emoji,
+                                         user->status_text);
+                            else
+                                snprintf(status_title, sizeof(status_title),
+                                         "%s", user->status_text);
+                        }
+                        else
+                            status_title[0] = '\0';
+                        weechat_buffer_set(ch->buffer, "title", status_title);
+                    }
                 }
             }
         }
@@ -1594,38 +1745,70 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
         return;
     }
 
-    /* New channel / group / IM created while connected */
+    /*
+     * Channel lifecycle while connected (wee-slack parity):
+     *  - channel_created: model only, is_member=0, no buffer
+     *  - channel_joined / group_joined / mpim_joined: member + open buffer
+     *  - im_created: model only; im_open opens + hotlist
+     *  - im_open: open existing DM buffer (or create from id)
+     */
     if (strcmp(type, "channel_created") == 0 ||
+        strcmp(type, "channel_joined") == 0 ||
         strcmp(type, "group_joined") == 0 ||
         strcmp(type, "im_created") == 0 ||
+        strcmp(type, "im_open") == 0 ||
         strcmp(type, "mpim_joined") == 0)
     {
         struct json_object *channel_obj = NULL;
         enum slack_channel_type ctype = SLACK_CHANNEL_TYPE_CHANNEL;
         const char *cid = NULL, *cname = NULL;
+        int open_buffer = 0;
+        int is_member = 0;
+        int announce_created = 0;
 
-        if (strcmp(type, "im_created") == 0)
+        if (strcmp(type, "im_created") == 0 || strcmp(type, "im_open") == 0)
             ctype = SLACK_CHANNEL_TYPE_DM;
         else if (strcmp(type, "mpim_joined") == 0)
             ctype = SLACK_CHANNEL_TYPE_MPDM;
         else if (strcmp(type, "group_joined") == 0)
             ctype = SLACK_CHANNEL_TYPE_GROUP;
 
+        if (strcmp(type, "channel_joined") == 0 ||
+            strcmp(type, "group_joined") == 0 ||
+            strcmp(type, "mpim_joined") == 0 ||
+            strcmp(type, "im_open") == 0)
+        {
+            open_buffer = 1;
+            is_member = 1;
+        }
+        else if (strcmp(type, "channel_created") == 0)
+            announce_created = 1;
+        else if (strcmp(type, "im_created") == 0)
+            is_member = 1; /* we own the IM; open deferred to im_open */
+
+        /* channel field may be object (joined/created) or bare id (im_open) */
         if (json_object_object_get_ex(json, "channel", &channel_obj))
         {
-            struct json_object *id_obj, *name_obj, *user_obj;
-            if (json_object_object_get_ex(channel_obj, "id", &id_obj))
-                cid = json_object_get_string(id_obj);
-            if (json_object_object_get_ex(channel_obj, "name", &name_obj))
-                cname = json_object_get_string(name_obj);
-            if (cid)
+            if (json_object_is_type(channel_obj, json_type_string))
             {
-                struct t_slack_channel *ch = slack_channel_search(cid);
-                if (!ch)
+                cid = json_object_get_string(channel_obj);
+            }
+            else if (json_object_is_type(channel_obj, json_type_object))
+            {
+                struct json_object *id_obj, *name_obj, *user_obj;
+                if (json_object_object_get_ex(channel_obj, "id", &id_obj))
+                    cid = json_object_get_string(id_obj);
+                if (json_object_object_get_ex(channel_obj, "name", &name_obj))
+                    cname = json_object_get_string(name_obj);
+                if (cid)
                 {
-                    ch = slack_channel_new(cid,
-                                           cname && cname[0] ? cname : cid,
-                                           ctype);
+                    struct t_slack_channel *ch = slack_channel_search(cid);
+                    if (!ch)
+                    {
+                        ch = slack_channel_new(cid,
+                                               cname && cname[0] ? cname : cid,
+                                               ctype);
+                    }
                     if (ch)
                     {
                         slack_channel_update(ch, channel_obj);
@@ -1637,16 +1820,63 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                             ch->user_id = strdup(
                                 json_object_get_string(user_obj));
                         }
-                        ch->is_member = 1;
-                        if (!ch->buffer)
+                        ch->is_member = is_member;
+                        if (open_buffer && !ch->buffer)
                             slack_buffer_new(workspace, ch);
-                        SLACK_WS_PRINTF(
-                            workspace,
-                            "%sweeslack: joined %s",
-                            weechat_prefix("network"),
-                            ch->name ? ch->name : cid);
+                        if (open_buffer && ch->buffer &&
+                            strcmp(type, "im_open") == 0)
+                            weechat_buffer_set(ch->buffer, "hotlist", "2");
+                        if (open_buffer)
+                            SLACK_WS_PRINTF(
+                                workspace,
+                                "%sweeslack: joined %s",
+                                weechat_prefix("network"),
+                                ch->name ? ch->name : cid);
+                        else if (announce_created)
+                            SLACK_WS_PRINTF(
+                                workspace,
+                                "%sweeslack: channel created: %s",
+                                weechat_prefix("network"),
+                                ch->name ? ch->name : cid);
                     }
+                    return;
                 }
+            }
+        }
+
+        /* im_open often only has channel id string */
+        if (cid && cid[0])
+        {
+            struct t_slack_channel *ch = slack_channel_search(cid);
+            struct json_object *user_obj;
+
+            if (!ch)
+            {
+                const char *dm_name = cid;
+                if (json_object_object_get_ex(json, "user", &user_obj))
+                {
+                    const char *peer = json_object_get_string(user_obj);
+                    struct t_slack_user *u = peer ? slack_user_search(peer)
+                                                 : NULL;
+                    if (u)
+                        dm_name = slack_user_best_name(u);
+                }
+                ch = slack_channel_new(cid, dm_name, ctype);
+                if (ch &&
+                    json_object_object_get_ex(json, "user", &user_obj))
+                {
+                    free(ch->user_id);
+                    ch->user_id = strdup(json_object_get_string(user_obj));
+                }
+            }
+            if (ch)
+            {
+                ch->is_member = is_member;
+                if (open_buffer && !ch->buffer)
+                    slack_buffer_new(workspace, ch);
+                if (open_buffer && ch->buffer &&
+                    strcmp(type, "im_open") == 0)
+                    weechat_buffer_set(ch->buffer, "hotlist", "2");
             }
         }
         return;

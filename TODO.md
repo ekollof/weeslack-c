@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — Here/Away nicklist, mute prefs on connect,
-bot roster model (is_bot → bots map, users.info for unknowns)
+**Last update:** 2026-07-20 — reaction suffixes on print; reconnect_url;
+thread_broadcast prefix; channel_joined/im_open; DM title from status
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -55,6 +55,7 @@ bot roster model (is_bot → bots map, users.info for unknowns)
 
 - [x] Live + history; tags include `slack_ts_<ts>`; `localvar_slack_timestamp` + `last_message_ts`  
 - [x] Reactions + react/unreact commands (+ model update)  
+- [x] Reaction **suffixes** on history/live print (`[:name:count]`, own = lightgreen)  
 - [x] Typing (title indicator), mentions (`<@U>`, `<!here>`, `<!subteam^…>`), mute tags, read markers  
 - [x] Emoji shortcodes + custom map + `emoji_render_mode`  
 - [x] Bold/italic/strikethrough honor config (`render_*_as`)  
@@ -121,10 +122,13 @@ bot roster model (is_bot → bots map, users.info for unknowns)
 ## Phase 10: RTM
 
 - [x] Core events + lifecycle (create/rename/archive/leave/delete/join)  
+- [x] `channel_joined` / `im_open` / `im_created` (member vs created semantics)  
 - [x] pin / emoji_changed / dnd / presence / team_join  
 - [x] `me_message`, pin subtypes, channel_name, purpose  
+- [x] RTM `reconnect_url` stored for next WS session  
 - [x] Rate-limit + auth messaging  
 - [x] Reconnect with fresh rtm.connect  
+- [x] `user_change` → DM buffer title from status emoji/text  
 
 ---
 
@@ -171,4 +175,10 @@ rtm.connect
 | HTTP / curl ignored proxy | `slack_http_*_proxy` helpers |
 | History/members single page | capped multi-page slow queue |
 | No mute from Slack prefs | `users.prefs.get` after channel list |
-| Flat nicklist | Here/Away groups by presence |
+| Flat nicklist | Here/Away groups + `nicklist_display_groups=1` |
+| Here/Away stuck on Away | RTM `presence_sub` after hello/users.list |
+| Mute/highlight prefs only on connect | also `pref_change` RTM |
+| Reactions only as notices | also suffix `[:name:n]` on message print |
+| No `reconnect_url` handling | store URL on workspace |
+| `channel_created` opened + forced member | created = model only; join/open separate |
+| DM title stale on status change | `user_change` updates peer DM title |
