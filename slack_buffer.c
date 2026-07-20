@@ -127,17 +127,6 @@ slack_buffer_input_cb(const void *pointer, void *data,
         return WEECHAT_RC_OK;
     }
 
-    /* Leading / that is not a WeeChat command: post as chat text.
-     * Real Slack slash APIs are app-specific; this matches desktop "message". */
-    if (input_data[0] == '/')
-    {
-        slack_event_send_message(sbuf->workspace,
-                                  sbuf->channel->id,
-                                  input_data,
-                                  NULL);
-        return WEECHAT_RC_OK;
-    }
-
     /* replace emoji shortcodes with unicode before sending */
     char *processed = slack_event_replace_emoji(input_data);
     if (!processed)
@@ -157,8 +146,6 @@ slack_buffer_input_cb(const void *pointer, void *data,
             const char *second_underscore = strchr(rest, '_');
             if (second_underscore)
             {
-                /* channel_id is "thread_<parent_id>_<thread_ts>" */
-                /* find the parent channel by its ID (the part between first and second underscore) */
                 size_t parent_id_len = second_underscore - rest;
                 char parent_id[128];
                 if (parent_id_len < sizeof(parent_id))
@@ -175,6 +162,10 @@ slack_buffer_input_cb(const void *pointer, void *data,
         }
     }
 
+    /*
+     * Leading / that is not a WeeChat command: post as chat text
+     * (emoji already expanded). Real Slack slash APIs are app-specific.
+     */
     slack_event_send_message(sbuf->workspace,
                               channel_id,
                               processed,

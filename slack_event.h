@@ -91,5 +91,12 @@ extern void slack_event_pin_message(struct t_weeslack_workspace *workspace,
 extern void slack_event_search_messages(struct t_weeslack_workspace *workspace,
                                          const char *query,
                                          struct t_gui_buffer *buffer);
+extern void slack_event_join_channel(struct t_weeslack_workspace *workspace,
+                                     const char *name_or_id);
+extern void slack_event_leave_channel(struct t_weeslack_workspace *workspace,
+                                      const char *channel_id);
+extern void slack_event_whois(struct t_weeslack_workspace *workspace,
+                              const char *name_or_id,
+                              struct t_gui_buffer *buffer);
 
 #endif

@@ -1,7 +1,6 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — pin/leave RTM, mention highlights, reply default,
-history 5×100
+**Last update:** 2026-07-20 — HTML unescape, whois/join/leave, dnd/deleted RTM
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -76,6 +75,7 @@ history 5×100
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
 - [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
+- [x] **`whois`**, **`join`**, **`leave`/`part`**  
 - [x] Stars list — resolve channel/user names, format text (cap 40 shown)  
 - [x] Search list — resolve names, format text (cap 20 shown)  
 - [~] subscribe = local thread notify only  
@@ -119,6 +119,8 @@ history 5×100
 - [x] `pin_added` / `pin_removed`, `channel_left` / `group_left` / `im_close` / `mpim_close`  
 - [x] Self-mention → `notify_highlight` (raw `<@U…>` or `@display_name`)  
 - [x] `me_message` (/me style), `channel_purpose`, Block Kit text fallback  
+- [x] HTML entity unescape (`&amp;`, numeric entities, …)  
+- [x] `dnd_updated` / `channel_deleted`  
 - [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
 - [x] Rate-limit + auth messaging  
 
