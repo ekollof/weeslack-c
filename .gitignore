@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.d
+
+# Editor / OS
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Debug / local
+*.log
+.gdb_history
+core
+core.*
