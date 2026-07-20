@@ -2988,6 +2988,9 @@ slack_event_users_cb(struct t_weeslack_workspace *workspace,
                         weechat_prefix("network"), total);
     }
 
+    /* Drop bots/apps/slackbot that may already be on nicklists */
+    slack_buffer_purge_hidden_nicks();
+
     slack_event_fetch_bots(workspace);
 }
 
@@ -5437,6 +5440,7 @@ slack_event_refresh_users_cb(struct t_weeslack_workspace *workspace,
                 SLACK_WS_PRINTF(workspace, "%sweeslack: refreshed %d users",
                                 weechat_prefix("network"), total);
             }
+            slack_buffer_purge_hidden_nicks();
         }
         if (json)
             json_object_put(json);

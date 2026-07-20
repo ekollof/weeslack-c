@@ -33,6 +33,7 @@ struct t_slack_user
     char *avatar_72;
     int deleted;
     int is_bot;
+    int is_app_user; /* Slack app / integration user (Google Drive, etc.) */
     int is_external;
     char *presence;
     char *status_emoji;
@@ -51,6 +52,8 @@ extern const char *slack_user_get_color(struct t_slack_user *user);
 /* display_name → real_name → @handle → id; never NULL if user non-NULL */
 extern const char *slack_user_best_name(struct t_slack_user *user);
 extern void slack_user_update(struct t_slack_user *user, struct json_object *json);
+/* 1 = hide from channel nicklist (bots, apps, slackbot, deleted). */
+extern int slack_user_hide_from_nicklist(struct t_slack_user *user);
 
 /* ---- SlackBot ---- */
 

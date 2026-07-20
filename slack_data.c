@@ -199,6 +199,53 @@ slack_user_best_name(struct t_slack_user *user)
     return "unknown";
 }
 
+int
+slack_user_hide_from_nicklist(struct t_slack_user *user)
+{
+    const char *n;
+
+    if (!user)
+        return 1;
+
+    if (user->deleted)
+        return 1;
+    if (user->is_bot)
+        return 1;
+    if (user->is_app_user)
+        return 1;
+
+    /* Classic Slackbot */
+    if (user->id && strcmp(user->id, "USLACKBOT") == 0)
+        return 1;
+
+    n = user->name;
+    if (n && n[0])
+    {
+        if (weechat_strcasecmp(n, "slackbot") == 0)
+            return 1;
+        if (weechat_strcasecmp(n, "uslackbot") == 0)
+            return 1;
+        /* Common integration bot handles (still show as message authors) */
+        if (weechat_strncasecmp(n, "google_drive", 12) == 0)
+            return 1;
+        if (weechat_strncasecmp(n, "google-drive", 12) == 0)
+            return 1;
+        if (weechat_strncasecmp(n, "gdrive", 6) == 0)
+            return 1;
+    }
+
+    n = user->display_name;
+    if (n && n[0])
+    {
+        if (weechat_strcasecmp(n, "slackbot") == 0)
+            return 1;
+        if (weechat_strncasecmp(n, "google drive", 12) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
 void
 slack_user_update(struct t_slack_user *user, struct json_object *json)
 {
@@ -242,6 +289,9 @@ slack_user_update(struct t_slack_user *user, struct json_object *json)
 
     if (json_object_object_get_ex(json, "is_bot", &obj))
         user->is_bot = json_object_get_boolean(obj);
+
+    if (json_object_object_get_ex(json, "is_app_user", &obj))
+        user->is_app_user = json_object_get_boolean(obj);
 
     if (json_object_object_get_ex(json, "presence", &obj))
     {

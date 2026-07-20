@@ -34,6 +34,8 @@ extern void slack_buffer_remove_nick(struct t_slack_buffer *sbuf,
                                       struct t_slack_user *user);
 extern void slack_buffer_refresh_nicks(struct t_slack_buffer *sbuf);
 extern void slack_buffer_clear_nicks(struct t_slack_buffer *sbuf);
+/* Drop bots/apps/slackbot from every channel nicklist (after users.list). */
+extern void slack_buffer_purge_hidden_nicks(void);
 extern void slack_buffer_set_muted(struct t_slack_buffer *sbuf, int muted);
 extern void slack_buffer_clear_hotlist(struct t_gui_buffer *buffer);
 extern void slack_buffer_set_typing(struct t_slack_channel *channel,

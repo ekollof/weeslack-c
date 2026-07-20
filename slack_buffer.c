@@ -535,6 +535,10 @@ slack_buffer_add_nick(struct t_slack_buffer *sbuf, struct t_slack_user *user)
     if (!sbuf || !sbuf->buffer || !user)
         return;
 
+    /* Bots, app users (Google Drive, …), USLACKBOT — not in roster */
+    if (slack_user_hide_from_nicklist(user))
+        return;
+
     nick = slack_user_best_name(user);
     if (!nick || !nick[0])
         nick = user->id;
@@ -722,6 +726,30 @@ slack_buffer_set_typing(struct t_slack_channel *channel, const char *user_name)
 }
 
 void
+slack_buffer_purge_hidden_nicks(void)
+{
+    struct t_slack_user *user;
+    struct t_slack_channel *ch;
+
+    for (user = slack_user_list_global(); user; user = user->next)
+    {
+        if (!slack_user_hide_from_nicklist(user))
+            continue;
+        for (ch = slack_channel_list_global(); ch; ch = ch->next)
+        {
+            struct t_slack_buffer *sbuf;
+            if (!ch->buffer)
+                continue;
+            sbuf = slack_buffer_search(ch->buffer);
+            if (!sbuf)
+                sbuf = slack_buffer_search_by_channel(ch->id);
+            if (sbuf)
+                slack_buffer_remove_nick(sbuf, user);
+        }
+    }
+}
+
+void
 slack_buffer_update_user_presence(struct t_slack_user *user)
 {
     const char *nick;
@@ -733,6 +761,23 @@ slack_buffer_update_user_presence(struct t_slack_user *user)
 
     if (!user)
         return;
+
+    if (slack_user_hide_from_nicklist(user))
+    {
+        /* Ensure bots never linger in nicklists after profile updates */
+        for (ch = slack_channel_list_global(); ch; ch = ch->next)
+        {
+            struct t_slack_buffer *sbuf;
+            if (!ch->buffer)
+                continue;
+            sbuf = slack_buffer_search(ch->buffer);
+            if (!sbuf)
+                sbuf = slack_buffer_search_by_channel(ch->id);
+            if (sbuf)
+                slack_buffer_remove_nick(sbuf, user);
+        }
+        return;
+    }
 
     nick = slack_user_best_name(user);
     if (!nick)
