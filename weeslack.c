@@ -1183,7 +1183,10 @@ weeslack_command_cslack(const void *pointer, void *data,
                 }
             }
             if (thread && thread->buffer)
-                weechat_buffer_set(thread->buffer, "display", "1");
+            {
+                if (weechat_config_boolean(weeslack_config.switch_buffer_on_join))
+                    weechat_buffer_set(thread->buffer, "display", "1");
+            }
             else
                 weechat_printf(buffer, "%sweeslack: could not open thread",
                                 weechat_prefix("error"));
@@ -1845,6 +1848,80 @@ weeslack_config_init(void)
         "distracting_channels", "string",
         "Comma-separated buffer full_names marked distracting (for /cslack nodistractions)",
         NULL, 0, 0, "", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.history_fetch_count = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "history_fetch_count", "integer",
+        "Messages per history page (1–1000; still capped to a few pages)",
+        NULL, 1, 1000, "100", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.group_name_prefix = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "group_name_prefix", "string",
+        "Short-name prefix for private channels/groups (default &)",
+        NULL, 0, 0, "&", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.switch_buffer_on_join = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "switch_buffer_on_join", "boolean",
+        "Switch to channel/thread buffer when joining or opening a thread",
+        NULL, 0, 0, "on", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.unhide_buffers_with_activity = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "unhide_buffers_with_activity", "boolean",
+        "Unhide a hidden buffer when a new live message arrives (if not muted)",
+        NULL, 0, 0, "off", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.muted_channels_activity = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "muted_channels_activity", "integer",
+        "Muted channel activity: 0=none, 1=personal_highlights, 2=all_highlights, 3=all",
+        "none|personal_highlights|all_highlights|all",
+        0, 3, "personal_highlights", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.map_underline_to = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "map_underline_to", "string",
+        "Map WeeChat underline (\\x1f) to this Slack marker when sending (default _ for italic)",
+        NULL, 0, 0, "_", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.link_previews = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "link_previews", "boolean",
+        "Show website link-preview attachments on messages",
+        NULL, 0, 0, "on", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.notify_subscribed_threads = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "notify_subscribed_threads", "integer",
+        "Server-buffer notice for subscribed threads: 0=auto, 1=always, 2=never",
+        "auto|true|false",
+        0, 2, "auto", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);

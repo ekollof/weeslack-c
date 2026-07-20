@@ -713,8 +713,16 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
 
             if (use_short)
             {
-                if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
-                    channel->type == SLACK_CHANNEL_TYPE_GROUP)
+                if (channel->type == SLACK_CHANNEL_TYPE_GROUP)
+                {
+                    const char *gpfx = weechat_config_string(
+                        weeslack_config.group_name_prefix);
+                    if (!gpfx || !gpfx[0])
+                        gpfx = "&";
+                    snprintf(short_name, sizeof(short_name), "%s%s",
+                             gpfx, ch_name);
+                }
+                else if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL)
                     snprintf(short_name, sizeof(short_name), "#%s", ch_name);
                 else
                     snprintf(short_name, sizeof(short_name), "%s", ch_name);
@@ -722,8 +730,16 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
             else
             {
                 /* longer short_name: team.#channel (full_name stays hierarchical) */
-                if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
-                    channel->type == SLACK_CHANNEL_TYPE_GROUP)
+                if (channel->type == SLACK_CHANNEL_TYPE_GROUP)
+                {
+                    const char *gpfx = weechat_config_string(
+                        weeslack_config.group_name_prefix);
+                    if (!gpfx || !gpfx[0])
+                        gpfx = "&";
+                    snprintf(short_name, sizeof(short_name), "%s.%s%s",
+                             team ? team : "slack", gpfx, ch_name);
+                }
+                else if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL)
                     snprintf(short_name, sizeof(short_name), "%s.#%s",
                              team ? team : "slack", ch_name);
                 else
@@ -1139,7 +1155,25 @@ slack_buffer_set_muted(struct t_slack_buffer *sbuf, int muted)
     if (sbuf->channel)
         sbuf->channel->is_muted = muted ? 1 : 0;
 
-    weechat_buffer_set(sbuf->buffer, "notify", muted ? "none" : "highlight");
+    /*
+     * muted_channels_activity: none → notify none; personal/all_highlights →
+     * highlight; all → message (activity like unmuted).
+     */
+    if (muted)
+    {
+        int mode = weechat_config_integer(
+            weeslack_config.muted_channels_activity);
+        const char *notify = "none";
+
+        if (mode == 3) /* all */
+            notify = "message";
+        else if (mode == 1 || mode == 2) /* personal / all highlights */
+            notify = "highlight";
+        weechat_buffer_set(sbuf->buffer, "notify", notify);
+    }
+    else
+        weechat_buffer_set(sbuf->buffer, "notify", "highlight");
+
     weechat_buffer_set(sbuf->buffer, "localvar_set_slack_muted",
                        muted ? "1" : "0");
 
@@ -1149,7 +1183,8 @@ slack_buffer_set_muted(struct t_slack_buffer *sbuf, int muted)
             weeslack_config.color_buflist_muted_channels);
         if (muted_color && muted_color[0])
             weechat_buffer_set(sbuf->buffer, "color_name_inactive", muted_color);
-        slack_buffer_clear_hotlist(sbuf->buffer);
+        if (weechat_config_integer(weeslack_config.muted_channels_activity) == 0)
+            slack_buffer_clear_hotlist(sbuf->buffer);
     }
     else
     {

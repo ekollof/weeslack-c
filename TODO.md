@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — reaction nicks, distracting, slash, cursor
-$hash keys, use_full_names / external suffix, thread $hash suffix
+**Last update:** 2026-07-20 — history_fetch_count, muted activity, unhide,
+group prefix, link_previews, map_underline, switch_on_join, thread notices
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -124,6 +124,9 @@ $hash keys, use_full_names / external suffix, thread $hash suffix
 - [x] **`look.never_away`** — 5‑min timer sets presence `auto` when enabled  
 - [x] **`look.send_typing_notice`** — typing via `input_text_changed`  
 - [x] Bar items **`away`** / **`slack_away`** (manual vs auto)  
+- [x] **`history_fetch_count`**, **`group_name_prefix`**, **`switch_buffer_on_join`**  
+- [x] **`unhide_buffers_with_activity`**, **`muted_channels_activity`**  
+- [x] **`map_underline_to`**, **`link_previews`**, **`notify_subscribed_threads`**  
 
 ---
 
@@ -171,15 +174,14 @@ rtm.connect
 ## Intentionally remaining (low ROI / platform limits)
 
 1. Full custom-emoji image rendering in TUI (URLs only)  
-2. Real Slack slash-command protocol for user tokens  
-3. Multi-workspace UI beyond one `default` id  
-4. Auto-open every thread on live reply (rejected — rate-limit / buffer storm)  
-5. Unlimited history/members pagination (hard caps keep the queue healthy)  
-6. Binary upload via `hook_url` (raw PUT still needs curl/process)  
-7. Multi-workspace UI beyond one `default` id (also listed above)  
-8. Background load all history / auto_open_threads (rate-limit sensitive)  
-9. `unhide_buffers_with_activity`, `muted_channels_activity` polish  
-10. Full `record_events` debug mode  
+2. Multi-workspace UI beyond one `default` id  
+3. Auto-open every thread on live reply / `auto_open_threads` (rate-limit)  
+4. Unlimited history/members pagination (hard caps keep the queue healthy)  
+5. Binary upload via `hook_url` (raw PUT still needs curl/process)  
+6. Background load all history on connect (rate-limit sensitive)  
+7. Full `record_events` debug mode  
+8. `colorize_attachments` / `shared_name_prefix` / `server_aliases` polish  
+9. Server-side thread subscribe API (still local notify + notices)  
 
 ---
 
@@ -217,3 +219,10 @@ rtm.connect
 | No chat.command slash | /cslack slash /cmd args |
 | No cursor $hash actions | mouse+cursor hsignals on weeslack buffers |
 | Thread suffix without hash | `[ Thread: $hash Replies: N ]` |
+| Fixed history page size | `history_fetch_count` (capped pages still) |
+| Muted always silent | `muted_channels_activity` modes |
+| Private channels use # | `group_name_prefix` (`&` default) |
+| Always switch on join | gated by `switch_buffer_on_join` |
+| Hidden buffers stay hidden | optional `unhide_buffers_with_activity` |
+| Always show link unfurls | `link_previews` |
+| Underline not mapped on send | `map_underline_to` |

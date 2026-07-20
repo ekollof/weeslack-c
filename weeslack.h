@@ -64,6 +64,14 @@ struct t_weeslack_config
     struct t_config_option *external_user_suffix;
     struct t_config_option *show_reaction_nicks;
     struct t_config_option *distracting_channels;
+    struct t_config_option *history_fetch_count;
+    struct t_config_option *group_name_prefix;
+    struct t_config_option *switch_buffer_on_join;
+    struct t_config_option *unhide_buffers_with_activity;
+    struct t_config_option *muted_channels_activity;
+    struct t_config_option *map_underline_to;
+    struct t_config_option *link_previews;
+    struct t_config_option *notify_subscribed_threads;
 
     /* color */
     struct t_config_option *color_typing_notice;
