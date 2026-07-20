@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — phase continue: history/members pagination,
-stars/search polish, curl proxy for binary transfers
+**Last update:** 2026-07-20 — RTM join/leave/rename, safe formatting,
+file display, users.list page cap, history dedupe
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -55,7 +55,8 @@ stars/search polish, curl proxy for binary transfers
 - [x] Bold/italic/strikethrough honor config (`render_*_as`)  
 - [x] Thread-in-channel uses `thread_broadcast_prefix`  
 - [~] Edit/delete — notice lines (WeeChat has no public line-edit API)  
-- [~] Files — display + **`/cslack download <url>`** (mkdir_parents + proxy)  
+- [x] Files — display (size/mime/download URL) + **`/cslack download <url>`**  
+- [x] Message markdown render uses capacity-tracked `snprintf` (no `sprintf`)  
 - [x] Join/leave show resolved names  
 - [x] `colorize_private_chats` gates nick color on DM/MPDM  
 
@@ -112,6 +113,8 @@ stars/search polish, curl proxy for binary transfers
 ## Phase 10: RTM
 
 - [x] Core events  
+- [x] `member_joined_channel` / `member_left_channel` (nicklist + notice)  
+- [x] `user_change`, `channel_rename` / `group_rename`, archive/unarchive  
 - [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
 - [x] Rate-limit + auth messaging  
 
@@ -159,3 +162,7 @@ rtm.connect
 | History/members single page only | capped multi-page on slow queue |
 | Stars/search raw ids | resolve names + format text |
 | `header=1` broke JSON parse | removed (connect fix) |
+| `sprintf` in markdown render | `slack_fmt_append` + `vsnprintf` |
+| Thin file lines | title/name, human size, private download URL |
+| Missing RTM join/leave/rename | member_*, user_change, channel_rename, archive |
+| users.list unlimited pages | cap 10 pages |
