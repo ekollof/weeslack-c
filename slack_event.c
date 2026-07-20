@@ -2930,7 +2930,21 @@ slack_event_users_cb(struct t_weeslack_workspace *workspace,
 
             struct t_slack_user *user = slack_user_new(uid, uname, NULL);
             if (user)
+            {
                 slack_user_update(user, u_obj);
+                /*
+                 * wee-slack put is_bot members in team.bots, not team.users.
+                 * Keep a SlackUser record for message resolution, but also
+                 * register a bot entry and leave nicklist filtering to
+                 * slack_user_hide_from_nicklist().
+                 */
+                if (user->is_bot || user->is_app_user)
+                {
+                    struct t_slack_bot *bot = slack_bot_new(uid, uname);
+                    if (bot)
+                        slack_bot_update(bot, u_obj);
+                }
+            }
         }
     }
 
@@ -3253,6 +3267,16 @@ struct t_slack_members_ctx
     struct t_slack_channel *channel;
     int page;
     int total;
+    int unknown_lookups; /* users.info calls this members fetch (capped) */
+};
+
+/* Cap users.info for unknown member ids (wee-slack style, rate-limit safe). */
+#define SLACK_MEMBERS_MAX_USERINFO  40
+
+struct t_slack_userinfo_ctx
+{
+    char *channel_id;
+    char *user_id;
 };
 
 static void slack_event_members_cb(struct t_weeslack_workspace *workspace,
@@ -3290,6 +3314,111 @@ slack_event_members_request(struct t_weeslack_workspace *workspace,
     }
     json_object_put(params);
     return 1;
+}
+
+/*
+ * Like wee-slack: only nicklist people in the known human user map.
+ * Unknown member ids → users.info (slow queue); bots never get a nick.
+ */
+static void
+slack_event_userinfo_cb(struct t_weeslack_workspace *workspace,
+                        int return_code, const char *output,
+                        void *user_data)
+{
+    struct t_slack_userinfo_ctx *ctx = user_data;
+    struct json_object *json, *user_obj;
+    struct t_slack_user *user;
+    struct t_slack_buffer *sbuf;
+
+    if (!ctx)
+        return;
+
+    if (return_code == 0 && output)
+    {
+        json = slack_json_decode(output);
+        if (json && !slack_api_check_error(workspace, json, "users.info"))
+        {
+            if (json_object_object_get_ex(json, "user", &user_obj))
+            {
+                struct json_object *id_obj, *name_obj;
+                const char *uid = NULL, *uname = NULL;
+
+                if (json_object_object_get_ex(user_obj, "id", &id_obj))
+                    uid = json_object_get_string(id_obj);
+                if (json_object_object_get_ex(user_obj, "name", &name_obj))
+                    uname = json_object_get_string(name_obj);
+                if (uid)
+                {
+                    user = slack_user_new(uid,
+                                         uname && uname[0] ? uname : uid,
+                                         NULL);
+                    if (user)
+                    {
+                        slack_user_update(user, user_obj);
+                        /* wee-slack: is_bot → bots map, not users/nicklist */
+                        if (user->is_bot || user->is_app_user)
+                        {
+                            struct t_slack_bot *bot =
+                                slack_bot_new(uid,
+                                              uname && uname[0] ? uname : uid);
+                            if (bot)
+                                slack_bot_update(bot, user_obj);
+                        }
+                        else if (ctx->channel_id)
+                        {
+                            sbuf = slack_buffer_search_by_channel(
+                                ctx->channel_id);
+                            if (sbuf)
+                                slack_buffer_add_nick(sbuf, user);
+                        }
+                    }
+                }
+            }
+        }
+        if (json)
+            json_object_put(json);
+    }
+
+    free(ctx->channel_id);
+    free(ctx->user_id);
+    free(ctx);
+}
+
+static void
+slack_event_members_request_userinfo(struct t_weeslack_workspace *workspace,
+                                     const char *channel_id,
+                                     const char *user_id)
+{
+    struct t_slack_userinfo_ctx *ctx;
+    struct json_object *params;
+
+    if (!workspace || !user_id || !user_id[0])
+        return;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+        return;
+    ctx->channel_id = channel_id ? strdup(channel_id) : NULL;
+    ctx->user_id = strdup(user_id);
+    if (!ctx->user_id)
+    {
+        free(ctx->channel_id);
+        free(ctx);
+        return;
+    }
+
+    params = json_object_new_object();
+    json_object_object_add(params, "user", json_object_new_string(user_id));
+    /* slow lane — same as members/history, avoids stampede */
+    if (!slack_http_request_new_flags(workspace, "users.info", params,
+                                      SLACK_HTTP_SLOW,
+                                      slack_event_userinfo_cb, ctx))
+    {
+        free(ctx->channel_id);
+        free(ctx->user_id);
+        free(ctx);
+    }
+    json_object_put(params);
 }
 
 static void
@@ -3353,14 +3482,28 @@ slack_event_members_cb(struct t_weeslack_workspace *workspace,
 
             if (!uid)
                 continue;
+
+            /*
+             * wee-slack: nicklist only from team.users (humans). Unknown ids
+             * get users.info; is_bot accounts are stored as bots and never
+             * nicklisted. Do not invent stubs for the roster.
+             */
             user = slack_user_search(uid);
             if (!user)
-                user = slack_user_new(uid, uid, NULL);
-            if (user)
             {
-                slack_buffer_add_nick(sbuf, user);
-                ctx->total++;
+                if (ctx->unknown_lookups < SLACK_MEMBERS_MAX_USERINFO)
+                {
+                    slack_event_members_request_userinfo(workspace,
+                                                        channel->id, uid);
+                    ctx->unknown_lookups++;
+                }
+                continue;
             }
+            if (slack_user_hide_from_nicklist(user))
+                continue;
+
+            slack_buffer_add_nick(sbuf, user);
+            ctx->total++;
         }
     }
 
@@ -5428,7 +5571,16 @@ slack_event_refresh_users_cb(struct t_weeslack_workspace *workspace,
                         struct t_slack_user *user = slack_user_new(uid, uname,
                                                                    NULL);
                         if (user)
+                        {
                             slack_user_update(user, u_obj);
+                            if (user->is_bot || user->is_app_user)
+                            {
+                                struct t_slack_bot *bot =
+                                    slack_bot_new(uid, uname);
+                                if (bot)
+                                    slack_bot_update(bot, u_obj);
+                            }
+                        }
                     }
                 }
             }
