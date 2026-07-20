@@ -4995,6 +4995,222 @@ slack_event_set_presence(struct t_weeslack_workspace *workspace,
     json_object_put(params);
 }
 
+void
+slack_event_set_profile_status(struct t_weeslack_workspace *workspace,
+                                const char *status_emoji,
+                                const char *status_text)
+{
+    struct json_object *params, *profile;
+    char emoji_buf[64];
+    const char *emoji = status_emoji ? status_emoji : "";
+    const char *text = status_text ? status_text : "";
+
+    if (!workspace)
+        return;
+
+    /* Accept :name: or name */
+    if (emoji[0] == ':' && emoji[1])
+    {
+        size_t n = strlen(emoji);
+        if (n >= 3 && emoji[n - 1] == ':' && n - 2 < sizeof(emoji_buf))
+        {
+            memcpy(emoji_buf, emoji + 1, n - 2);
+            emoji_buf[n - 2] = '\0';
+            emoji = emoji_buf;
+        }
+    }
+
+    profile = json_object_new_object();
+    if (!profile)
+        return;
+    json_object_object_add(profile, "status_emoji",
+                           json_object_new_string(emoji));
+    json_object_object_add(profile, "status_text",
+                           json_object_new_string(text));
+
+    params = json_object_new_object();
+    if (!params)
+    {
+        json_object_put(profile);
+        return;
+    }
+    /* form-encoded as profile={...JSON...} */
+    json_object_object_add(params, "profile", profile);
+    slack_http_request_new(workspace, "users.profile.set", params,
+                           slack_event_simple_api_cb,
+                           (void *)"users.profile.set");
+    json_object_put(params);
+}
+
+static void
+slack_event_create_channel_cb(struct t_weeslack_workspace *workspace,
+                               int return_code, const char *output,
+                               void *user_data)
+{
+    char *name_hint = user_data;
+    struct json_object *json, *ch_obj, *id_obj, *name_obj;
+
+    if (return_code != 0 || !output)
+    {
+        SLACK_WS_PRINTF(workspace, "%sweeslack: create channel failed (rc=%d)",
+                        weechat_prefix("error"), return_code);
+        free(name_hint);
+        return;
+    }
+
+    json = slack_json_decode(output);
+    if (!json)
+    {
+        free(name_hint);
+        return;
+    }
+
+    if (slack_api_check_error(workspace, json, "conversations.create"))
+    {
+        json_object_put(json);
+        free(name_hint);
+        return;
+    }
+
+    if (json_object_object_get_ex(json, "channel", &ch_obj))
+    {
+        const char *cid = NULL, *cname = NULL;
+        enum slack_channel_type ctype = SLACK_CHANNEL_TYPE_CHANNEL;
+        struct t_slack_channel *ch;
+        struct json_object *is_priv;
+
+        if (json_object_object_get_ex(ch_obj, "id", &id_obj))
+            cid = json_object_get_string(id_obj);
+        if (json_object_object_get_ex(ch_obj, "name", &name_obj))
+            cname = json_object_get_string(name_obj);
+        if (json_object_object_get_ex(ch_obj, "is_private", &is_priv) &&
+            json_object_get_boolean(is_priv))
+            ctype = SLACK_CHANNEL_TYPE_GROUP;
+
+        if (cid)
+        {
+            ch = slack_channel_search(cid);
+            if (!ch)
+                ch = slack_channel_new(cid,
+                                       cname && cname[0] ? cname : cid,
+                                       ctype);
+            if (ch)
+            {
+                slack_channel_update(ch, ch_obj);
+                ch->is_member = 1;
+                if (!ch->buffer)
+                    slack_buffer_new(workspace, ch);
+                if (ch->buffer)
+                    weechat_buffer_set(ch->buffer, "display", "1");
+                SLACK_WS_PRINTF(workspace, "%sweeslack: created #%s",
+                                weechat_prefix("network"),
+                                ch->name ? ch->name : cid);
+            }
+        }
+    }
+    else
+    {
+        SLACK_WS_PRINTF(workspace, "%sweeslack: created channel %s",
+                        weechat_prefix("network"),
+                        name_hint ? name_hint : "");
+    }
+
+    json_object_put(json);
+    free(name_hint);
+}
+
+void
+slack_event_create_channel(struct t_weeslack_workspace *workspace,
+                            const char *name, int is_private)
+{
+    struct json_object *params;
+    const char *arg;
+    char *hint;
+
+    if (!workspace || !name || !name[0])
+        return;
+
+    arg = name;
+    if (arg[0] == '#')
+        arg++;
+
+    hint = strdup(arg);
+    params = json_object_new_object();
+    json_object_object_add(params, "name", json_object_new_string(arg));
+    json_object_object_add(params, "is_private",
+                           json_object_new_boolean(is_private ? 1 : 0));
+    slack_http_request_new(workspace, "conversations.create", params,
+                           slack_event_create_channel_cb, hint);
+    json_object_put(params);
+}
+
+void
+slack_event_invite_user(struct t_weeslack_workspace *workspace,
+                         const char *channel_id,
+                         const char *user_id_or_name)
+{
+    struct json_object *params;
+    struct t_slack_user *user;
+    const char *uid;
+
+    if (!workspace || !channel_id || !channel_id[0] ||
+        !user_id_or_name || !user_id_or_name[0])
+        return;
+
+    uid = user_id_or_name;
+    if (uid[0] == '@')
+        uid++;
+
+    /* Resolve nick → user id when not already a U… id */
+    if (!(uid[0] == 'U' || uid[0] == 'W'))
+    {
+        user = slack_user_search_name(uid);
+        if (!user)
+        {
+            SLACK_WS_PRINTF(workspace, "%sweeslack: user not found: %s",
+                            weechat_prefix("error"), user_id_or_name);
+            return;
+        }
+        uid = user->id;
+    }
+
+    params = json_object_new_object();
+    json_object_object_add(params, "channel",
+                           json_object_new_string(channel_id));
+    json_object_object_add(params, "users",
+                           json_object_new_string(uid));
+    slack_http_request_new(workspace, "conversations.invite", params,
+                           slack_event_simple_api_cb,
+                           (void *)"conversations.invite");
+    json_object_put(params);
+}
+
+void
+slack_event_send_me_message(struct t_weeslack_workspace *workspace,
+                             const char *channel_id,
+                             const char *text,
+                             const char *thread_ts)
+{
+    struct json_object *params;
+
+    if (!workspace || !channel_id || !text || !text[0])
+        return;
+
+    params = json_object_new_object();
+    json_object_object_add(params, "channel",
+                           json_object_new_string(channel_id));
+    json_object_object_add(params, "text",
+                           json_object_new_string(text));
+    if (thread_ts && thread_ts[0])
+    {
+        json_object_object_add(params, "thread_ts",
+                               json_object_new_string(thread_ts));
+    }
+    slack_http_request_new(workspace, "chat.meMessage", params,
+                           slack_event_send_message_cb, NULL);
+    json_object_put(params);
+}
+
 struct t_slack_mute_ctx
 {
     char *channel_id;

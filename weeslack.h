@@ -55,6 +55,7 @@ struct t_weeslack_config
     struct t_config_option *channel_name_typing_indicator;
     struct t_config_option *emoji_render_mode;
     struct t_config_option *download_path;
+    struct t_config_option *never_away;
 
     /* color */
     struct t_config_option *color_typing_notice;

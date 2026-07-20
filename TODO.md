@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — reaction suffixes on print; reconnect_url;
-thread_broadcast prefix; channel_joined/im_open; DM title from status
+**Last update:** 2026-07-20 — profile status, create/invite/showmuted,
+never_away, /me → chat.meMessage; weemoji.json
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -77,6 +77,7 @@ thread_broadcast prefix; channel_joined/im_open; DM title from status
 - [x] Upload pipeline (getUploadURL → PUT → complete); PUT uses proxy when configured  
 - [~] Slash: posted as plain text (real slash API is app-specific / low ROI)  
 - [x] Input emoji shortcodes  
+- [x] `/me text` → **`chat.meMessage`**  
 
 ---
 
@@ -86,6 +87,8 @@ thread_broadcast prefix; channel_joined/im_open; DM title from status
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
 - [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
 - [x] **`whois`** (+ live presence), **`join`**, **`leave`/`part`**, **`refresh`**, **`names`**  
+- [x] **`status`** profile emoji/text (`users.profile.set`) + `-delete`; legacy dnd/away/active  
+- [x] **`create`** (`conversations.create` [-private]), **`invite`**, **`showmuted`**  
 - [x] Stars / search list polish  
 - [~] subscribe = local thread notify only  
 
@@ -108,6 +111,7 @@ thread_broadcast prefix; channel_joined/im_open; DM title from status
 - [x] **download_path**, **short_buffer_names**, **colorize_private_chats**  
 - [x] color options (typing/deleted/edited/thread/muted)  
 - [x] `color.thread_suffix` = `multiple` uses nick color for reply count suffix  
+- [x] **`look.never_away`** — 5‑min timer sets presence `auto` when enabled  
 
 ---
 
@@ -183,3 +187,7 @@ rtm.connect
 | No `reconnect_url` handling | store URL on workspace |
 | `channel_created` opened + forced member | created = model only; join/open separate |
 | DM title stale on status change | `user_change` updates peer DM title |
+| `/cslack status` only dnd/away | also profile emoji/text via `users.profile.set` |
+| No create/invite/showmuted | conversations.create / invite + muted list |
+| Appear away while idle | optional `look.never_away` timer |
+| `/me` posted as plain text | `chat.meMessage` |

@@ -162,6 +162,15 @@ slack_buffer_input_cb(const void *pointer, void *data,
         }
     }
 
+    /* /me action → chat.meMessage (wee-slack style) */
+    if (strncmp(processed, "/me ", 4) == 0 && processed[4])
+    {
+        slack_event_send_me_message(sbuf->workspace, channel_id,
+                                     processed + 4, thread_ts);
+        free(processed);
+        return WEECHAT_RC_OK;
+    }
+
     /*
      * Leading / that is not a WeeChat command: post as chat text
      * (emoji already expanded). Real Slack slash APIs are app-specific.

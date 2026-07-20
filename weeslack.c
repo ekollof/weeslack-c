@@ -664,10 +664,40 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
+        /*
+         * wee-slack: /status [<emoji> [<text>]|-delete]
+         * Legacy presence: dnd|nodnd|away|active still accepted.
+         */
         if (argc < 3)
         {
-            weechat_printf(buffer, "%sweeslack: usage: /cslack status <dnd|away|active>",
-                            weechat_prefix("error"));
+            struct t_slack_user *me = NULL;
+            if (ws->my_user_id)
+                me = slack_user_search(ws->my_user_id);
+            if (me && ((me->status_emoji && me->status_emoji[0]) ||
+                       (me->status_text && me->status_text[0])))
+            {
+                char *emo = NULL;
+                if (me->status_emoji && me->status_emoji[0])
+                {
+                    char tmp[80];
+                    snprintf(tmp, sizeof(tmp), ":%s:", me->status_emoji);
+                    emo = slack_event_replace_emoji(tmp);
+                }
+                weechat_printf(buffer, "%sweeslack: status: %s%s%s",
+                                weechat_prefix("network"),
+                                emo ? emo : "",
+                                (emo && me->status_text && me->status_text[0])
+                                    ? " " : "",
+                                me->status_text ? me->status_text : "");
+                free(emo);
+            }
+            else
+            {
+                weechat_printf(buffer, "%sweeslack: no status set  "
+                                "(usage: /cslack status <emoji> [text] | "
+                                "-delete | dnd|away|active)",
+                                weechat_prefix("network"));
+            }
             return WEECHAT_RC_OK;
         }
 
@@ -679,15 +709,131 @@ weeslack_command_cslack(const void *pointer, void *data,
             slack_event_set_presence(ws, "away");
         else if (weechat_strcasecmp(argv[2], "active") == 0)
             slack_event_set_presence(ws, "auto");
+        else if (weechat_strcasecmp(argv[2], "-delete") == 0)
+        {
+            slack_event_set_profile_status(ws, "", "");
+            weechat_printf(buffer, "%sweeslack: clearing profile status…",
+                            weechat_prefix("network"));
+            return WEECHAT_RC_OK;
+        }
         else
         {
-            weechat_printf(buffer, "%sweeslack: unknown status '%s'",
-                            weechat_prefix("error"), argv[2]);
+            const char *emoji = argv[2];
+            const char *text = (argc >= 4) ? argv_eol[3] : "";
+            slack_event_set_profile_status(ws, emoji, text);
+            weechat_printf(buffer, "%sweeslack: updating profile status…",
+                            weechat_prefix("network"));
             return WEECHAT_RC_OK;
         }
 
-        weechat_printf(buffer, "%sweeslack: status updated",
+        weechat_printf(buffer, "%sweeslack: presence/dnd updated",
                         weechat_prefix("network"));
+    }
+    else if (weechat_strcasecmp(argv[1], "create") == 0)
+    {
+        struct t_weeslack_workspace *ws;
+        int is_private = 0;
+        const char *name = NULL;
+
+        ws = weeslack_workspace_search("default");
+        if (!ws || !ws->connected)
+        {
+            weechat_printf(buffer, "%sweeslack: not connected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        if (argc < 3)
+        {
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack create [-private] <name>",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        if (weechat_strcasecmp(argv[2], "-private") == 0)
+        {
+            is_private = 1;
+            if (argc < 4)
+            {
+                weechat_printf(buffer,
+                                "%sweeslack: usage: /cslack create -private <name>",
+                                weechat_prefix("error"));
+                return WEECHAT_RC_OK;
+            }
+            name = argv[3];
+        }
+        else
+            name = argv[2];
+
+        slack_event_create_channel(ws, name, is_private);
+        weechat_printf(buffer, "%sweeslack: creating %s%s…",
+                        weechat_prefix("network"),
+                        is_private ? "private channel " : "#",
+                        name);
+    }
+    else if (weechat_strcasecmp(argv[1], "invite") == 0)
+    {
+        struct t_weeslack_workspace *ws;
+        const char *channel_id;
+
+        ws = weeslack_workspace_search("default");
+        if (!ws || !ws->connected)
+        {
+            weechat_printf(buffer, "%sweeslack: not connected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        if (argc < 3)
+        {
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack invite <user|@nick|U…>",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        channel_id = weeslack_cmd_channel_id(buffer);
+        if (!channel_id)
+        {
+            weechat_printf(buffer, "%sweeslack: no channel selected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        slack_event_invite_user(ws, channel_id, argv[2]);
+        weechat_printf(buffer, "%sweeslack: inviting %s…",
+                        weechat_prefix("network"), argv[2]);
+    }
+    else if (weechat_strcasecmp(argv[1], "showmuted") == 0)
+    {
+        struct t_slack_channel *ch;
+        int count = 0;
+        char list[1024];
+        size_t pos = 0;
+
+        list[0] = '\0';
+        for (ch = slack_channel_list_global(); ch; ch = ch->next)
+        {
+            if (!ch->is_muted || !ch->name)
+                continue;
+            if (pos > 0 && pos + 2 < sizeof(list))
+            {
+                list[pos++] = ',';
+                list[pos++] = ' ';
+                list[pos] = '\0';
+            }
+            {
+                int n = snprintf(list + pos, sizeof(list) - pos, "%s",
+                                 ch->name);
+                if (n > 0 && (size_t)n < sizeof(list) - pos)
+                    pos += (size_t)n;
+                else
+                    break;
+            }
+            count++;
+        }
+        if (count == 0)
+            weechat_printf(buffer, "%sweeslack: no muted channels",
+                            weechat_prefix("network"));
+        else
+            weechat_printf(buffer, "%sweeslack: muted channels: %s",
+                            weechat_prefix("network"), list);
     }
     else if (weechat_strcasecmp(argv[1], "away") == 0)
     {
@@ -1211,7 +1357,13 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sunmute%s       Unmute current channel",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %sstatus%s <dnd|away|active> Set status",
+        weechat_printf(buffer, "  %sstatus%s [emoji [text]|-delete|dnd|away|active]",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %screate%s [-private] <name>  Create channel",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %sinvite%s <user> Invite user to current channel",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %sshowmuted%s    List muted channels",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %saway%s         Mark as away",
                         weechat_color("cyan"), weechat_color("reset"));
@@ -1391,6 +1543,15 @@ weeslack_config_init(void)
         "download_path", "string",
         "Directory for /cslack download (empty = ~/Downloads/weeslack)",
         NULL, 0, 0, "", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.never_away = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "never_away", "boolean",
+        "Periodically set presence to active (every 5 min) so you never appear away",
+        NULL, 0, 0, "off", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);
@@ -2030,6 +2191,27 @@ weeslack_upgrade_read_cb(const void *pointer, void *data,
 static int weeslack_upgrade_reconnect_cb(const void *pointer, void *data,
                                           int remaining_calls);
 
+/* wee-slack never_away: set presence active every 5 minutes when enabled */
+static int
+weeslack_never_away_cb(const void *pointer, void *data, int remaining_calls)
+{
+    struct t_weeslack_workspace *ws;
+
+    (void)pointer;
+    (void)data;
+    (void)remaining_calls;
+
+    if (!weechat_config_boolean(weeslack_config.never_away))
+        return WEECHAT_RC_OK;
+
+    for (ws = weeslack_workspaces; ws; ws = ws->next_workspace)
+    {
+        if (ws->connected)
+            slack_event_set_presence(ws, "auto");
+    }
+    return WEECHAT_RC_OK;
+}
+
 int
 weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
 {
@@ -2043,7 +2225,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_command(
         "cslack",
         "Slack protocol commands",
-        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
+        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || create || invite || showmuted || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
         "connect:      Connect to Slack using configured token\n"
         "disconnect:   Disconnect from Slack\n"
         "migrate:      Import token from wee-slack (python) config\n"
@@ -2059,7 +2241,10 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "talk:         Open DM with user id or name\n"
         "mute:         Mute current channel\n"
         "unmute:       Unmute current channel\n"
-        "status:       Set status (dnd, away, active)\n"
+        "status:       Profile status emoji/text, or dnd|away|active|-delete\n"
+        "create:       Create channel ([-private] name)\n"
+        "invite:       Invite user to current channel\n"
+        "showmuted:    List muted channels\n"
         "away:         Mark as away\n"
         "back:         Mark as active (clear away/DnD)\n"
         "hide:         Hide current channel\n"
@@ -2085,7 +2270,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "refresh:      Re-fetch users.list + emoji.list (no re-bootstrap)\n"
         "names:        Refresh nicklist for the current channel\n"
         "help:         Show help",
-        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
+        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status -delete|%(slack_emoji)|dnd|away|active|create -private|invite %(slack_nicks)|showmuted|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
         &weeslack_command_cslack,
         NULL,
         NULL);
@@ -2123,6 +2308,10 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
 
     /* Optional standard emoji table (same file as Python wee-slack). */
     slack_event_load_weemoji();
+
+    /* 5 min interval; no-op unless look.never_away is on */
+    weechat_hook_timer(1000 * 60 * 5, 0, 0,
+                        &weeslack_never_away_cb, NULL, NULL);
 
     weeslack_upgrade_file = weechat_upgrade_new(
         "weeslack",

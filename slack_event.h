@@ -86,6 +86,20 @@ extern void slack_event_set_dnd(struct t_weeslack_workspace *workspace,
                                  int enable);
 extern void slack_event_set_presence(struct t_weeslack_workspace *workspace,
                                       const char *presence);
+/* Slack profile status (emoji + text); empty strings clear fields. */
+extern void slack_event_set_profile_status(struct t_weeslack_workspace *workspace,
+                                            const char *status_emoji,
+                                            const char *status_text);
+extern void slack_event_create_channel(struct t_weeslack_workspace *workspace,
+                                        const char *name, int is_private);
+extern void slack_event_invite_user(struct t_weeslack_workspace *workspace,
+                                     const char *channel_id,
+                                     const char *user_id_or_name);
+/* chat.meMessage — /me style; thread_ts optional. */
+extern void slack_event_send_me_message(struct t_weeslack_workspace *workspace,
+                                         const char *channel_id,
+                                         const char *text,
+                                         const char *thread_ts);
 extern void slack_event_set_mute(struct t_weeslack_workspace *workspace,
                                   const char *channel_id, int mute);
 extern void slack_event_get_permalink(struct t_weeslack_workspace *workspace,
