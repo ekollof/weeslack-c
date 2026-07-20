@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — blockquotes, pin subtypes, names command,
-API ok feedback, join/leave nicklist
+**Last update:** 2026-07-20 — Here/Away nicklist, mute prefs on connect,
+bot roster model (is_bot → bots map, users.info for unknowns)
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -29,7 +29,7 @@ API ok feedback, join/leave nicklist
 - [x] SlackTS / SlackUser / SlackChannel / SlackSubteam  
 - [x] Workspace stable `id` vs display `name`  
 - [x] Custom emoji map via **`emoji.list`** (+ **refresh-only** on `emoji_changed`; no re-bootstrap)  
-- [~] Bots — `bots.list` optional (often unavailable on xoxp)  
+- [x] Bots — `is_bot` / `is_app_user` registered in bot map; **hidden from nicklist** (wee-slack style)  
 - [~] SlackMessage — list model; edit not in-place line rewrite  
 - [x] Reaction list maintained on RTM add/remove (notice lines; no in-place rewrite)  
 
@@ -41,10 +41,13 @@ API ok feedback, join/leave nicklist
 - [x] Lazy history + serial queue; members on focus  
 - [x] History pagination — up to **5×100** on slow queue; accumulate → chronological flush  
 - [x] Members pagination — up to **3×200** on slow queue  
+- [x] Unknown members → **`users.info`** (slow, capped); no stub nicks  
+- [x] Nicklist **Here / Away** groups (presence); bots purged  
 - [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe)  
 - [x] Buflist trigger includes `weeslack` (export conf)  
 - [~] Buffer close keeps model (by design)  
 - [x] `short_buffer_names` — `#channel` vs `team.#channel`  
+- [x] Mute prefs from **`users.prefs.get`** applied after channel list  
 
 ---
 
@@ -61,6 +64,8 @@ API ok feedback, join/leave nicklist
 - [x] Message markdown render uses capacity-tracked `snprintf` (no `sprintf`)  
 - [x] Join/leave show resolved names  
 - [x] `colorize_private_chats` gates nick color on DM/MPDM  
+- [x] Blockquotes, Block Kit text fallback, HTML entity unescape  
+- [x] Self-mention → `notify_highlight`  
 
 ---
 
@@ -78,9 +83,8 @@ API ok feedback, join/leave nicklist
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
 - [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
-- [x] **`whois`** (+ live `users.getPresence`), **`join`**, **`leave`/`part`**, **`refresh`**, **`names`**  
-- [x] Stars list — resolve channel/user names, format text (cap 40 shown)  
-- [x] Search list — resolve names, format text (cap 20 shown)  
+- [x] **`whois`** (+ live presence), **`join`**, **`leave`/`part`**, **`refresh`**, **`names`**  
+- [x] Stars / search list polish  
 - [~] subscribe = local thread notify only  
 
 ---
@@ -89,6 +93,7 @@ API ok feedback, join/leave nicklist
 
 - [x] Hooks wired to `/cslack`  
 - [x] Nick completion prefers **buffer nicklist**, else all users  
+- [x] Join completion via `%(slack_channels)`  
 
 ---
 
@@ -115,21 +120,11 @@ API ok feedback, join/leave nicklist
 
 ## Phase 10: RTM
 
-- [x] Core events  
-- [x] `member_joined_channel` / `member_left_channel` (nicklist + notice)  
-- [x] `user_change`, `channel_rename` / `group_rename`, archive/unarchive  
-- [x] `channel_created` / `group_joined` / `im_created` / `mpim_joined` / `team_join`  
-- [x] `pin_added` / `pin_removed`, `channel_left` / `group_left` / `im_close` / `mpim_close`  
-- [x] Self-mention → `notify_highlight` (raw `<@U…>` or `@display_name`)  
-- [x] `me_message` (/me style), `channel_purpose`, Block Kit text fallback  
-- [x] Blockquotes (`> …`), `pinned_item` / `unpinned_item` / `channel_name` subtypes  
-- [x] HTML entity unescape (`&amp;`, numeric entities, …)  
-- [x] Join/leave message subtypes update nicklist  
-- [x] `manual_presence_change`  
-- [x] Simple API callbacks log success (`… ok`)  
-- [x] `dnd_updated` / `channel_deleted`  
-- [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
+- [x] Core events + lifecycle (create/rename/archive/leave/delete/join)  
+- [x] pin / emoji_changed / dnd / presence / team_join  
+- [x] `me_message`, pin subtypes, channel_name, purpose  
 - [x] Rate-limit + auth messaging  
+- [x] Reconnect with fresh rtm.connect  
 
 ---
 
@@ -137,12 +132,15 @@ API ok feedback, join/leave nicklist
 
 ```
 rtm.connect
- → users.list / bots.list / emoji.list / usergroups.list  (via HTTP queue)
+ → users.list (is_bot → bot map + hide from nicklist) / bots.list / emoji.list / usergroups.list
  → conversations.list → create buffers (NO history, NO members)
+ → users.prefs.get → apply muted_channels
  → bootstrap quiet ~8s (buffer_switch ignores history/members)
- → user focuses a buffer → history (slow lane, ≤3 pages) + members (≤3 pages)
- → /cslack loadhistory forces re-fetch
- → emoji_changed → emoji.list only (no conversations.list)
+ → user focuses a buffer → history (slow, ≤5×100) + members (≤3×200)
+      unknown members → users.info (slow, capped); bots never nicklisted
+ → /cslack loadhistory | names | refresh as needed
+ → emoji_changed → emoji.list only
+ → WS drop / goodbye → rtm.connect (fresh URL), no full bootstrap
 ```
 
 **Do not** reload/connect while Slack is still cooling from earlier storms.
@@ -167,19 +165,10 @@ rtm.connect
 |-------|-----|
 | `emoji_changed` re-chained full bootstrap | emoji cb: bootstrap only when `user_data` set |
 | Every thread reply opened a buffer + `fetch_replies` | open only if subscribed / explicit `/cslack thread` |
-| `linkarchive` read never-set localvar | set `localvar_slack_timestamp` + `channel->last_message_ts` on print |
-| Dead config: short names, private color, strikethrough | wired |
-| HTTP ignored proxy | `slack_http_apply_proxy` / `slack_http_get_proxy_url` |
-| Curl upload/download ignored proxy | `slack_http_curl_add_proxy` |
-| Reaction model updated from wrong JSON | `slack_message_reaction_add/remove` |
-| History/members single page only | capped multi-page on slow queue |
-| Stars/search raw ids | resolve names + format text |
-| `header=1` broke JSON parse | removed (connect fix) |
-| `sprintf` in markdown render | `slack_fmt_append` + `vsnprintf` |
-| Thin file lines | title/name, human size, private download URL |
-| Missing RTM join/leave/rename | member_*, user_change, channel_rename, archive |
-| users.list unlimited pages | cap 10 pages |
-| pin/star/react required ts always | default to last message ts |
-| Block-only messages empty | extract text from blocks |
-| me_message plain | magenta `* nick text` action line |
-| Live channel/DM create missed | channel_created / im_created / team_join |
+| Bots in nicklist (Drive, USLACKBOT) | `is_bot`/`is_app_user` + purge; no member stubs; users.info for unknowns |
+| Stale WS reconnect URL | re-issue `rtm.connect` |
+| Dead config options | wired short names / private color / strikethrough |
+| HTTP / curl ignored proxy | `slack_http_*_proxy` helpers |
+| History/members single page | capped multi-page slow queue |
+| No mute from Slack prefs | `users.prefs.get` after channel list |
+| Flat nicklist | Here/Away groups by presence |

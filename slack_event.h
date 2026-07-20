@@ -105,5 +105,7 @@ extern void slack_event_refresh_directory(struct t_weeslack_workspace *workspace
 /* Force re-fetch of channel members into nicklist (clears members_loaded). */
 extern void slack_event_refresh_members(struct t_weeslack_workspace *workspace,
                                         struct t_slack_channel *channel);
+/* Apply Slack muted_channels preference after connect. */
+extern void slack_event_load_mute_prefs(struct t_weeslack_workspace *workspace);
 
 #endif

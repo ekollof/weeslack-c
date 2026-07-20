@@ -3815,6 +3815,9 @@ slack_event_channels_cb(struct t_weeslack_workspace *workspace,
     }
 
     json_object_put(json);
+
+    /* After all channel pages: apply Slack mute prefs to buffers */
+    slack_event_load_mute_prefs(workspace);
 }
 
 void
@@ -4516,6 +4519,85 @@ slack_event_mute_prefs_get_cb(struct t_weeslack_workspace *workspace,
                                slack_event_mute_prefs_set_cb, ctx);
         json_object_put(params);
     }
+}
+
+/* Apply muted_channels from users.prefs.get after connect (no set). */
+static void
+slack_event_connect_prefs_cb(struct t_weeslack_workspace *workspace,
+                             int return_code, const char *output,
+                             void *user_data)
+{
+    struct json_object *json, *prefs, *mc;
+    const char *s;
+    int muted_n = 0;
+
+    (void) user_data;
+
+    if (return_code != 0 || !output)
+        return;
+
+    json = slack_json_decode(output);
+    if (!json)
+        return;
+    if (slack_api_check_error(workspace, json, "users.prefs.get"))
+    {
+        json_object_put(json);
+        return;
+    }
+
+    if (json_object_object_get_ex(json, "prefs", &prefs) &&
+        json_object_object_get_ex(prefs, "muted_channels", &mc))
+    {
+        s = json_object_get_string(mc);
+        if (s && s[0])
+        {
+            char *copy = strdup(s);
+            char *tok, *save = NULL;
+
+            if (copy)
+            {
+                for (tok = strtok_r(copy, ",", &save); tok;
+                     tok = strtok_r(NULL, ",", &save))
+                {
+                    struct t_slack_channel *ch;
+                    struct t_slack_buffer *sbuf;
+
+                    while (*tok == ' ')
+                        tok++;
+                    if (!tok[0])
+                        continue;
+                    ch = slack_channel_search(tok);
+                    if (!ch)
+                        continue;
+                    ch->is_muted = 1;
+                    sbuf = slack_buffer_search_by_channel(ch->id);
+                    if (sbuf)
+                        slack_buffer_set_muted(sbuf, 1);
+                    muted_n++;
+                }
+                free(copy);
+            }
+        }
+    }
+
+    if (muted_n > 0)
+    {
+        SLACK_WS_PRINTF(workspace,
+                        "%sweeslack: applied mute to %d channel%s from prefs",
+                        weechat_prefix("network"), muted_n,
+                        muted_n == 1 ? "" : "s");
+    }
+
+    json_object_put(json);
+}
+
+void
+slack_event_load_mute_prefs(struct t_weeslack_workspace *workspace)
+{
+    if (!workspace)
+        return;
+    slack_http_request_new(workspace, "users.prefs.get", NULL,
+                           slack_event_connect_prefs_cb, NULL);
 }
 
 /*

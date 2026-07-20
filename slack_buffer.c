@@ -521,6 +521,47 @@ slack_buffer_nick_color(struct t_slack_user *user, char *hex_buf, size_t hex_siz
     return color && color[0] ? color : "default";
 }
 
+/* wee-slack-style nicklist groups (sort prefixes force Here above Away). */
+#define SLACK_NICK_GROUP_HERE  "0|Here"
+#define SLACK_NICK_GROUP_AWAY  "1|Away"
+
+static struct t_gui_nick_group *
+slack_buffer_ensure_nick_group(struct t_gui_buffer *buffer,
+                               const char *name, int visible)
+{
+    struct t_gui_nick_group *grp;
+
+    if (!buffer || !name)
+        return NULL;
+    grp = weechat_nicklist_search_group(buffer, NULL, name);
+    if (grp)
+        return grp;
+    return weechat_nicklist_add_group(
+        buffer, NULL, name, "weechat.color.nicklist_group", visible);
+}
+
+static struct t_gui_nick_group *
+slack_buffer_nick_group_for_user(struct t_gui_buffer *buffer,
+                                 struct t_slack_user *user)
+{
+    int here = 0;
+
+    if (!buffer || !user)
+        return NULL;
+
+    /* Ensure both groups exist so the list stays stable when empty. */
+    slack_buffer_ensure_nick_group(buffer, SLACK_NICK_GROUP_HERE, 1);
+    slack_buffer_ensure_nick_group(buffer, SLACK_NICK_GROUP_AWAY, 1);
+
+    if (user->presence && strcmp(user->presence, "active") == 0)
+        here = 1;
+
+    return slack_buffer_ensure_nick_group(
+        buffer,
+        here ? SLACK_NICK_GROUP_HERE : SLACK_NICK_GROUP_AWAY,
+        1);
+}
+
 void
 slack_buffer_add_nick(struct t_slack_buffer *sbuf, struct t_slack_user *user)
 {
@@ -545,18 +586,14 @@ slack_buffer_add_nick(struct t_slack_buffer *sbuf, struct t_slack_user *user)
     if (!nick || !nick[0])
         return;
 
-    nick_group = weechat_nicklist_search_group(sbuf->buffer, NULL, "users");
-    if (!nick_group)
-    {
-        nick_group = weechat_nicklist_add_group(
-            sbuf->buffer, NULL, "users", "weechat.color.nicklist_group", 1);
-    }
-    if (!nick_group)
-        return;
-
-    existing = weechat_nicklist_search_nick(sbuf->buffer, nick_group, nick);
+    /* Drop from any group (Here/Away/legacy "users") before re-add. */
+    existing = weechat_nicklist_search_nick(sbuf->buffer, NULL, nick);
     if (existing)
         weechat_nicklist_remove_nick(sbuf->buffer, existing);
+
+    nick_group = slack_buffer_nick_group_for_user(sbuf->buffer, user);
+    if (!nick_group)
+        return;
 
     color = slack_buffer_nick_color(user, hex_color, sizeof(hex_color));
 
@@ -591,7 +628,6 @@ slack_buffer_remove_nick(struct t_slack_buffer *sbuf,
                           struct t_slack_user *user)
 {
     const char *nick;
-    struct t_gui_nick_group *nick_group;
     struct t_gui_nick *n;
 
     if (!sbuf || !sbuf->buffer || !user)
@@ -601,11 +637,8 @@ slack_buffer_remove_nick(struct t_slack_buffer *sbuf,
     if (!nick)
         return;
 
-    nick_group = weechat_nicklist_search_group(sbuf->buffer, NULL, "users");
-    if (!nick_group)
-        return;
-
-    n = weechat_nicklist_search_nick(sbuf->buffer, nick_group, nick);
+    /* NULL group → search all groups (Here/Away/legacy). */
+    n = weechat_nicklist_search_nick(sbuf->buffer, NULL, nick);
     if (n)
         weechat_nicklist_remove_nick(sbuf->buffer, n);
 }
@@ -753,10 +786,6 @@ void
 slack_buffer_update_user_presence(struct t_slack_user *user)
 {
     const char *nick;
-    char hex_color[16];
-    const char *color;
-    const char *prefix;
-    const char *prefix_color;
     struct t_slack_channel *ch;
 
     if (!user)
@@ -783,41 +812,21 @@ slack_buffer_update_user_presence(struct t_slack_user *user)
     if (!nick)
         return;
 
-    color = slack_buffer_nick_color(user, hex_color, sizeof(hex_color));
-
-    if (user->presence && strcmp(user->presence, "active") == 0)
-    {
-        prefix = "+";
-        prefix_color = "green";
-    }
-    else if (user->presence && strcmp(user->presence, "away") == 0)
-    {
-        prefix = "-";
-        prefix_color = "yellow";
-    }
-    else
-    {
-        prefix = " ";
-        prefix_color = NULL;
-    }
-
+    /* Re-home nick into Here vs Away (wee-slack style). */
     for (ch = slack_channel_list_global(); ch; ch = ch->next)
     {
-        struct t_gui_nick_group *grp;
-        struct t_gui_nick *n;
+        struct t_slack_buffer *sbuf;
 
         if (!ch->buffer)
             continue;
-        grp = weechat_nicklist_search_group(ch->buffer, NULL, "users");
-        if (!grp)
+        sbuf = slack_buffer_search(ch->buffer);
+        if (!sbuf)
+            sbuf = slack_buffer_search_by_channel(ch->id);
+        if (!sbuf)
             continue;
-        n = weechat_nicklist_search_nick(ch->buffer, grp, nick);
-        if (!n)
+        /* only touch channels that already show this user */
+        if (!weechat_nicklist_search_nick(ch->buffer, NULL, nick))
             continue;
-        weechat_nicklist_nick_set(ch->buffer, n, "prefix", prefix);
-        if (prefix_color)
-            weechat_nicklist_nick_set(ch->buffer, n, "prefix_color",
-                                      prefix_color);
-        weechat_nicklist_nick_set(ch->buffer, n, "color", color);
+        slack_buffer_add_nick(sbuf, user);
     }
 }
