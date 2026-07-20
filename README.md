@@ -294,7 +294,7 @@ auto-download share this path. If `look.icat_enabled` is on **and** the
 weechat-icat script is loaded (`/icat` registered), image files trigger:
 
 ```text
-/icat -print_immediately -quiet -columns 40 -rows N "<path>"
+/icat -print_immediately -quiet -columns 40 -rows N /absolute/path.png
 ```
 
 If `/icat` is missing, previews are skipped (one-time warning; no spam).
