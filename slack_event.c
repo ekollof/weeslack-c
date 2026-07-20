@@ -1602,11 +1602,179 @@ slack_event_in_bootstrap_quiet(void)
     return time(NULL) < g_bootstrap_quiet_until;
 }
 
+/* History: up to HISTORY_MAX_PAGES pages of HISTORY_PAGE_SIZE on the slow
+ * queue. Messages are accumulated then flushed oldest→newest so multi-page
+ * loads stay in chronological buffer order without stampeding the API. */
+#define SLACK_HISTORY_PAGE_SIZE   50
+#define SLACK_HISTORY_MAX_PAGES   3
+#define SLACK_MEMBERS_PAGE_SIZE  200
+#define SLACK_MEMBERS_MAX_PAGES    3
+
 struct t_slack_history_ctx
 {
     struct t_slack_channel *channel;
     int is_replies;
+    int page;
+    int truncated;
+    /* retained message objects (json_object_get) until flush */
+    struct json_object **msgs;
+    int msg_count;
+    int msg_cap;
+    char parent_id[64];
+    char thread_ts[64];
 };
+
+static void
+slack_event_history_ctx_free(struct t_slack_history_ctx *ctx)
+{
+    int i;
+
+    if (!ctx)
+        return;
+    if (ctx->msgs)
+    {
+        for (i = 0; i < ctx->msg_count; i++)
+        {
+            if (ctx->msgs[i])
+                json_object_put(ctx->msgs[i]);
+        }
+        free(ctx->msgs);
+    }
+    free(ctx);
+}
+
+static int
+slack_event_history_msg_ts_cmp(const void *a, const void *b)
+{
+    struct json_object *ja = *(struct json_object * const *)a;
+    struct json_object *jb = *(struct json_object * const *)b;
+    struct json_object *ta, *tb;
+    const char *sa = "", *sb = "";
+    SlackTS tsa, tsb;
+
+    if (json_object_object_get_ex(ja, "ts", &ta))
+        sa = json_object_get_string(ta);
+    if (json_object_object_get_ex(jb, "ts", &tb))
+        sb = json_object_get_string(tb);
+    tsa = slack_ts_new(sa);
+    tsb = slack_ts_new(sb);
+    return slack_ts_cmp(tsa, tsb);
+}
+
+static int
+slack_event_history_append_msg(struct t_slack_history_ctx *ctx,
+                               struct json_object *msg)
+{
+    struct json_object **nm;
+
+    if (!ctx || !msg)
+        return 0;
+    if (ctx->msg_count >= ctx->msg_cap)
+    {
+        int ncap = ctx->msg_cap ? ctx->msg_cap * 2 : 64;
+        nm = realloc(ctx->msgs, (size_t)ncap * sizeof(*nm));
+        if (!nm)
+            return 0;
+        ctx->msgs = nm;
+        ctx->msg_cap = ncap;
+    }
+    ctx->msgs[ctx->msg_count] = json_object_get(msg);
+    ctx->msg_count++;
+    return 1;
+}
+
+static void
+slack_event_history_flush(struct t_weeslack_workspace *workspace,
+                          struct t_slack_history_ctx *ctx)
+{
+    struct t_slack_channel *channel;
+    int i, loaded = 0;
+
+    if (!ctx)
+        return;
+    channel = ctx->channel;
+
+    if (ctx->msg_count > 1)
+        qsort(ctx->msgs, (size_t)ctx->msg_count, sizeof(ctx->msgs[0]),
+              slack_event_history_msg_ts_cmp);
+
+    for (i = 0; i < ctx->msg_count; i++)
+    {
+        if (ctx->msgs[i])
+        {
+            slack_event_handle_message(workspace, channel, ctx->msgs[i], 1);
+            loaded++;
+        }
+    }
+
+    if (channel && channel->buffer && loaded > 0)
+    {
+        weechat_printf(channel->buffer,
+                        "%s--- loaded %d messages from history%s ---%s",
+                        weechat_prefix("network"),
+                        loaded,
+                        ctx->truncated ? " (truncated; more on Slack)" : "",
+                        weechat_color("reset"));
+    }
+
+    if (channel)
+    {
+        channel->history_state = 3;
+        channel->history_retries = 0;
+    }
+
+    slack_event_history_ctx_free(ctx);
+}
+
+static void slack_event_history_cb(struct t_weeslack_workspace *workspace,
+                                    int return_code, const char *output,
+                                    void *user_data);
+
+static int
+slack_event_history_request(struct t_weeslack_workspace *workspace,
+                            struct t_slack_history_ctx *ctx,
+                            const char *cursor)
+{
+    struct json_object *params;
+    const char *method;
+
+    if (!workspace || !ctx || !ctx->channel)
+        return 0;
+
+    params = json_object_new_object();
+    if (!params)
+        return 0;
+
+    if (ctx->is_replies)
+    {
+        method = "conversations.replies";
+        json_object_object_add(params, "channel",
+                               json_object_new_string(ctx->parent_id));
+        json_object_object_add(params, "ts",
+                               json_object_new_string(ctx->thread_ts));
+    }
+    else
+    {
+        method = "conversations.history";
+        json_object_object_add(params, "channel",
+                               json_object_new_string(ctx->channel->id));
+    }
+    json_object_object_add(params, "limit",
+                           json_object_new_int(SLACK_HISTORY_PAGE_SIZE));
+    if (cursor && cursor[0])
+        json_object_object_add(params, "cursor",
+                               json_object_new_string(cursor));
+
+    if (!slack_http_request_new_flags(workspace, method, params,
+                                      SLACK_HTTP_SLOW,
+                                      slack_event_history_cb, ctx))
+    {
+        json_object_put(params);
+        return 0;
+    }
+    json_object_put(params);
+    return 1;
+}
 
 static void
 slack_event_history_cb(struct t_weeslack_workspace *workspace,
@@ -1617,7 +1785,8 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
     struct t_slack_channel *channel;
     const char *api_name;
     struct json_object *json, *messages_obj;
-    int loaded = 0;
+    const char *next_cursor = NULL;
+    int has_more = 0;
 
     if (!ctx)
         return;
@@ -1627,28 +1796,42 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
 
     if (return_code != 0 || !output)
     {
-        if (channel)
-            channel->history_state = 0;
-        free(ctx);
+        if (ctx->msg_count > 0)
+            slack_event_history_flush(workspace, ctx);
+        else
+        {
+            if (channel)
+                channel->history_state = 0;
+            slack_event_history_ctx_free(ctx);
+        }
         return;
     }
 
     json = slack_json_decode(output);
     if (!json)
     {
-        if (channel)
-            channel->history_state = 0;
-        free(ctx);
+        if (ctx->msg_count > 0)
+            slack_event_history_flush(workspace, ctx);
+        else
+        {
+            if (channel)
+                channel->history_state = 0;
+            slack_event_history_ctx_free(ctx);
+        }
         return;
     }
 
     if (slack_api_check_error(workspace, json, api_name))
     {
-        /* HTTP layer already re-queued on 429; if we still get here, allow retry */
-        if (channel)
-            channel->history_state = 0;
+        if (ctx->msg_count > 0)
+            slack_event_history_flush(workspace, ctx);
+        else
+        {
+            if (channel)
+                channel->history_state = 0;
+            slack_event_history_ctx_free(ctx);
+        }
         json_object_put(json);
-        free(ctx);
         return;
     }
 
@@ -1656,33 +1839,57 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
     {
         int count = json_object_array_length(messages_obj);
         int start = ctx->is_replies ? 1 : 0;
+        int i;
 
-        for (int i = count - 1; i >= start; i--)
+        for (i = start; i < count; i++)
         {
-            struct json_object *msg_obj = json_object_array_get_idx(messages_obj, i);
-            slack_event_handle_message(workspace, channel, msg_obj, 1);
-            loaded++;
+            struct json_object *msg_obj =
+                json_object_array_get_idx(messages_obj, i);
+            slack_event_history_append_msg(ctx, msg_obj);
         }
     }
 
-    /* single page only — no has_more follow-up (avoids history storms) */
-    if (channel && channel->buffer && loaded > 0)
     {
-        weechat_printf(channel->buffer,
-                        "%s--- loaded %d messages from history ---%s",
-                        weechat_prefix("network"),
-                        loaded,
-                        weechat_color("reset"));
+        struct json_object *hm;
+        if (json_object_object_get_ex(json, "has_more", &hm))
+            has_more = json_object_get_boolean(hm);
+    }
+    {
+        struct json_object *meta, *cobj;
+        if (json_object_object_get_ex(json, "response_metadata", &meta) &&
+            json_object_object_get_ex(meta, "next_cursor", &cobj))
+        {
+            next_cursor = json_object_get_string(cobj);
+            if (next_cursor && !next_cursor[0])
+                next_cursor = NULL;
+        }
     }
 
-    if (channel)
+    ctx->page++;
+
+    if ((has_more || next_cursor) && ctx->page < SLACK_HISTORY_MAX_PAGES &&
+        next_cursor)
     {
-        channel->history_state = 3;
-        channel->history_retries = 0;
+        char *cursor_copy = strdup(next_cursor);
+        json_object_put(json);
+        if (cursor_copy &&
+            slack_event_history_request(workspace, ctx, cursor_copy))
+        {
+            free(cursor_copy);
+            return;
+        }
+        free(cursor_copy);
+        /* fall through to flush what we have */
+        ctx->truncated = 1;
+        slack_event_history_flush(workspace, ctx);
+        return;
     }
+
+    if ((has_more || next_cursor) && ctx->page >= SLACK_HISTORY_MAX_PAGES)
+        ctx->truncated = 1;
 
     json_object_put(json);
-    free(ctx);
+    slack_event_history_flush(workspace, ctx);
 }
 
 static void
@@ -1691,7 +1898,6 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
                            int is_replies)
 {
     struct t_slack_history_ctx *ctx;
-    struct json_object *params;
 
     if (!workspace || !channel || !channel->id)
         return;
@@ -1704,16 +1910,11 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
         return;
     ctx->channel = channel;
     ctx->is_replies = is_replies;
+    ctx->page = 0;
     channel->history_state = 2;
-
-    params = json_object_new_object();
 
     if (is_replies)
     {
-        char parent_buf[128];
-        const char *parent_id = NULL;
-        const char *thread_ts = NULL;
-
         if (strncmp(channel->id, "thread_", 7) == 0)
         {
             const char *rest = channel->id + 7;
@@ -1721,52 +1922,29 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
             if (us)
             {
                 size_t n = (size_t)(us - rest);
-                if (n < sizeof(parent_buf))
+                if (n < sizeof(ctx->parent_id))
                 {
-                    memcpy(parent_buf, rest, n);
-                    parent_buf[n] = '\0';
-                    parent_id = parent_buf;
-                    thread_ts = us + 1;
+                    memcpy(ctx->parent_id, rest, n);
+                    ctx->parent_id[n] = '\0';
+                    snprintf(ctx->thread_ts, sizeof(ctx->thread_ts), "%s",
+                             us + 1);
                 }
             }
         }
 
-        if (!parent_id || !thread_ts)
+        if (!ctx->parent_id[0] || !ctx->thread_ts[0])
         {
-            free(ctx);
             channel->history_state = 0;
-            json_object_put(params);
+            slack_event_history_ctx_free(ctx);
             return;
         }
-
-        json_object_object_add(params, "channel",
-                               json_object_new_string(parent_id));
-        json_object_object_add(params, "ts",
-                               json_object_new_string(thread_ts));
-        json_object_object_add(params, "limit", json_object_new_int(50));
-        if (!slack_http_request_new_flags(workspace, "conversations.replies",
-                                          params, SLACK_HTTP_SLOW,
-                                          slack_event_history_cb, ctx))
-        {
-            free(ctx);
-            channel->history_state = 0;
-        }
     }
-    else
+
+    if (!slack_event_history_request(workspace, ctx, NULL))
     {
-        json_object_object_add(params, "channel",
-                               json_object_new_string(channel->id));
-        json_object_object_add(params, "limit", json_object_new_int(50));
-        if (!slack_http_request_new_flags(workspace, "conversations.history",
-                                          params, SLACK_HTTP_SLOW,
-                                          slack_event_history_cb, ctx))
-        {
-            free(ctx);
-            channel->history_state = 0;
-        }
+        channel->history_state = 0;
+        slack_event_history_ctx_free(ctx);
     }
-
-    json_object_put(params);
 }
 
 void
@@ -2167,37 +2345,95 @@ slack_event_fetch_usergroups(struct t_weeslack_workspace *workspace)
 }
 
 /* ============================================================
- * Channel members → nicklist
+ * Channel members → nicklist (slow queue, capped pages)
  * ============================================================ */
+
+struct t_slack_members_ctx
+{
+    struct t_slack_channel *channel;
+    int page;
+    int total;
+};
+
+static void slack_event_members_cb(struct t_weeslack_workspace *workspace,
+                                    int return_code, const char *output,
+                                    void *user_data);
+
+static int
+slack_event_members_request(struct t_weeslack_workspace *workspace,
+                            struct t_slack_members_ctx *ctx,
+                            const char *cursor)
+{
+    struct json_object *params;
+
+    if (!workspace || !ctx || !ctx->channel)
+        return 0;
+
+    params = json_object_new_object();
+    if (!params)
+        return 0;
+
+    json_object_object_add(params, "channel",
+                           json_object_new_string(ctx->channel->id));
+    json_object_object_add(params, "limit",
+                           json_object_new_int(SLACK_MEMBERS_PAGE_SIZE));
+    if (cursor && cursor[0])
+        json_object_object_add(params, "cursor",
+                               json_object_new_string(cursor));
+
+    if (!slack_http_request_new_flags(workspace, "conversations.members",
+                                      params, SLACK_HTTP_SLOW,
+                                      slack_event_members_cb, ctx))
+    {
+        json_object_put(params);
+        return 0;
+    }
+    json_object_put(params);
+    return 1;
+}
 
 static void
 slack_event_members_cb(struct t_weeslack_workspace *workspace,
                        int return_code, const char *output,
                        void *user_data)
 {
-    struct t_slack_channel *channel = (struct t_slack_channel *)user_data;
+    struct t_slack_members_ctx *ctx = user_data;
+    struct t_slack_channel *channel;
     struct t_slack_buffer *sbuf;
+    const char *next_cursor = NULL;
 
-    if (!channel)
+    if (!ctx)
         return;
+    channel = ctx->channel;
+    if (!channel)
+    {
+        free(ctx);
+        return;
+    }
 
     if (return_code != 0 || !output)
     {
-        channel->members_loaded = 0;
+        if (ctx->total == 0)
+            channel->members_loaded = 0;
+        free(ctx);
         return;
     }
 
     struct json_object *json = slack_json_decode(output);
     if (!json)
     {
-        channel->members_loaded = 0;
+        if (ctx->total == 0)
+            channel->members_loaded = 0;
+        free(ctx);
         return;
     }
 
     if (slack_api_check_error(workspace, json, "conversations.members"))
     {
-        channel->members_loaded = 0;
+        if (ctx->total == 0)
+            channel->members_loaded = 0;
         json_object_put(json);
+        free(ctx);
         return;
     }
 
@@ -2221,19 +2457,51 @@ slack_event_members_cb(struct t_weeslack_workspace *workspace,
             if (!user)
                 user = slack_user_new(uid, uid, NULL);
             if (user)
+            {
                 slack_buffer_add_nick(sbuf, user);
+                ctx->total++;
+            }
         }
     }
 
-    /* No members pagination — one page is enough for nicklist UX */
+    {
+        struct json_object *meta, *cobj;
+        if (json_object_object_get_ex(json, "response_metadata", &meta) &&
+            json_object_object_get_ex(meta, "next_cursor", &cobj))
+        {
+            next_cursor = json_object_get_string(cobj);
+            if (next_cursor && !next_cursor[0])
+                next_cursor = NULL;
+        }
+    }
 
-    json_object_put(json);
+    ctx->page++;
+
+    if (next_cursor && ctx->page < SLACK_MEMBERS_MAX_PAGES)
+    {
+        char *cursor_copy = strdup(next_cursor);
+        json_object_put(json);
+        if (cursor_copy &&
+            slack_event_members_request(workspace, ctx, cursor_copy))
+        {
+            free(cursor_copy);
+            return;
+        }
+        free(cursor_copy);
+    }
+    else
+        json_object_put(json);
+
+    /* members_loaded stays 1 (done / in-progress complete) */
+    free(ctx);
 }
 
 void
 slack_event_fetch_members(struct t_weeslack_workspace *workspace,
                            struct t_slack_channel *channel)
 {
+    struct t_slack_members_ctx *ctx;
+
     if (!workspace || !channel || !channel->id)
         return;
     if (channel->members_loaded)
@@ -2241,19 +2509,19 @@ slack_event_fetch_members(struct t_weeslack_workspace *workspace,
     if (slack_event_in_bootstrap_quiet())
         return;
 
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+        return;
+    ctx->channel = channel;
+    ctx->page = 0;
+    ctx->total = 0;
+
     channel->members_loaded = 1; /* set early to dedupe; cleared on hard fail */
 
+    if (!slack_event_members_request(workspace, ctx, NULL))
     {
-        struct json_object *params = json_object_new_object();
-        json_object_object_add(params, "channel",
-                               json_object_new_string(channel->id));
-        json_object_object_add(params, "limit",
-                               json_object_new_int(200));
-        if (!slack_http_request_new_flags(workspace, "conversations.members",
-                                          params, SLACK_HTTP_SLOW,
-                                          slack_event_members_cb, channel))
-            channel->members_loaded = 0;
-        json_object_put(params);
+        channel->members_loaded = 0;
+        free(ctx);
     }
 }
 
@@ -2749,12 +3017,24 @@ slack_event_upload_url_cb(struct t_weeslack_workspace *workspace,
 
     snprintf(file_arg, sizeof(file_arg), "@%s", ctx->file_path);
 
-    weechat_hashtable_set(options, "arg1", "-sS");
-    weechat_hashtable_set(options, "arg2", "-X");
-    weechat_hashtable_set(options, "arg3", "POST");
-    weechat_hashtable_set(options, "arg4", "-T");
-    weechat_hashtable_set(options, "arg5", file_arg);
-    weechat_hashtable_set(options, "arg6", ctx->upload_url);
+    {
+        int argi = 1;
+        char key[16];
+
+        slack_http_curl_add_proxy(options, &argi);
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "-sS");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "-X");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "POST");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "-T");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, file_arg);
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, ctx->upload_url);
+    }
 
     weechat_hook_process_hashtable(
         "curl", options, 120000,
@@ -3320,29 +3600,80 @@ slack_event_search_http_cb(struct t_weeslack_workspace *workspace,
         if (json_object_object_get_ex(messages_obj, "matches", &matches_obj))
         {
             int count = json_object_array_length(matches_obj);
-            for (int i = 0; i < count && i < 15; i++)
+            for (int i = 0; i < count && i < 20; i++)
             {
                 struct json_object *match = json_object_array_get_idx(matches_obj, i);
                 struct json_object *text_obj, *ts_obj, *ch_obj, *name_obj;
-                const char *text = "?", *ts = "?", *ch = "?";
+                struct json_object *user_obj, *username_obj;
+                const char *text = "?", *ts = "?", *ch = "?", *who = "";
+                char ch_disp[128];
+                char *fmt = NULL, *emoji = NULL, *ment = NULL;
+                struct t_slack_channel *sch = NULL;
+                struct t_slack_user *su = NULL;
 
                 if (json_object_object_get_ex(match, "text", &text_obj))
                     text = json_object_get_string(text_obj);
                 if (json_object_object_get_ex(match, "ts", &ts_obj))
                     ts = json_object_get_string(ts_obj);
+                if (json_object_object_get_ex(match, "username", &username_obj))
+                    who = json_object_get_string(username_obj);
+                if (json_object_object_get_ex(match, "user", &user_obj))
+                {
+                    const char *uid = json_object_get_string(user_obj);
+                    su = uid ? slack_user_search(uid) : NULL;
+                    if (su)
+                        who = slack_user_best_name(su);
+                    else if (!who[0] && uid)
+                        who = uid;
+                }
                 if (json_object_object_get_ex(match, "channel", &ch_obj))
                 {
                     if (json_object_is_type(ch_obj, json_type_object) &&
                         json_object_object_get_ex(ch_obj, "name", &name_obj))
                         ch = json_object_get_string(name_obj);
                     else if (json_object_is_type(ch_obj, json_type_string))
+                    {
                         ch = json_object_get_string(ch_obj);
+                        sch = slack_channel_search(ch);
+                        if (sch && sch->name && sch->name[0])
+                            ch = sch->name;
+                    }
+                    else if (json_object_is_type(ch_obj, json_type_object))
+                    {
+                        struct json_object *id_obj;
+                        if (json_object_object_get_ex(ch_obj, "id", &id_obj))
+                        {
+                            const char *cid = json_object_get_string(id_obj);
+                            sch = cid ? slack_channel_search(cid) : NULL;
+                            if (sch && sch->name)
+                                ch = sch->name;
+                        }
+                    }
                 }
 
-                weechat_printf(buffer, "%s  [#%s] %s: %.100s%s",
+                snprintf(ch_disp, sizeof(ch_disp), "%s%s",
+                         (sch && (sch->type == SLACK_CHANNEL_TYPE_DM ||
+                                  sch->type == SLACK_CHANNEL_TYPE_MPDM))
+                             ? "" : "#",
+                         ch ? ch : "?");
+
+                fmt = slack_event_render_formatting(text);
+                emoji = slack_event_apply_emoji_mode(fmt ? fmt : text);
+                ment = slack_event_format_mentions(workspace,
+                                                   emoji ? emoji : text, sch);
+
+                weechat_printf(buffer, "%s  [%s] %s%s%s: %.120s%s",
                                 weechat_prefix("network"),
-                                ch, ts, text,
-                                strlen(text) > 100 ? "..." : "");
+                                ch_disp,
+                                who && who[0] ? who : "",
+                                who && who[0] ? " " : "",
+                                ts ? ts : "?",
+                                ment ? ment : text,
+                                (ment && strlen(ment) > 120) ||
+                                (!ment && strlen(text) > 120) ? "..." : "");
+                free(fmt);
+                free(emoji);
+                free(ment);
             }
         }
     }
@@ -3558,26 +3889,34 @@ slack_event_download_file(struct t_weeslack_workspace *workspace,
         return;
     }
 
-    weechat_hashtable_set(options, "arg1", "-sSL");
-    weechat_hashtable_set(options, "arg2", "-H");
-    weechat_hashtable_set(options, "arg3", auth);
-    if (workspace->cookie && workspace->cookie[0])
     {
+        int argi = 1;
+        char key[16];
         char cookie_h[512];
-        snprintf(cookie_h, sizeof(cookie_h), "Cookie: %s%s",
-                 (strncmp(workspace->cookie, "d=", 2) == 0) ? "" : "d=",
-                 workspace->cookie);
-        weechat_hashtable_set(options, "arg4", "-H");
-        weechat_hashtable_set(options, "arg5", cookie_h);
-        weechat_hashtable_set(options, "arg6", "-o");
-        weechat_hashtable_set(options, "arg7", path);
-        weechat_hashtable_set(options, "arg8", url);
-    }
-    else
-    {
-        weechat_hashtable_set(options, "arg4", "-o");
-        weechat_hashtable_set(options, "arg5", path);
-        weechat_hashtable_set(options, "arg6", url);
+
+        slack_http_curl_add_proxy(options, &argi);
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "-sSL");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "-H");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, auth);
+        if (workspace->cookie && workspace->cookie[0])
+        {
+            snprintf(cookie_h, sizeof(cookie_h), "Cookie: %s%s",
+                     (strncmp(workspace->cookie, "d=", 2) == 0) ? "" : "d=",
+                     workspace->cookie);
+            snprintf(key, sizeof(key), "arg%d", argi++);
+            weechat_hashtable_set(options, key, "-H");
+            snprintf(key, sizeof(key), "arg%d", argi++);
+            weechat_hashtable_set(options, key, cookie_h);
+        }
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, "-o");
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, path);
+        snprintf(key, sizeof(key), "arg%d", argi++);
+        weechat_hashtable_set(options, key, url);
     }
 
     weechat_hook_process_hashtable(
@@ -3624,27 +3963,69 @@ slack_event_stars_list_cb(struct t_weeslack_workspace *workspace,
         int count = json_object_array_length(items);
         weechat_printf(buffer, "%sweeslack: %d starred items",
                         weechat_prefix("network"), count);
-        for (int i = 0; i < count && i < 25; i++)
+        for (int i = 0; i < count && i < 40; i++)
         {
             struct json_object *it = json_object_array_get_idx(items, i);
             struct json_object *type_obj, *msg_obj, *ch_obj, *ts_obj, *text_obj;
-            const char *type = "?", *ch = "?", *ts = "?", *text = "";
+            struct json_object *user_obj;
+            const char *type = "?", *ch = "?", *ts = "?", *text = "", *who = "";
+            char ch_disp[128];
+            char *fmt = NULL, *emoji = NULL, *ment = NULL;
+            struct t_slack_channel *sch = NULL;
+            struct t_slack_user *su = NULL;
 
             if (json_object_object_get_ex(it, "type", &type_obj))
                 type = json_object_get_string(type_obj);
             if (json_object_object_get_ex(it, "channel", &ch_obj))
+            {
                 ch = json_object_get_string(ch_obj);
+                sch = ch ? slack_channel_search(ch) : NULL;
+                if (sch && sch->name && sch->name[0])
+                    ch = sch->name;
+            }
             if (json_object_object_get_ex(it, "message", &msg_obj))
             {
                 if (json_object_object_get_ex(msg_obj, "ts", &ts_obj))
                     ts = json_object_get_string(ts_obj);
                 if (json_object_object_get_ex(msg_obj, "text", &text_obj))
                     text = json_object_get_string(text_obj);
+                if (json_object_object_get_ex(msg_obj, "user", &user_obj))
+                {
+                    const char *uid = json_object_get_string(user_obj);
+                    su = uid ? slack_user_search(uid) : NULL;
+                    who = su ? slack_user_best_name(su) : (uid ? uid : "");
+                }
             }
-            weechat_printf(buffer, "%s  [%s] %s %s: %.80s",
-                            weechat_prefix("network"), type, ch, ts, text);
+
+            snprintf(ch_disp, sizeof(ch_disp), "%s%s",
+                     (sch && (sch->type == SLACK_CHANNEL_TYPE_DM ||
+                              sch->type == SLACK_CHANNEL_TYPE_MPDM))
+                         ? "" : "#",
+                     ch ? ch : "?");
+
+            fmt = slack_event_render_formatting(text);
+            emoji = slack_event_apply_emoji_mode(fmt ? fmt : text);
+            ment = slack_event_format_mentions(workspace,
+                                               emoji ? emoji : text, sch);
+
+            weechat_printf(buffer, "%s  [%s] %s %s%s%s: %.100s%s",
+                            weechat_prefix("network"),
+                            type ? type : "?",
+                            ch_disp,
+                            who && who[0] ? who : "",
+                            who && who[0] ? " " : "",
+                            ts ? ts : "?",
+                            ment ? ment : text,
+                            (ment && strlen(ment) > 100) ||
+                            (!ment && text && strlen(text) > 100) ? "..." : "");
+            free(fmt);
+            free(emoji);
+            free(ment);
             n++;
         }
+        if (count > 40)
+            weechat_printf(buffer, "%s  … %d more not shown",
+                            weechat_prefix("network"), count - 40);
     }
     if (n == 0)
         weechat_printf(buffer, "%sweeslack: no stars (or no access)",

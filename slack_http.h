@@ -70,4 +70,9 @@ extern int slack_http_body_is_ratelimited(const char *body);
 extern void slack_http_queue_init(void);
 extern void slack_http_queue_shutdown(void);
 
+/* Proxy helpers for hook_url and curl hook_process (caller frees URL). */
+extern char *slack_http_get_proxy_url(void);
+/* Append curl -x <proxy> starting at *arg_index (1-based argN keys). */
+extern void slack_http_curl_add_proxy(struct t_hashtable *options, int *arg_index);
+
 #endif

@@ -273,8 +273,8 @@ slack_http_q_pop_ready(struct t_slack_http_request **head,
 }
 
 /* Build a curl proxy URL from weechat.network.proxy_curl + weechat.proxy.* */
-static void
-slack_http_apply_proxy(struct t_hashtable *options)
+char *
+slack_http_get_proxy_url(void)
 {
     struct t_config_option *opt;
     const char *name, *type, *address, *username, *password;
@@ -283,21 +283,18 @@ slack_http_apply_proxy(struct t_hashtable *options)
     char key[128];
     const char *scheme = "http";
 
-    if (!options)
-        return;
-
     opt = weechat_config_get("weechat.network.proxy_curl");
     if (!opt)
-        return;
+        return NULL;
     name = weechat_config_string(opt);
     if (!name || !name[0])
-        return;
+        return NULL;
 
     snprintf(key, sizeof(key), "weechat.proxy.%s.address", name);
     opt = weechat_config_get(key);
     address = opt ? weechat_config_string(opt) : NULL;
     if (!address || !address[0])
-        return;
+        return NULL;
 
     snprintf(key, sizeof(key), "weechat.proxy.%s.port", name);
     opt = weechat_config_get(key);
@@ -337,7 +334,45 @@ slack_http_apply_proxy(struct t_hashtable *options)
         snprintf(proxy_url, sizeof(proxy_url), "%s://%s:%d",
                  scheme, address, port > 0 ? port : 1080);
 
+    return strdup(proxy_url);
+}
+
+static void
+slack_http_apply_proxy(struct t_hashtable *options)
+{
+    char *proxy_url;
+
+    if (!options)
+        return;
+    proxy_url = slack_http_get_proxy_url();
+    if (!proxy_url)
+        return;
     weechat_hashtable_set(options, "proxy", proxy_url);
+    free(proxy_url);
+}
+
+void
+slack_http_curl_add_proxy(struct t_hashtable *options, int *arg_index)
+{
+    char *proxy_url;
+    char key[16];
+    int i;
+
+    if (!options || !arg_index || *arg_index < 1)
+        return;
+    proxy_url = slack_http_get_proxy_url();
+    if (!proxy_url)
+        return;
+
+    i = *arg_index;
+    snprintf(key, sizeof(key), "arg%d", i);
+    weechat_hashtable_set(options, key, "-x");
+    i++;
+    snprintf(key, sizeof(key), "arg%d", i);
+    weechat_hashtable_set(options, key, proxy_url);
+    i++;
+    *arg_index = i;
+    free(proxy_url);
 }
 
 static struct t_hashtable *
