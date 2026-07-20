@@ -378,7 +378,8 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
     if (channel->type != SLACK_CHANNEL_TYPE_DM)
     {
         weechat_buffer_set(sbuf->buffer, "nicklist", "1");
-        weechat_buffer_set(sbuf->buffer, "nicklist_display_groups", "0");
+        /* Show Here/Away group headers (was 0 — flat list, groups invisible). */
+        weechat_buffer_set(sbuf->buffer, "nicklist_display_groups", "1");
     }
 
     if (channel->topic && channel->topic[0])
