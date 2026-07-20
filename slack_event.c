@@ -1950,14 +1950,34 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                  ts_tag ? ts_tag : "0",
                  is_me ? ",slack_me" : "");
 
+        /*
+         * File-only messages (empty text): keep nick + [file] on one line so
+         * we don't leave a blank "nick\t" then a second line for the file.
+         */
         if (is_me)
         {
             weechat_printf_date_tags(
                 display_channel->buffer,
                 ts.sec,
                 tags,
-                " \t%s%s",
+                " \t%s%s%s%s",
                 me_buf,
+                (files && files[0] &&
+                 (!formatted || !formatted[0])) ? " " : "",
+                (files && files[0] &&
+                 (!formatted || !formatted[0])) ? files : "",
+                bcast);
+        }
+        else if (files && files[0] && (!formatted || !formatted[0]))
+        {
+            weechat_printf_date_tags(
+                display_channel->buffer,
+                ts.sec,
+                tags,
+                "%s\t%s%s%s",
+                nick_str,
+                files,
+                reactions ? reactions : "",
                 bcast);
         }
         else
@@ -1971,6 +1991,16 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                 formatted ? formatted : "",
                 reactions ? reactions : "",
                 bcast);
+            if (files && files[0])
+            {
+                weechat_printf_date_tags(
+                    display_channel->buffer,
+                    ts.sec,
+                    NULL,
+                    "%s\t%s",
+                    "",
+                    files);
+            }
         }
 
         if (ts_tag)
@@ -1990,17 +2020,6 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             }
         }
         free(ts_tag);
-
-        if (files && files[0])
-        {
-            weechat_printf_date_tags(
-                display_channel->buffer,
-                ts.sec,
-                NULL,
-                "%s\t%s",
-                "",
-                files);
-        }
 
         /* Live only — history would storm the download queue. */
         if (!history && files && files[0])
@@ -2496,41 +2515,11 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
     if (strcmp(type, "file_created") == 0 ||
         strcmp(type, "file_shared") == 0)
     {
-        struct json_object *file_obj;
-        if (json_object_object_get_ex(json, "file", &file_obj))
-        {
-            struct json_object *name_obj, *type_obj2;
-            const char *file_name = NULL, *file_type = NULL;
-
-            if (json_object_object_get_ex(file_obj, "name", &name_obj))
-                file_name = json_object_get_string(name_obj);
-            if (json_object_object_get_ex(file_obj, "filetype", &type_obj2))
-                file_type = json_object_get_string(type_obj2);
-
-            SLACK_WS_PRINTF(workspace, "%sweeslack: %s file: %s (%s)",
-                            weechat_prefix("network"),
-                            strcmp(type, "file_created") == 0
-                                ? "created" : "shared",
-                            file_name ? file_name : "?",
-                            file_type ? file_type : "?");
-
-            struct json_object *channel_obj;
-            if (json_object_object_get_ex(json, "channel_id", &channel_obj))
-            {
-                const char *ch_id = json_object_get_string(channel_obj);
-                struct t_slack_channel *ch = slack_channel_search(ch_id);
-                if (ch && ch->buffer)
-                {
-                    char msg_buf[512];
-                    snprintf(msg_buf, sizeof(msg_buf), "[file: %s]",
-                             file_name ? file_name : "?");
-                    weechat_printf(ch->buffer, "%s%s%s",
-                                    weechat_prefix("action"),
-                                    msg_buf,
-                                    weechat_color("reset"));
-                }
-            }
-        }
+        /*
+         * Redundant with the message event (which carries files/file and
+         * is formatted + auto-downloaded). Old RTM often only has file_id
+         * → printed "[file: ?]" and doubled the share in the buffer.
+         */
         return;
     }
 
@@ -6070,97 +6059,33 @@ slack_event_upload_complete_cb(struct t_weeslack_workspace *workspace,
     slack_format_bytes(size_buf, sizeof(size_buf), ctx->length);
 
     /*
-     * Always show a chat-style line in the target buffer. Self-DMs often
-     * do not RTM-echo file shares, and older events use "file" not "files".
+     * Status line only — the RTM message event paints the chat [file] line
+     * (synthetic lines doubled when Slack does echo the share).
+     * Local /icat now (file is already on disk); RTM path also downloads
+     * for remote viewers' files.
      */
     {
         struct json_object *files_obj = NULL, *f0 = NULL, *url_obj = NULL;
         struct t_gui_buffer *buf;
-        struct t_slack_channel *ch;
-        struct t_slack_user *me = NULL;
-        char *nick_str = NULL;
         const char *permalink = NULL;
-        const char *url_priv = NULL;
-        char tags[128];
-        time_t now = time(NULL);
 
         if (json_object_object_get_ex(json, "files", &files_obj) &&
             json_object_is_type(files_obj, json_type_array) &&
             json_object_array_length(files_obj) > 0)
         {
             f0 = json_object_array_get_idx(files_obj, 0);
-            if (f0)
-            {
-                if (json_object_object_get_ex(f0, "permalink", &url_obj))
-                    permalink = json_object_get_string(url_obj);
-                if (json_object_object_get_ex(f0, "url_private", &url_obj))
-                    url_priv = json_object_get_string(url_obj);
-                if ((!url_priv || !url_priv[0]) &&
-                    json_object_object_get_ex(f0, "url_private_download",
-                                              &url_obj))
-                    url_priv = json_object_get_string(url_obj);
-            }
+            if (f0 && json_object_object_get_ex(f0, "permalink", &url_obj))
+                permalink = json_object_get_string(url_obj);
         }
-
-        buf = slack_event_upload_buffer(ctx);
-        ch = ctx->channel_id ? slack_channel_search(ctx->channel_id) : NULL;
-        if (workspace && workspace->my_user_id)
-            me = slack_user_search(workspace->my_user_id);
-        nick_str = slack_event_format_user(me, workspace ? workspace->my_user_id
-                                                         : NULL,
-                                           ch);
-
-        snprintf(tags, sizeof(tags), "notify_none,no_highlight,slack_upload");
-        if (buf)
-        {
-            const char *link = (url_priv && url_priv[0]) ? url_priv
-                : ((permalink && permalink[0]) ? permalink : "");
-
-            weechat_printf_date_tags(
-                buf, now, tags,
-                "%s\t%s[file]%s %s (%s)%s%s",
-                nick_str ? nick_str : "me",
-                weechat_color("blue"),
-                weechat_color("reset"),
-                name,
-                size_buf,
-                (link && link[0]) ? " " : "",
-                (link && link[0]) ? link : "");
-        }
-        free(nick_str);
 
         slack_event_upload_printf(ctx, 0, "uploaded %s (%s)%s%s",
                                   name, size_buf,
                                   (permalink && permalink[0]) ? " — " : "",
                                   (permalink && permalink[0]) ? permalink : "");
 
-        /*
-         * Own uploads: the file is already local — preview immediately.
-         * Self-DMs often skip RTM file_share, so auto_download never runs.
-         */
+        buf = slack_event_upload_buffer(ctx);
         if (buf && ctx->file_path && ctx->file_path[0])
             slack_event_try_icat_preview(buf, ctx->file_path, NULL);
-
-        /*
-         * If Slack returned private URLs, auth-download into the Xepher tree
-         * (completeUpload often only returns id/title — then this no-ops).
-         */
-        if (ch && files_obj &&
-            json_object_is_type(files_obj, json_type_array) &&
-            (weechat_config_boolean(weeslack_config.auto_download_files) ||
-             weechat_config_boolean(weeslack_config.icat_enabled)))
-        {
-            struct json_object *wrap = json_object_new_object();
-
-            if (wrap)
-            {
-                json_object_object_add(wrap, "files",
-                                       json_object_get(files_obj));
-                slack_event_auto_download_message_files(
-                    workspace, ch, wrap, buf);
-                json_object_put(wrap);
-            }
-        }
     }
 
     json_object_put(json);
@@ -7818,8 +7743,11 @@ slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
 {
     unsigned int pw, ph, cols, rows;
     char cmd[1024];
-    char path_q[768];
+    char abs_path[768];
+    char path_safe[768];
+    const char *use_path;
     size_t i, j;
+    struct stat st;
 
     if (!path || !path[0] || !buffer)
         return;
@@ -7831,7 +7759,30 @@ slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
     if (!slack_event_icat_available(buffer))
         return;
 
-    slack_event_read_image_dimensions(path, &pw, &ph);
+    /*
+     * weechat-icat does os.path.isfile(path) on the raw positional arg.
+     * Do NOT wrap in quotes — they become part of the path and the open
+     * fails silently under -quiet.
+     */
+    use_path = path;
+    if (realpath(path, abs_path))
+        use_path = abs_path;
+    if (stat(use_path, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+
+    /* Drop control chars / quotes that would confuse icat option parsing. */
+    j = 0;
+    for (i = 0; use_path[i] && j + 1 < sizeof(path_safe); i++)
+    {
+        if (use_path[i] == '"' || use_path[i] == '\n' || use_path[i] == '\r')
+            continue;
+        path_safe[j++] = use_path[i];
+    }
+    path_safe[j] = '\0';
+    if (!path_safe[0])
+        return;
+
+    slack_event_read_image_dimensions(path_safe, &pw, &ph);
     cols = 40;
     if (pw == 0 || ph == 0)
         rows = 10;
@@ -7844,21 +7795,10 @@ slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
             rows = 20;
     }
 
-    /* Quote path for /icat; strip double-quotes from path content. */
-    path_q[0] = '"';
-    j = 1;
-    for (i = 0; path[i] && j + 2 < sizeof(path_q); i++)
-    {
-        if (path[i] == '"' || path[i] == '\n' || path[i] == '\r')
-            continue;
-        path_q[j++] = path[i];
-    }
-    path_q[j++] = '"';
-    path_q[j] = '\0';
-
+    /* Spaces in the path are fine: icat rejoins non-option tokens. */
     snprintf(cmd, sizeof(cmd),
              "/icat -print_immediately -quiet -columns %u -rows %u %s",
-             cols, rows, path_q);
+             cols, rows, path_safe);
     weechat_command(buffer, cmd);
 }
 
@@ -7880,8 +7820,10 @@ slack_event_icat_emoji_tile(struct t_gui_buffer *buffer, const char *path,
                             const char *shortcode)
 {
     unsigned int pw, ph, cols, rows;
-    char cmd[1024], path_q[768];
+    char cmd[1024], abs_path[768], path_safe[768];
+    const char *use_path;
     size_t pi, pj;
+    struct stat st;
 
     if (!buffer || !path || !path[0])
         return;
@@ -7890,7 +7832,23 @@ slack_event_icat_emoji_tile(struct t_gui_buffer *buffer, const char *path,
     if (!slack_event_icat_available(buffer))
         return;
 
-    slack_event_read_image_dimensions(path, &pw, &ph);
+    use_path = path;
+    if (realpath(path, abs_path))
+        use_path = abs_path;
+    if (stat(use_path, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+    pj = 0;
+    for (pi = 0; use_path[pi] && pj + 1 < sizeof(path_safe); pi++)
+    {
+        if (use_path[pi] == '"' || use_path[pi] == '\n' || use_path[pi] == '\r')
+            continue;
+        path_safe[pj++] = use_path[pi];
+    }
+    path_safe[pj] = '\0';
+    if (!path_safe[0])
+        return;
+
+    slack_event_read_image_dimensions(path_safe, &pw, &ph);
     cols = 4;
     if (pw == 0 || ph == 0)
         rows = 2;
@@ -7903,23 +7861,13 @@ slack_event_icat_emoji_tile(struct t_gui_buffer *buffer, const char *path,
             rows = 4;
     }
 
-    path_q[0] = '"';
-    pj = 1;
-    for (pi = 0; path[pi] && pj + 2 < sizeof(path_q); pi++)
-    {
-        if (path[pi] == '"' || path[pi] == '\n' || path[pi] == '\r')
-            continue;
-        path_q[pj++] = path[pi];
-    }
-    path_q[pj++] = '"';
-    path_q[pj] = '\0';
-
     if (shortcode && shortcode[0])
         weechat_printf(buffer, "%s:%s:",
                         weechat_prefix("network"), shortcode);
+    /* No quotes around path — icat treats them as part of the filename. */
     snprintf(cmd, sizeof(cmd),
              "/icat -print_immediately -quiet -columns %u -rows %u %s",
-             cols, rows, path_q);
+             cols, rows, path_safe);
     weechat_command(buffer, cmd);
 }
 
