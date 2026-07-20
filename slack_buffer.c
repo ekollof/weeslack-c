@@ -1219,6 +1219,7 @@ slack_buffer_typing_clear_cb(const void *pointer, void *data, int remaining_call
         weechat_buffer_set(channel->buffer, "title",
                            channel->topic ? channel->topic : "");
     }
+    weechat_bar_item_update("slack_typing_notice");
 
     return WEECHAT_RC_OK;
 }
@@ -1232,11 +1233,12 @@ slack_buffer_set_typing(struct t_slack_channel *channel, const char *user_name)
     if (!channel || !channel->buffer || !user_name || !user_name[0])
         return;
 
-    if (!weechat_config_boolean(weeslack_config.channel_name_typing_indicator))
-        return;
-
     free(channel->typing_user);
     channel->typing_user = strdup(user_name);
+    weechat_bar_item_update("slack_typing_notice");
+
+    if (!weechat_config_boolean(weeslack_config.channel_name_typing_indicator))
+        return;
 
     color = weechat_config_string(weeslack_config.color_typing_notice);
     if (!color || !color[0])

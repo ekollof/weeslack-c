@@ -72,6 +72,8 @@ struct t_weeslack_config
     struct t_config_option *map_underline_to;
     struct t_config_option *link_previews;
     struct t_config_option *notify_subscribed_threads;
+    struct t_config_option *colorize_attachments;
+    struct t_config_option *shared_name_prefix;
 
     /* color */
     struct t_config_option *color_typing_notice;

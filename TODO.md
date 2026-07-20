@@ -1,7 +1,8 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — history_fetch_count, muted activity, unhide,
-group prefix, link_previews, map_underline, switch_on_join, thread notices
+**Last update:** 2026-07-20 — crash fix (hsignal free), typing throttle,
+thread subscribe API + RTM, slack_typing_notice bar, colorize_attachments,
+shared_name_prefix
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -40,7 +41,7 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 
 - [x] Server + child hierarchy, localvars  
 - [x] Lazy history + serial queue; members on focus  
-- [x] History pagination — up to **5×100** on slow queue; accumulate → chronological flush  
+- [x] History pagination — multi-page slow queue (`history_fetch_count`, hard page cap)  
 - [x] Members pagination — up to **3×200** on slow queue  
 - [x] Unknown members → **`users.info`** (slow, capped); no stub nicks  
 - [x] Nicklist **Here / Away** groups + **`presence_sub`** (RTM); bots purged  
@@ -75,6 +76,7 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 - [x] `colorize_private_chats` gates nick color on DM/MPDM  
 - [x] Blockquotes, Block Kit text fallback, HTML entity unescape  
 - [x] Self-mention → `notify_highlight`  
+- [x] **`colorize_attachments`** (none / prefix / all)  
 
 ---
 
@@ -82,9 +84,10 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 
 - [x] postMessage / threads / reply  
 - [x] Upload pipeline (getUploadURL → PUT → complete); PUT uses proxy when configured  
-- [~] Slash: posted as plain text (real slash API is app-specific / low ROI)  
+- [x] **`/cslack slash /cmd [args]`** → `chat.command` (session token)  
 - [x] Input emoji shortcodes  
 - [x] `/me text` → **`chat.meMessage`**  
+- [x] Outgoing underline/bold IRC codes → Slack markers (`map_underline_to`)  
 
 ---
 
@@ -100,7 +103,7 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 - [x] **`distracting`** / **`nodistractions`**; **`slash`** → `chat.command`  
 - [x] Cursor/mouse **`$hash` actions** (M/D/L/R/T + right-click)  
 - [x] Stars / search list polish  
-- [~] subscribe = local thread notify only  
+- [x] **`subscribe` / `unsubscribe`** → `subscriptions.thread.add|remove` (+ local notify)  
 
 ---
 
@@ -109,6 +112,7 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 - [x] Hooks wired to `/cslack`  
 - [x] Nick completion prefers **buffer nicklist**, else all users  
 - [x] Join completion via `%(slack_channels)`  
+- [x] Thread completion offers `$hash` for parents with replies  
 
 ---
 
@@ -119,14 +123,16 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 - [x] token, emoji_render_mode, typing indicator (title), thread_messages_in_channel  
 - [x] thread_broadcast_prefix, render_bold_as / render_italic_as / **render_strikethrough_as**  
 - [x] **download_path**, **short_buffer_names**, **colorize_private_chats**  
-- [x] color options (typing/deleted/edited/thread/muted)  
+- [x] color options (typing/deleted/edited/thread/muted/reaction)  
 - [x] `color.thread_suffix` = `multiple` uses nick color for reply count suffix  
 - [x] **`look.never_away`** — 5‑min timer sets presence `auto` when enabled  
-- [x] **`look.send_typing_notice`** — typing via `input_text_changed`  
-- [x] Bar items **`away`** / **`slack_away`** (manual vs auto)  
-- [x] **`history_fetch_count`**, **`group_name_prefix`**, **`switch_buffer_on_join`**  
-- [x] **`unhide_buffers_with_activity`**, **`muted_channels_activity`**  
-- [x] **`map_underline_to`**, **`link_previews`**, **`notify_subscribed_threads`**  
+- [x] **`look.send_typing_notice`** — typing via `input_text_changed` (**≤1 / 4s**)  
+- [x] Bar items **`slack_away`**, **`slack_typing_notice`** (not core `away`)  
+- [x] **`history_fetch_count`**, **`group_name_prefix`**, **`shared_name_prefix`**  
+- [x] **`switch_buffer_on_join`**, **`unhide_buffers_with_activity`**  
+- [x] **`muted_channels_activity`**, **`map_underline_to`**, **`link_previews`**  
+- [x] **`notify_subscribed_threads`**, **`colorize_attachments`**, **`show_reaction_nicks`**  
+- [x] **`use_full_names`**, **`external_user_suffix`**, **`distracting_channels`**  
 
 ---
 
@@ -136,6 +142,7 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 - [x] **`/upgrade` auto-reconnect** (timer + token after upgrade read)  
 - [x] stars.list / stars.add / stars.remove  
 - [x] pin / search / permalink / react  
+- [x] ASAN build: `make asan` / `make asan-install` (see Makefile)  
 
 ---
 
@@ -149,6 +156,7 @@ group prefix, link_previews, map_underline, switch_on_join, thread notices
 - [x] Rate-limit + auth messaging  
 - [x] Reconnect with fresh rtm.connect  
 - [x] `user_change` → DM buffer title from status emoji/text  
+- [x] **`thread_subscribed` / `thread_unsubscribed`**  
 
 ---
 
@@ -160,14 +168,16 @@ rtm.connect
  → conversations.list → create buffers (NO history, NO members)
  → users.prefs.get → apply muted_channels
  → bootstrap quiet ~8s (buffer_switch ignores history/members)
- → user focuses a buffer → history (slow, ≤5×100) + members (≤3×200)
+ → user focuses a buffer → history (slow, multi-page) + members (≤3×200)
       unknown members → users.info (slow, capped); bots never nicklisted
  → /cslack loadhistory | names | refresh as needed
  → emoji_changed → emoji.list only
  → WS drop / goodbye → rtm.connect (fresh URL), no full bootstrap
 ```
 
-**Do not** reload/connect while Slack is still cooling from earlier storms.
+**Do not** reload/connect while Slack is still cooling from earlier storms.  
+**Do not** `make install` over a loaded plugin — unload first or restart.  
+Prefer **process restart** over `/plugin unload|load` when hunting crashes.
 
 ---
 
@@ -180,8 +190,8 @@ rtm.connect
 5. Binary upload via `hook_url` (raw PUT still needs curl/process)  
 6. Background load all history on connect (rate-limit sensitive)  
 7. Full `record_events` debug mode  
-8. `colorize_attachments` / `shared_name_prefix` / `server_aliases` polish  
-9. Server-side thread subscribe API (still local notify + notices)  
+8. `server_aliases` multi-team polish  
+9. Leading `/` still posts as chat when not `/me` or sed/react shortcuts  
 
 ---
 
@@ -212,8 +222,7 @@ rtm.connect
 | No s/// message edit | input `s/old/new/[gi]` + `s///` delete via chat API |
 | No $hash message ids | SHA1 short hash like wee-slack hashed_messages |
 | thread required raw ts | optional; default last thread parent; $hash/N |
-| No away bar item | `away` / `slack_away` bar items |
-| Typing only via /cslack typing | optional auto on input_text_changed |
+| Typing flood on every keystroke | throttle **4s** per channel (wee-slack) |
 | No reaction nicks / colors | show_reaction_nicks + color options |
 | No distracting channel lists | distracting / nodistractions |
 | No chat.command slash | /cslack slash /cmd args |
@@ -226,3 +235,8 @@ rtm.connect
 | Hidden buffers stay hidden | optional `unhide_buffers_with_activity` |
 | Always show link unfurls | `link_previews` |
 | Underline not mapped on send | `map_underline_to` |
+| **`free(): invalid pointer` on unload** | hsignal `callback_data` must be **NULL** (WeeChat free()s it; no string literals) |
+| Core input bar crash with `(away)` | do **not** register bar item named `away`; use `slack_away` only |
+| Cursor `_buffer` cast | resolve via `_buffer_full_name` + hdata walk |
+| Subscribe local only | also `subscriptions.thread.add|remove` + RTM subscribe events |
+| No typing bar item | `slack_typing_notice` bar item |

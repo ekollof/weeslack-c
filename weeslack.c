@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <json-c/json.h>
 
 #include "weeslack.h"
@@ -1924,6 +1925,25 @@ weeslack_config_init(void)
         NULL, NULL, NULL,
         NULL, NULL, NULL);
 
+    weeslack_config.colorize_attachments = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "colorize_attachments", "integer",
+        "Attachment colorize: 0=none, 1=prefix only, 2=whole line",
+        "none|prefix|all",
+        0, 2, "prefix", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.shared_name_prefix = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "shared_name_prefix", "string",
+        "Short-name prefix for shared/external channels (empty = same as normal)",
+        NULL, 0, 0, "%", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
     /* color section */
     weeslack_config.section_color = weechat_config_new_section(
         weeslack_config.file, "color",
@@ -2807,7 +2827,10 @@ weeslack_line_event_cb(const void *pointer, void *data,
     return WEECHAT_RC_OK;
 }
 
-/* Send typing notices while composing (throttled lightly by WeeChat signals). */
+/* Typing WS events at most once per 4s (wee-slack typing_timer). */
+static time_t weeslack_typing_last_sent;
+static char weeslack_typing_last_channel[128];
+
 static int
 weeslack_input_text_changed_cb(const void *pointer, void *data,
                                 const char *signal, const char *type_data,
@@ -2816,6 +2839,7 @@ weeslack_input_text_changed_cb(const void *pointer, void *data,
     struct t_gui_buffer *buf = signal_data;
     const char *channel_id;
     struct t_weeslack_workspace *ws;
+    time_t now;
 
     (void)pointer;
     (void)data;
@@ -2835,8 +2859,58 @@ weeslack_input_text_changed_cb(const void *pointer, void *data,
     if (!ws || !ws->connected)
         return WEECHAT_RC_OK;
 
+    now = time(NULL);
+    if (weeslack_typing_last_sent != 0 &&
+        now < weeslack_typing_last_sent + 4 &&
+        strcmp(weeslack_typing_last_channel, channel_id) == 0)
+        return WEECHAT_RC_OK;
+
+    weeslack_typing_last_sent = now;
+    snprintf(weeslack_typing_last_channel, sizeof(weeslack_typing_last_channel),
+             "%s", channel_id);
     slack_event_send_typing(ws, channel_id);
     return WEECHAT_RC_OK;
+}
+
+/* Bar item: who is typing in the current Slack buffer (title already shows). */
+static char *
+weeslack_typing_bar_cb(const void *pointer, void *data,
+                       struct t_gui_bar_item *item,
+                       struct t_gui_window *window,
+                       struct t_gui_buffer *buffer,
+                       struct t_hashtable *extra_info)
+{
+    const char *channel_id;
+    struct t_slack_channel *ch;
+    const char *col;
+    char *out;
+
+    (void)pointer;
+    (void)data;
+    (void)item;
+    (void)window;
+    (void)extra_info;
+
+    if (!buffer)
+        buffer = weechat_current_buffer();
+    if (!buffer)
+        return NULL;
+    channel_id = weechat_buffer_get_string(buffer, "localvar_slack_channel_id");
+    if (!channel_id)
+        return NULL;
+    ch = slack_channel_search(channel_id);
+    if (!ch || !ch->typing_user || !ch->typing_user[0])
+        return NULL;
+
+    col = weechat_config_string(weeslack_config.color_typing_notice);
+    if (!col || !col[0])
+        col = "yellow";
+    out = malloc(160);
+    if (!out)
+        return NULL;
+    snprintf(out, 160, "%styping: %s%s",
+             weechat_color(col), ch->typing_user, weechat_color("reset"));
+    return out;
 }
 
 int
@@ -2923,6 +2997,8 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
                          &weeslack_input_text_changed_cb, NULL, NULL);
 
     weechat_bar_item_new("slack_away", &weeslack_away_bar_cb, NULL, NULL);
+    weechat_bar_item_new("slack_typing_notice", &weeslack_typing_bar_cb,
+                          NULL, NULL);
 
     /* Cursor / mouse line actions (wee-slack parity) */
     {

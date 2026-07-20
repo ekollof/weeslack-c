@@ -2192,6 +2192,51 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
         return;
     }
 
+    if (strcmp(type, "thread_subscribed") == 0 ||
+        strcmp(type, "thread_unsubscribed") == 0)
+    {
+        struct json_object *sub_obj, *ch_obj, *ts_obj;
+        const char *cid = NULL, *tts = NULL;
+        int sub = (strcmp(type, "thread_subscribed") == 0);
+        struct t_slack_channel *parent, *thread;
+        struct t_slack_message *msg;
+
+        if (json_object_object_get_ex(json, "subscription", &sub_obj))
+        {
+            if (json_object_object_get_ex(sub_obj, "channel", &ch_obj))
+                cid = json_object_get_string(ch_obj);
+            if (json_object_object_get_ex(sub_obj, "thread_ts", &ts_obj))
+                tts = json_object_get_string(ts_obj);
+        }
+        if (cid && tts)
+        {
+            parent = slack_channel_search(cid);
+            if (parent)
+            {
+                msg = slack_message_search(parent->messages, slack_ts_new(tts));
+                if (msg)
+                    msg->subscribed = sub ? 1 : 0;
+            }
+            if (parent)
+            {
+                thread = slack_thread_channel_find(parent, tts);
+                if (thread)
+                {
+                    thread->is_subscribed = sub ? 1 : 0;
+                    if (thread->buffer)
+                        weechat_buffer_set(thread->buffer, "notify",
+                                           sub ? "highlight" : "none");
+                }
+            }
+            SLACK_WS_PRINTF(workspace,
+                            "%sthread %s %s",
+                            weechat_prefix("network"),
+                            tts,
+                            sub ? "subscribed" : "unsubscribed");
+        }
+        return;
+    }
+
     /* member_joined_channel / member_left_channel (not message subtypes) */
     if (strcmp(type, "member_joined_channel") == 0 ||
         strcmp(type, "member_left_channel") == 0)
@@ -3106,12 +3151,19 @@ slack_event_format_attachments(struct json_object *msg_json)
     int shown = 0;
     int link_previews;
 
+    int color_mode;
+
     if (!json_object_object_get_ex(msg_json, "attachments", &att_obj))
         return NULL;
 
     count = json_object_array_length(att_obj);
     if (count == 0)
         return NULL;
+
+    /* 0=none 1=prefix 2=all */
+    color_mode = weechat_config_integer(weeslack_config.colorize_attachments);
+    if (color_mode < 0)
+        color_mode = 1;
 
     link_previews = weechat_config_boolean(weeslack_config.link_previews);
 
@@ -3173,30 +3225,50 @@ slack_event_format_attachments(struct json_object *msg_json)
 
         if (pos < buf_size - 1)
         {
+            const char *c_on = "";
+            const char *c_off = "";
+
+            if (color_mode == 2)
+            {
+                c_on = weechat_color("darkgray");
+                c_off = weechat_color("reset");
+            }
+            else if (color_mode == 1)
+            {
+                c_on = weechat_color("darkgray");
+                c_off = weechat_color("reset");
+            }
+            /* color_mode 0: plain */
+
             if (pretext[0])
-                written = snprintf(result + pos, buf_size - pos,
-                                   "%s%s%s",
-                                   shown > 0 ? "\n" : "",
-                                   pretext, weechat_color("reset"));
-            else if (title[0] && title_link[0])
-                written = snprintf(result + pos, buf_size - pos,
-                                   "%s%s%s%s: %s%s",
-                                   shown > 0 ? "\n" : "",
-                                   author[0] ? author : "",
-                                   author[0] ? ": " : "",
-                                   title, title_link,
-                                   weechat_color("reset"));
-            else if (title[0])
                 written = snprintf(result + pos, buf_size - pos,
                                    "%s%s%s%s",
                                    shown > 0 ? "\n" : "",
+                                   c_on, pretext, c_off);
+            else if (title[0] && title_link[0])
+                written = snprintf(result + pos, buf_size - pos,
+                                   "%s%s%s%s%s: %s%s",
+                                   shown > 0 ? "\n" : "",
+                                   c_on,
                                    author[0] ? author : "",
                                    author[0] ? ": " : "",
-                                   title);
+                                   title, title_link,
+                                   c_off);
+            else if (title[0])
+                written = snprintf(result + pos, buf_size - pos,
+                                   "%s%s%s%s%s%s",
+                                   shown > 0 ? "\n" : "",
+                                   c_on,
+                                   author[0] ? author : "",
+                                   author[0] ? ": " : "",
+                                   title, c_off);
             else if (text[0])
                 written = snprintf(result + pos, buf_size - pos,
-                                   "%s%s",
-                                   shown > 0 ? "\n" : "", text);
+                                   "%s%s%s%s",
+                                   shown > 0 ? "\n" : "",
+                                   color_mode == 2 ? c_on : "",
+                                   text,
+                                   color_mode == 2 ? c_off : "");
 
             if (written > 0)
             {
@@ -6335,18 +6407,64 @@ slack_event_set_subscribe(struct t_weeslack_workspace *workspace,
                            int subscribe)
 {
     struct t_slack_buffer *sbuf;
+    const char *parent_id = NULL;
+    const char *thread_ts = NULL;
+    char parent_buf[128];
+    char ts_buf[64];
 
     if (!channel)
         return;
 
-    (void) workspace;
     channel->is_subscribed = subscribe ? 1 : 0;
+
+    /* Resolve parent channel + thread_ts for API */
+    if (channel->type == SLACK_CHANNEL_TYPE_THREAD && channel->id)
+    {
+        const char *prefix = "thread_";
+        if (strncmp(channel->id, prefix, 7) == 0)
+        {
+            const char *rest = channel->id + 7;
+            const char *us = strchr(rest, '_');
+            if (us && (size_t)(us - rest) < sizeof(parent_buf))
+            {
+                memcpy(parent_buf, rest, (size_t)(us - rest));
+                parent_buf[us - rest] = '\0';
+                parent_id = parent_buf;
+                thread_ts = us + 1;
+            }
+        }
+    }
+
+    if (workspace && parent_id && thread_ts && thread_ts[0])
+    {
+        struct json_object *params = json_object_new_object();
+        const char *last_read = thread_ts;
+
+        if (channel->last_message_ts && channel->last_message_ts[0])
+            last_read = channel->last_message_ts;
+        snprintf(ts_buf, sizeof(ts_buf), "%s", last_read);
+
+        json_object_object_add(params, "channel",
+                               json_object_new_string(parent_id));
+        json_object_object_add(params, "thread_ts",
+                               json_object_new_string(thread_ts));
+        json_object_object_add(params, "last_read",
+                               json_object_new_string(ts_buf));
+        slack_http_request_new(
+            workspace,
+            subscribe ? "subscriptions.thread.add"
+                      : "subscriptions.thread.remove",
+            params,
+            slack_event_simple_api_cb,
+            (void *)(subscribe ? "subscriptions.thread.add"
+                               : "subscriptions.thread.remove"));
+        json_object_put(params);
+    }
 
     if (channel->buffer)
     {
         weechat_buffer_set(channel->buffer, "localvar_set_slack_subscribed",
                            subscribe ? "1" : "0");
-        /* Thread buffers: subscribed → highlight notify, else low noise */
         if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
             weechat_buffer_set(channel->buffer, "notify",
                                subscribe ? "highlight" : "none");
