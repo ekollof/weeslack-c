@@ -98,6 +98,16 @@ extern int slack_http_curl_get_file(const char *url, const char *path,
                                     t_slack_curl_done_cb callback,
                                     void *user_data);
 
+/*
+ * GET url into memory (OAuth, etc.). body is valid only during callback.
+ * Shares the global multi concurrency budget.
+ */
+typedef void (*t_slack_curl_body_cb)(void *user_data, int ok, long http_code,
+                                     const char *body);
+extern int slack_http_curl_get_body(const char *url,
+                                    t_slack_curl_body_cb callback,
+                                    void *user_data);
+
 /* Cancel all multi transfers (plugin end). */
 extern void slack_http_curl_multi_shutdown(void);
 

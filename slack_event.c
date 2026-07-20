@@ -6740,6 +6740,7 @@ slack_event_mute_prefs_get_cb(struct t_weeslack_workspace *workspace,
     struct t_slack_mute_ctx *ctx = user_data;
     char muted[4096];
     char new_muted[4096];
+    size_t pos = 0;
     int found = 0;
 
     muted[0] = '\0';
@@ -6772,7 +6773,6 @@ slack_event_mute_prefs_get_cb(struct t_weeslack_workspace *workspace,
         char *copy = strdup(muted);
         char *save = NULL;
         char *tok;
-        size_t pos = 0;
 
         if (copy)
         {
@@ -6809,12 +6809,18 @@ slack_event_mute_prefs_get_cb(struct t_weeslack_workspace *workspace,
         }
     }
 
-    if (ctx->mute && !found)
+    if (ctx->mute && !found && ctx->channel_id && ctx->channel_id[0])
     {
-        if (new_muted[0])
-            strncat(new_muted, ",", sizeof(new_muted) - strlen(new_muted) - 1);
-        strncat(new_muted, ctx->channel_id,
-                sizeof(new_muted) - strlen(new_muted) - 1);
+        size_t rem = sizeof(new_muted) - pos;
+
+        if (pos > 0 && rem > 1)
+        {
+            new_muted[pos++] = ',';
+            new_muted[pos] = '\0';
+            rem = sizeof(new_muted) - pos;
+        }
+        if (rem > 1)
+            snprintf(new_muted + pos, rem, "%s", ctx->channel_id);
     }
 
     {

@@ -34,17 +34,18 @@ All `slack_http_request_new*` calls **enqueue**; nothing stampedes the API.
 
 | Mechanism | Behavior |
 |-----------|----------|
-| Fast queue | Normal API calls |
+| Fast queue | Normal Web API calls |
 | Slow queue (`SLACK_HTTP_SLOW`) | History + members; ≤1 promote/sec into fast |
-| Max concurrent | 2 in-flight libcurl transfers |
+| Max concurrent | **2** libcurl multi handles total (API + binary + OAuth body) |
 | 429 / `ratelimited` | Global cooldown from `Retry-After` (else ~8s); re-queue job |
 | Soft failure | Quadratic backoff re-queue (max 3 tries) |
 | `SLACK_HTTP_MARK` | `conversations.mark` — dropped under cooldown |
 
 Call `slack_http_queue_init()` in plugin init and `slack_http_queue_shutdown()` on end.
 
-Binary file **PUT** (upload) and authenticated **download** use **libcurl multi**
-(async; Bearer + cookie; WeeChat proxy).
+All Slack HTTP uses **libcurl multi** (timer-driven): Web API form bodies,
+binary **PUT**/authenticated **GET**, OAuth code exchange, custom-emoji fetch.
+Bearer + cookie + WeeChat proxy where applicable. No `hook_url` / `hook_process`.
 
 ### Connect bootstrap (rate-limit safe)
 
@@ -85,13 +86,15 @@ History tags include `slack_ts_<ts>` for tooling.
 
 | Command | Notes |
 |---------|--------|
-| `/cslack connect` / `disconnect` / `migrate` / `register` | Token from config, OAuth, or Python migrate |
+| `/cslack connect` / `reconnect [all]` / `disconnect` | Connect / re-issue rtm.connect / drop RTM |
+| `/cslack migrate` / `register` | Python token import; OAuth or paste `xox…` |
 | `/cslack unregister` / `forget -yes [id]` | Retire workspace: drop token + close buffers |
-| `/cslack loadhistory [id]` | Uses focused buffer if command buffer is core |
-| `/cslack talk` | Name or user id |
-| `/cslack download <url>` | Auth download → `<root>/weeslack/<origin>/<YYYY-MM-DD>/<file>` |
-| `/cslack stars` / `star` / `unstar` | Slack stars API |
-| `/cslack react` / `unreact` | Reactions |
+| `/cslack loadhistory` / `rehistory` / `names` | History + nicklist (focused buffer if core) |
+| `/cslack talk` / `open` | DM or MPDM (`a,b`); open = talk alias |
+| `/cslack join` / `show [#ch]` | Join API, or reopen closed member buffer |
+| `/cslack download` / `upload` | Auth file I/O via libcurl multi |
+| `/cslack stars` / `star` / `unstar` / `react` / `unreact` | Stars + reactions |
+| `/cslack info` / `queue` / `debug` / `version` | Status, HTTP queue, debug buffer |
 
 When `/cslack` is run from `core.weechat` (debug socket), buffer-local ops use
 `weechat_current_buffer()`.
@@ -126,13 +129,13 @@ When `/cslack` is run from `core.weechat` (debug socket), buffer-local ops use
 
 ## Live testing / automation
 
-With WeeChat running and `weechat_debug_socket.py` loaded:
+With WeeChat running and `weechat_debug_socket.py` loaded (see **tools/** below):
 
 ```sh
-# from weechat-export tree
-./weechat-cmd.sh '/plugin load weeslack'
-./weechat-cmd.sh '/cslack connect'
-./weechat-cmd.sh '/cslack loadhistory'   # after switching to a channel buffer in the UI
+# from this repo root
+./tools/weechat-cmd.sh '/plugin load weeslack'
+./tools/weechat-cmd.sh '/cslack connect'
+./tools/weechat-cmd.sh '/cslack loadhistory'   # after focusing a channel in the UI
 ```
 
 Socket: `$XDG_RUNTIME_DIR/weechat/weechat_debug.sock`.
@@ -148,7 +151,8 @@ These rules are **mandatory**.
 
 ### Buffer Safety
 
-- **Never** use `strcpy`, `strcat`, `sprintf`. Use `snprintf` with `sizeof(buf)`.
+- **Never** use `strcpy`, `strcat`, `sprintf`, or `strncat`. Use `snprintf`
+  with `sizeof(buf)` / remaining capacity (`buf + pos`, `sizeof - pos`).
 - Track remaining capacity when building strings incrementally.
 - Prefer `calloc` over `malloc`.
 

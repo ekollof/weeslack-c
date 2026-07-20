@@ -364,6 +364,7 @@ slack_http_get_proxy_url(void)
 /* Implemented with libcurl multi (below). */
 static int slack_http_api_curl_start(struct t_slack_http_request *request);
 static void slack_http_api_curl_cancel(struct t_slack_http_request *request);
+static int slack_http_multi_xfer_count(void);
 
 static void
 slack_http_start_request(struct t_slack_http_request *request)
@@ -423,7 +424,8 @@ slack_http_queue_pump(void)
         }
     }
 
-    while (g_inflight < SLACK_HTTP_MAX_CONCURRENT)
+    while (g_inflight < SLACK_HTTP_MAX_CONCURRENT &&
+           slack_http_multi_xfer_count() < SLACK_HTTP_MAX_CONCURRENT)
     {
         req = slack_http_q_pop_ready(&g_fast_head, &g_fast_tail);
         if (!req)
@@ -473,8 +475,9 @@ slack_http_queue_status(char *buf, size_t buflen)
     cool_left = (g_cooldown_until > now) ? (int)(g_cooldown_until - now) : 0;
 
     snprintf(buf, buflen,
-             "in_flight=%d/%d fast_q=%d slow_q=%d cooldown=%ds",
-             g_inflight, SLACK_HTTP_MAX_CONCURRENT,
+             "api_inflight=%d multi=%d/%d fast_q=%d slow_q=%d cooldown=%ds",
+             g_inflight,
+             slack_http_multi_xfer_count(), SLACK_HTTP_MAX_CONCURRENT,
              slack_http_q_count(g_fast_head),
              slack_http_q_count(g_slow_head),
              cool_left);
@@ -775,7 +778,8 @@ enum slack_curl_op
 {
     SLACK_CURL_PUT = 1,
     SLACK_CURL_GET = 2,
-    SLACK_CURL_API = 3  /* Slack web API (form body / GET) */
+    SLACK_CURL_API = 3,  /* Slack web API (form body / GET) */
+    SLACK_CURL_BODY = 4  /* GET body to memory (OAuth, etc.) */
 };
 
 struct t_slack_curl_xfer
@@ -790,8 +794,9 @@ struct t_slack_curl_xfer
     char *cookie;        /* raw cookie value, optional d= prefix handled by caller */
     char errbuf[CURL_ERROR_SIZE];
     t_slack_curl_done_cb callback;
+    t_slack_curl_body_cb body_cb;
     void *user_data;
-    /* SLACK_CURL_API */
+    /* SLACK_CURL_API / BODY */
     struct t_slack_http_request *api_req;
     char *resp_body;
     size_t resp_len;
@@ -910,6 +915,21 @@ slack_http_curl_check_done(void)
             if (hdr)
                 curl_slist_free_all(hdr);
             curl_easy_setopt(found->easy, CURLOPT_PRIVATE, NULL);
+        }
+
+        if (found->op == SLACK_CURL_BODY && found->body_cb)
+        {
+            char *body = found->resp_body;
+            t_slack_curl_body_cb bcb = found->body_cb;
+            void *ud = found->user_data;
+
+            found->resp_body = NULL;
+            found->body_cb = NULL;
+            bcb(ud, ok, http_code, body ? body : "");
+            free(body);
+            slack_http_curl_unlink(found);
+            slack_http_curl_xfer_free(found);
+            continue;
         }
 
         if (found->op == SLACK_CURL_API && found->api_req)
@@ -1081,6 +1101,8 @@ slack_http_curl_timer_cb(const void *pointer, void *data, int remaining_calls)
 
     curl_multi_perform(g_curl_multi, &g_curl_still_running);
     slack_http_curl_check_done();
+    /* Free multi slots may allow queued Web API jobs to start. */
+    slack_http_queue_pump();
 
     if (g_curl_still_running <= 0 && !g_curl_xfers)
     {
@@ -1107,11 +1129,29 @@ slack_http_curl_ensure_multi(void)
 }
 
 static int
+slack_http_multi_xfer_count(void)
+{
+    struct t_slack_curl_xfer *x;
+    int n = 0;
+
+    for (x = g_curl_xfers; x; x = x->next)
+        n++;
+    return n;
+}
+
+static int
 slack_http_curl_start(struct t_slack_curl_xfer *x)
 {
     CURLMcode mc;
 
     if (!x || !x->easy)
+        return 0;
+
+    /*
+     * Shared budget for API + binary (AGENTS: max concurrent libcurl).
+     * Count handles already on the multi; do not add past the cap.
+     */
+    if (slack_http_multi_xfer_count() >= SLACK_HTTP_MAX_CONCURRENT)
         return 0;
 
     slack_http_curl_ensure_multi();
@@ -1497,6 +1537,56 @@ slack_http_curl_get_file(const char *url, const char *path,
     return 1;
 }
 
+int
+slack_http_curl_get_body(const char *url,
+                         t_slack_curl_body_cb callback,
+                         void *user_data)
+{
+    struct t_slack_curl_xfer *x;
+    int timeout_ms;
+
+    if (!url || !url[0] || !callback)
+        return 0;
+
+    x = calloc(1, sizeof(*x));
+    if (!x)
+        return 0;
+
+    x->op = SLACK_CURL_BODY;
+    x->url = strdup(url);
+    x->body_cb = callback;
+    x->user_data = user_data;
+    x->easy = curl_easy_init();
+    if (!x->easy || !x->url)
+    {
+        slack_http_curl_xfer_free(x);
+        return 0;
+    }
+
+    timeout_ms = weechat_config_integer(weeslack_config.slack_timeout);
+    if (timeout_ms < 5000)
+        timeout_ms = SLACK_HTTP_TIMEOUT_FALLBACK_MS;
+
+    curl_easy_setopt(x->easy, CURLOPT_URL, x->url);
+    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/" WEESLACK_VERSION);
+    curl_easy_setopt(x->easy, CURLOPT_ERRORBUFFER, x->errbuf);
+    curl_easy_setopt(x->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(x->easy, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(x->easy, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
+    curl_easy_setopt(x->easy, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    curl_easy_setopt(x->easy, CURLOPT_WRITEFUNCTION, slack_http_api_write_cb);
+    curl_easy_setopt(x->easy, CURLOPT_WRITEDATA, x);
+    slack_http_curl_apply_proxy_easy(x->easy);
+
+    if (!slack_http_curl_start(x))
+    {
+        x->body_cb = NULL;
+        slack_http_curl_xfer_free(x);
+        return 0;
+    }
+    return 1;
+}
+
 void
 slack_http_curl_multi_shutdown(void)
 {
@@ -1519,6 +1609,8 @@ slack_http_curl_multi_shutdown(void)
             curl_slist_free_all(hdr);
         /* Do not invoke callbacks on unload — user_data may be mid-free. */
         x->callback = NULL;
+        x->body_cb = NULL;
+        x->api_req = NULL;
         slack_http_curl_xfer_free(x);
     }
     g_curl_xfers = NULL;

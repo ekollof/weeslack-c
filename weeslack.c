@@ -797,48 +797,34 @@ weeslack_token_config_append(struct t_gui_buffer *buffer, const char *token,
                     weechat_prefix("network"));
 }
 
-static int
-weeslack_register_oauth_cb(const void *pointer, void *data, const char *url,
-                            struct t_hashtable *options, struct t_hashtable *output)
+static void
+weeslack_register_oauth_done(void *user_data, int ok, long http_code,
+                             const char *body)
 {
-    struct t_gui_buffer *buffer = (struct t_gui_buffer *)pointer;
-    const char *out;
+    struct t_gui_buffer *buffer = user_data;
     struct json_object *json, *ok_obj, *tok_obj, *team_obj, *err_obj;
-    int ok = 0;
+    int api_ok = 0;
 
-    (void)data;
-    (void)url;
-    (void)options;
-
-    if (!output)
+    if (!ok || !body || !body[0])
     {
-        weechat_printf(buffer, "%sweeslack: OAuth request failed (no output)",
-                        weechat_prefix("error"));
-        return WEECHAT_RC_OK;
+        weechat_printf(buffer,
+                        "%sweeslack: OAuth request failed (HTTP %ld)",
+                        weechat_prefix("error"), http_code);
+        return;
     }
 
-    out = weechat_hashtable_get(output, "output");
-    if (!out || !out[0])
-        out = weechat_hashtable_get(output, "error");
-    if (!out || !out[0])
-    {
-        weechat_printf(buffer, "%sweeslack: OAuth empty response",
-                        weechat_prefix("error"));
-        return WEECHAT_RC_OK;
-    }
-
-    json = json_tokener_parse(out);
+    json = json_tokener_parse(body);
     if (!json)
     {
         weechat_printf(buffer, "%sweeslack: OAuth invalid JSON",
                         weechat_prefix("error"));
-        return WEECHAT_RC_OK;
+        return;
     }
 
     if (json_object_object_get_ex(json, "ok", &ok_obj))
-        ok = json_object_get_boolean(ok_obj);
+        api_ok = json_object_get_boolean(ok_obj);
 
-    if (!ok)
+    if (!api_ok)
     {
         const char *err = "unknown";
         if (json_object_object_get_ex(json, "error", &err_obj))
@@ -846,7 +832,7 @@ weeslack_register_oauth_cb(const void *pointer, void *data, const char *url,
         weechat_printf(buffer, "%sweeslack: OAuth failed: %s",
                         weechat_prefix("error"), err ? err : "unknown");
         json_object_put(json);
-        return WEECHAT_RC_OK;
+        return;
     }
 
     if (json_object_object_get_ex(json, "access_token", &tok_obj))
@@ -864,7 +850,6 @@ weeslack_register_oauth_cb(const void *pointer, void *data, const char *url,
     }
 
     json_object_put(json);
-    return WEECHAT_RC_OK;
 }
 
 static void
@@ -875,8 +860,6 @@ weeslack_command_register(struct t_gui_buffer *buffer, int argc, char **argv,
     const char *code = NULL;
     char url[1024];
     const char *redirect;
-    struct t_hashtable *opts;
-    int timeout;
 
     if (argc >= 3)
     {
@@ -979,21 +962,15 @@ weeslack_command_register(struct t_gui_buffer *buffer, int argc, char **argv,
 
     (void)redirect; /* encoded above */
 
-    opts = weechat_hashtable_new(8, WEECHAT_HASHTABLE_STRING,
-                                  WEECHAT_HASHTABLE_STRING, NULL, NULL);
-    if (!opts)
-        return;
-    weechat_hashtable_set(opts, "useragent", "weeslack/0.1");
-
-    timeout = weechat_config_integer(weeslack_config.slack_timeout);
-    if (timeout < 5000)
-        timeout = 30000;
-
     weechat_printf(buffer, "%sweeslack: exchanging OAuth code…",
                     weechat_prefix("network"));
-    weechat_hook_url(url, opts, timeout, &weeslack_register_oauth_cb,
-                     buffer, NULL);
-    weechat_hashtable_free(opts);
+    if (!slack_http_curl_get_body(url, weeslack_register_oauth_done, buffer))
+    {
+        weechat_printf(buffer,
+                        "%sweeslack: could not start OAuth request "
+                        "(HTTP busy or curl error)",
+                        weechat_prefix("error"));
+    }
 }
 
 static int
