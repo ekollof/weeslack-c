@@ -7532,7 +7532,10 @@ slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
     weechat_command(buffer, cmd);
 }
 
-/* ---- Custom emoji → cache + /icat (when look.icat_enabled + /icat) ---- */
+/* ---- Custom emoji → cache + /icat (when look.icat_enabled + /icat) ----
+ * WeeChat chat lines are text; graphics use Kitty via /icat (same as files).
+ * Gate: look.icat_enabled AND /icat registered (probe, one-time warn).
+ */
 
 struct t_slack_emoji_icat_ctx
 {
@@ -7540,6 +7543,55 @@ struct t_slack_emoji_icat_ctx
     char *path;
     char *name;
 };
+
+/* Compact tile for custom emoji (not full attachment size). */
+static void
+slack_event_icat_emoji_tile(struct t_gui_buffer *buffer, const char *path,
+                            const char *shortcode)
+{
+    unsigned int pw, ph, cols, rows;
+    char cmd[1024], path_q[768];
+    size_t pi, pj;
+
+    if (!buffer || !path || !path[0])
+        return;
+    if (!weechat_config_boolean(weeslack_config.icat_enabled))
+        return;
+    if (!slack_event_icat_available(buffer))
+        return;
+
+    slack_event_read_image_dimensions(path, &pw, &ph);
+    cols = 4;
+    if (pw == 0 || ph == 0)
+        rows = 2;
+    else
+    {
+        rows = (unsigned int)(((double)cols * (double)ph / (double)pw) + 0.5);
+        if (rows < 1)
+            rows = 1;
+        if (rows > 4)
+            rows = 4;
+    }
+
+    path_q[0] = '"';
+    pj = 1;
+    for (pi = 0; path[pi] && pj + 2 < sizeof(path_q); pi++)
+    {
+        if (path[pi] == '"' || path[pi] == '\n' || path[pi] == '\r')
+            continue;
+        path_q[pj++] = path[pi];
+    }
+    path_q[pj++] = '"';
+    path_q[pj] = '\0';
+
+    if (shortcode && shortcode[0])
+        weechat_printf(buffer, "%s:%s:",
+                        weechat_prefix("network"), shortcode);
+    snprintf(cmd, sizeof(cmd),
+             "/icat -print_immediately -quiet -columns %u -rows %u %s",
+             cols, rows, path_q);
+    weechat_command(buffer, cmd);
+}
 
 static void
 slack_event_emoji_icat_done(void *user_data, int ok, long http_code)
@@ -7550,7 +7602,7 @@ slack_event_emoji_icat_done(void *user_data, int ok, long http_code)
     if (!ctx)
         return;
     if (ok && ctx->path && ctx->buffer)
-        slack_event_try_icat_preview(ctx->buffer, ctx->path, "image/png");
+        slack_event_icat_emoji_tile(ctx->buffer, ctx->path, ctx->name);
     else if (!ok && ctx->path)
         unlink(ctx->path); /* incomplete download */
     free(ctx->path);
@@ -7729,44 +7781,7 @@ slack_event_custom_emoji_icat(struct t_weeslack_workspace *workspace,
 
         if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
         {
-            /* Small emoji tiles */
-            {
-                unsigned int pw, ph, cols, rows;
-                char cmd[1024], path_q[768];
-                size_t pi, pj;
-
-                if (!slack_event_icat_available(buffer))
-                    return;
-                slack_event_read_image_dimensions(path, &pw, &ph);
-                cols = 4;
-                if (pw == 0 || ph == 0)
-                    rows = 2;
-                else
-                {
-                    rows = (unsigned int)(((double)cols * (double)ph /
-                                           (double)pw) + 0.5);
-                    if (rows < 1)
-                        rows = 1;
-                    if (rows > 4)
-                        rows = 4;
-                }
-                path_q[0] = '"';
-                pj = 1;
-                for (pi = 0; path[pi] && pj + 2 < sizeof(path_q); pi++)
-                {
-                    if (path[pi] == '"' || path[pi] == '\n' || path[pi] == '\r')
-                        continue;
-                    path_q[pj++] = path[pi];
-                }
-                path_q[pj++] = '"';
-                path_q[pj] = '\0';
-                snprintf(cmd, sizeof(cmd),
-                         "/icat -print_immediately -quiet -columns %u -rows %u %s",
-                         cols, rows, path_q);
-                weechat_printf(buffer, "%s:%s:",
-                                weechat_prefix("network"), shortcode);
-                weechat_command(buffer, cmd);
-            }
+            slack_event_icat_emoji_tile(buffer, path, shortcode);
             shown++;
             continue;
         }

@@ -119,7 +119,8 @@ When `/cslack` is run from `core.weechat` (debug socket), buffer-local ops use
 
 - `look.download_path` — root; files go to `<root>/weeslack/<origin>/<YYYY-MM-DD>/<file>`  
 - `look.auto_download_files` — live attachments auto-saved under that layout (default on)  
-- `look.icat_enabled` — Kitty `/icat` for files **and** custom emoji (requires icat.py)  
+- `look.icat_enabled` — Kitty `/icat` for attachment images **and** custom
+  emoji (requires `icat.py` / `/icat` registered; probe before run)
 - `render_bold_as` / `render_italic_as`  
 - Color options for typing / deleted / edited / thread / muted  
 

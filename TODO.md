@@ -70,7 +70,9 @@ buffers, live-only auto-reopen, history reset on close
 - [x] **`use_full_names`**, **`external_user_suffix`**  
 - [x] Typing, mentions, mute tags, read markers  
 - [x] Emoji shortcodes + custom map + `emoji_render_mode` + weemoji.json  
-- [x] Custom emoji **images** via `/icat` when enabled (cached)  
+- [x] Custom emoji **images** via `/icat` when `look.icat_enabled` **and**
+      `/icat` is registered (probe; compact tiles; cache under
+      `data_dir/weeslack/emoji/`) — chat lines stay text; graphics use Kitty
 - [x] Bold/italic/strikethrough honor config  
 - [x] Thread-in-channel + `thread_broadcast_prefix`  
 - [x] Edit/delete in-place; input `s///`, `+emoji`/`-emoji`, `//` escape  
@@ -152,10 +154,12 @@ Prefer process restart over unload/load when hunting crashes.
 
 1. **Unlimited** members with no page cap — hard max **50** pages (~10k);
    higher risks API storms (use `look.members_max_pages`)  
-2. True inline custom emoji **inside** a chat line (TUI); we use `/icat`
-   tiles under the message instead  
-3. Replacing WeeChat’s `hook_url` Web API with pure libcurl for form POSTs
+2. Replacing WeeChat’s `hook_url` Web API with pure libcurl for form POSTs
    (queue + `hook_url` already work; multi is for binary bodies)  
+
+**Custom emoji graphics:** not “out of scope” — use **`look.icat_enabled`**
+when `/icat` is registered (same path as file image previews). Text lines
+keep `:shortcode:`; image follows as a Kitty tile.
 
 ---
 
