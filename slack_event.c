@@ -3489,21 +3489,54 @@ slack_format_bytes(char *buf, size_t buf_size, long size)
 static char *
 slack_event_format_files(struct json_object *msg_json)
 {
-    struct json_object *files_obj;
+    struct json_object *files_obj = NULL;
+    struct json_object *single_wrap = NULL;
     int shown = 0;
+    int count;
+    int free_wrap = 0;
 
-    if (!json_object_object_get_ex(msg_json, "files", &files_obj))
+    if (!msg_json)
         return NULL;
 
-    int count = json_object_array_length(files_obj);
+    /*
+     * Modern messages: "files": [ {...}, ... ]
+     * RTM file_share (common for uploads): single "file": { ... }
+     */
+    if (json_object_object_get_ex(msg_json, "files", &files_obj) &&
+        json_object_is_type(files_obj, json_type_array))
+    {
+        /* use as-is */
+    }
+    else if (json_object_object_get_ex(msg_json, "file", &files_obj) &&
+             json_object_is_type(files_obj, json_type_object))
+    {
+        single_wrap = json_object_new_array();
+        if (!single_wrap)
+            return NULL;
+        /* array_add takes a reference; keep original via get */
+        json_object_array_add(single_wrap, json_object_get(files_obj));
+        files_obj = single_wrap;
+        free_wrap = 1;
+    }
+    else
+        return NULL;
+
+    count = json_object_array_length(files_obj);
     if (count == 0)
+    {
+        if (free_wrap)
+            json_object_put(single_wrap);
         return NULL;
-
+    }
     /* estimate buffer size (title + url + metadata) */
     size_t buf_size = (size_t)count * 384 + 64;
     char *result = malloc(buf_size);
     if (!result)
+    {
+        if (free_wrap)
+            json_object_put(single_wrap);
         return NULL;
+    }
 
     result[0] = '\0';
     size_t pos = 0;
@@ -3574,6 +3607,9 @@ slack_event_format_files(struct json_object *msg_json)
                 ? (size_t)written : (buf_size - pos - 1);
         shown++;
     }
+
+    if (free_wrap)
+        json_object_put(single_wrap);
 
     if (shown == 0)
     {
@@ -6030,26 +6066,70 @@ slack_event_upload_complete_cb(struct t_weeslack_workspace *workspace,
 
     slack_format_bytes(size_buf, sizeof(size_buf), ctx->length);
 
-    /* Immediate local feedback (self-DM may not echo a message event). */
+    /*
+     * Always show a chat-style line in the target buffer. Self-DMs often
+     * do not RTM-echo file shares, and older events use "file" not "files".
+     */
     {
-        struct json_object *files_obj, *f0, *url_obj;
+        struct json_object *files_obj = NULL, *f0 = NULL, *url_obj = NULL;
+        struct t_gui_buffer *buf;
+        struct t_slack_channel *ch;
+        struct t_slack_user *me = NULL;
+        char *nick_str = NULL;
         const char *permalink = NULL;
+        const char *url_priv = NULL;
+        char tags[128];
+        time_t now = time(NULL);
 
         if (json_object_object_get_ex(json, "files", &files_obj) &&
             json_object_is_type(files_obj, json_type_array) &&
             json_object_array_length(files_obj) > 0)
         {
             f0 = json_object_array_get_idx(files_obj, 0);
-            if (f0 && json_object_object_get_ex(f0, "permalink", &url_obj))
-                permalink = json_object_get_string(url_obj);
+            if (f0)
+            {
+                if (json_object_object_get_ex(f0, "permalink", &url_obj))
+                    permalink = json_object_get_string(url_obj);
+                if (json_object_object_get_ex(f0, "url_private", &url_obj))
+                    url_priv = json_object_get_string(url_obj);
+                if ((!url_priv || !url_priv[0]) &&
+                    json_object_object_get_ex(f0, "url_private_download",
+                                              &url_obj))
+                    url_priv = json_object_get_string(url_obj);
+            }
         }
 
-        if (permalink && permalink[0])
-            slack_event_upload_printf(ctx, 0, "uploaded %s (%s) — %s",
-                                      name, size_buf, permalink);
-        else
-            slack_event_upload_printf(ctx, 0, "uploaded %s (%s)",
-                                      name, size_buf);
+        buf = slack_event_upload_buffer(ctx);
+        ch = ctx->channel_id ? slack_channel_search(ctx->channel_id) : NULL;
+        if (workspace && workspace->my_user_id)
+            me = slack_user_search(workspace->my_user_id);
+        nick_str = slack_event_format_user(me, workspace ? workspace->my_user_id
+                                                         : NULL,
+                                           ch);
+
+        snprintf(tags, sizeof(tags), "notify_none,no_highlight,slack_upload");
+        if (buf)
+        {
+            const char *link = (url_priv && url_priv[0]) ? url_priv
+                : ((permalink && permalink[0]) ? permalink : "");
+
+            weechat_printf_date_tags(
+                buf, now, tags,
+                "%s\t%s[file]%s %s (%s)%s%s",
+                nick_str ? nick_str : "me",
+                weechat_color("blue"),
+                weechat_color("reset"),
+                name,
+                size_buf,
+                (link && link[0]) ? " " : "",
+                (link && link[0]) ? link : "");
+        }
+        free(nick_str);
+
+        slack_event_upload_printf(ctx, 0, "uploaded %s (%s)%s%s",
+                                  name, size_buf,
+                                  (permalink && permalink[0]) ? " — " : "",
+                                  (permalink && permalink[0]) ? permalink : "");
     }
 
     json_object_put(json);
@@ -6061,7 +6141,6 @@ slack_event_upload_put_done(void *user_data, int ok, long http_code)
 {
     struct t_slack_upload_ctx *ctx = user_data;
     struct json_object *params, *files_arr, *file_obj;
-    const char *files_str;
 
     if (!ctx)
         return;
@@ -6074,15 +6153,22 @@ slack_event_upload_put_done(void *user_data, int ok, long http_code)
         return;
     }
 
-    /* Build files= JSON safely (filename may contain quotes). */
+    /*
+     * Pass files as a real JSON array object — form encoder emits compact
+     * JSON. (Stringifying then wrapping in a string double-escaped quotes
+     * and broke channel share.)
+     */
     files_arr = json_object_new_array();
     file_obj = json_object_new_object();
-    if (!files_arr || !file_obj)
+    params = json_object_new_object();
+    if (!files_arr || !file_obj || !params)
     {
         if (files_arr)
             json_object_put(files_arr);
         if (file_obj)
             json_object_put(file_obj);
+        if (params)
+            json_object_put(params);
         slack_event_upload_printf(ctx, 1, "upload complete: out of memory");
         slack_event_upload_ctx_free(ctx);
         return;
@@ -6094,29 +6180,17 @@ slack_event_upload_put_done(void *user_data, int ok, long http_code)
                            json_object_new_string(
                                ctx->filename ? ctx->filename : "file"));
     json_object_array_add(files_arr, file_obj);
-    files_str = json_object_to_json_string(files_arr);
-
-    params = json_object_new_object();
-    if (!params || !files_str)
-    {
-        json_object_put(files_arr);
-        if (params)
-            json_object_put(params);
-        slack_event_upload_printf(ctx, 1, "upload complete: out of memory");
-        slack_event_upload_ctx_free(ctx);
-        return;
-    }
-
-    json_object_object_add(params, "files",
-                           json_object_new_string(files_str));
+    json_object_object_add(params, "files", files_arr);
     json_object_object_add(params, "channel_id",
+                           json_object_new_string(ctx->channel_id));
+    /* Some workspaces / legacy paths also honor channels= */
+    json_object_object_add(params, "channels",
                            json_object_new_string(ctx->channel_id));
     if (ctx->thread_ts && ctx->thread_ts[0])
     {
         json_object_object_add(params, "thread_ts",
                                json_object_new_string(ctx->thread_ts));
     }
-    json_object_put(files_arr);
 
     slack_http_request_new(ctx->workspace, "files.completeUploadExternal",
                            params, slack_event_upload_complete_cb, ctx);

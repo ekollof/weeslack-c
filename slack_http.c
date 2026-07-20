@@ -110,16 +110,24 @@ slack_http_encode_query_string(struct json_object *params)
     {
         const char *key = json_object_iter_peek_name(&it);
         struct json_object *val = json_object_iter_peek_value(&it);
-        const char *val_str = json_object_to_json_string(val);
-        size_t val_len = strlen(val_str);
+        const char *val_str;
+        size_t val_len;
         char *encoded_key, *encoded_val, *out, *new_result;
         size_t key_len, enc_val_len;
 
-        if (val_len >= 2 && val_str[0] == '"' && val_str[val_len - 1] == '"')
-        {
-            val_str++;
-            val_len -= 2;
-        }
+        /*
+         * Strings: use raw content (not JSON-quoted). Nested JSON (e.g.
+         * files=[{"id":"F…"}]) must not be double-escaped as \" or Slack
+         * rejects/ignores the share target.
+         * Arrays/objects: compact JSON via json_object_to_json_string.
+         */
+        if (json_object_is_type(val, json_type_string))
+            val_str = json_object_get_string(val);
+        else
+            val_str = json_object_to_json_string(val);
+        if (!val_str)
+            val_str = "";
+        val_len = strlen(val_str);
 
         encoded_key = slack_url_encode(key);
         encoded_val = calloc(1, val_len * 3 + 1);
