@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — RTM join/leave/rename, safe formatting,
-file display, users.list page cap, history dedupe
+**Last update:** 2026-07-20 — last-ts commands, blocks text, me_message,
+purpose, channel/im create, team_join
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -75,7 +75,7 @@ file display, users.list page cap, history dedupe
 
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
-- [x] **`linkarchive`** without args uses last printed message ts  
+- [x] **`linkarchive` / pin / star / react** default to last printed message ts  
 - [x] Stars list — resolve channel/user names, format text (cap 40 shown)  
 - [x] Search list — resolve names, format text (cap 20 shown)  
 - [~] subscribe = local thread notify only  
@@ -115,6 +115,8 @@ file display, users.list page cap, history dedupe
 - [x] Core events  
 - [x] `member_joined_channel` / `member_left_channel` (nicklist + notice)  
 - [x] `user_change`, `channel_rename` / `group_rename`, archive/unarchive  
+- [x] `channel_created` / `group_joined` / `im_created` / `mpim_joined` / `team_join`  
+- [x] `me_message` (/me style), `channel_purpose`, Block Kit text fallback  
 - [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
 - [x] Rate-limit + auth messaging  
 
@@ -166,3 +168,7 @@ rtm.connect
 | Thin file lines | title/name, human size, private download URL |
 | Missing RTM join/leave/rename | member_*, user_change, channel_rename, archive |
 | users.list unlimited pages | cap 10 pages |
+| pin/star/react required ts always | default to last message ts |
+| Block-only messages empty | extract text from blocks |
+| me_message plain | magenta `* nick text` action line |
+| Live channel/DM create missed | channel_created / im_created / team_join |

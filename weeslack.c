@@ -207,6 +207,32 @@ weeslack_cmd_channel_id(struct t_gui_buffer *buffer)
     return weechat_buffer_get_string(buf, "localvar_slack_channel_id");
 }
 
+/* Resolve a message ts: explicit arg, else buffer localvar, else channel last. */
+static const char *
+weeslack_cmd_message_ts(struct t_gui_buffer *buffer, const char *channel_id,
+                        const char *explicit_ts)
+{
+    struct t_gui_buffer *buf;
+    const char *ts;
+    struct t_slack_channel *ch;
+
+    if (explicit_ts && explicit_ts[0])
+        return explicit_ts;
+
+    buf = weeslack_cmd_buffer(buffer);
+    ts = weechat_buffer_get_string(buf, "localvar_slack_timestamp");
+    if (ts && ts[0])
+        return ts;
+
+    if (channel_id)
+    {
+        ch = slack_channel_search(channel_id);
+        if (ch && ch->last_message_ts && ch->last_message_ts[0])
+            return ch->last_message_ts;
+    }
+    return NULL;
+}
+
 static int
 weeslack_command_cslack(const void *pointer, void *data,
                         struct t_gui_buffer *buffer,
@@ -733,6 +759,9 @@ weeslack_command_cslack(const void *pointer, void *data,
     {
         struct t_weeslack_workspace *ws;
         int add = (weechat_strcasecmp(argv[1], "react") == 0);
+        const char *channel_id;
+        const char *ts = NULL;
+        const char *emoji = NULL;
 
         ws = weeslack_workspace_search("default");
         if (!ws || !ws->connected)
@@ -741,27 +770,39 @@ weeslack_command_cslack(const void *pointer, void *data,
                             weechat_prefix("error"));
             return WEECHAT_RC_OK;
         }
-        if (argc < 4)
+        channel_id = weeslack_cmd_channel_id(buffer);
+        if (!channel_id)
+        {
+            weechat_printf(buffer, "%sweeslack: no channel selected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        /* /cslack react <emoji>  OR  /cslack react <ts> <emoji> */
+        if (argc >= 4)
+        {
+            ts = argv[2];
+            emoji = argv[3];
+        }
+        else if (argc >= 3)
+        {
+            emoji = argv[2];
+            ts = weeslack_cmd_message_ts(buffer, channel_id, NULL);
+        }
+        if (!emoji || !emoji[0] || !ts || !ts[0])
         {
             weechat_printf(buffer,
-                            "%sweeslack: usage: /cslack %s <timestamp> <emoji>",
+                            "%sweeslack: usage: /cslack %s [timestamp] <emoji>",
                             weechat_prefix("error"), argv[1]);
             return WEECHAT_RC_OK;
         }
-        {
-            const char *channel_id = weeslack_cmd_channel_id(buffer);
-            if (!channel_id)
-            {
-                weechat_printf(buffer, "%sweeslack: no channel selected",
-                                weechat_prefix("error"));
-                return WEECHAT_RC_OK;
-            }
-            slack_event_react(ws, channel_id, argv[2], argv[3], add);
-        }
+        slack_event_react(ws, channel_id, ts, emoji, add);
     }
     else if (weechat_strcasecmp(argv[1], "linkarchive") == 0)
     {
         struct t_weeslack_workspace *ws;
+        const char *channel_id;
+        const char *ts;
+
         ws = weeslack_workspace_search("default");
         if (!ws || !ws->connected)
         {
@@ -770,7 +811,7 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        const char *channel_id = weeslack_cmd_channel_id(buffer);
+        channel_id = weeslack_cmd_channel_id(buffer);
         if (!channel_id)
         {
             weechat_printf(buffer, "%sweeslack: no channel selected",
@@ -778,20 +819,8 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        const char *ts = (argc >= 3) ? argv[2] : NULL;
-        if (!ts || !ts[0])
-        {
-            /* Prefer buffer localvar (set on each printed message), then
-             * channel model last_message_ts. */
-            ts = weechat_buffer_get_string(buffer, "localvar_slack_timestamp");
-            if (!ts || !ts[0])
-            {
-                struct t_slack_channel *ch = slack_channel_search(channel_id);
-                if (ch && ch->last_message_ts && ch->last_message_ts[0])
-                    ts = ch->last_message_ts;
-            }
-        }
-
+        ts = weeslack_cmd_message_ts(buffer, channel_id,
+                                     (argc >= 3) ? argv[2] : NULL);
         if (!ts || !ts[0])
         {
             weechat_printf(buffer, "%sweeslack: no message timestamp; "
@@ -848,9 +877,14 @@ weeslack_command_cslack(const void *pointer, void *data,
                             weechat_prefix("network"));
         }
     }
-    else if (weechat_strcasecmp(argv[1], "pin") == 0)
+    else if (weechat_strcasecmp(argv[1], "pin") == 0 ||
+             weechat_strcasecmp(argv[1], "unpin") == 0)
     {
         struct t_weeslack_workspace *ws;
+        int pin = (weechat_strcasecmp(argv[1], "pin") == 0);
+        const char *channel_id;
+        const char *ts;
+
         ws = weeslack_workspace_search("default");
         if (!ws || !ws->connected)
         {
@@ -859,14 +893,7 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        if (argc < 3)
-        {
-            weechat_printf(buffer, "%sweeslack: usage: /cslack pin <timestamp>",
-                            weechat_prefix("error"));
-            return WEECHAT_RC_OK;
-        }
-
-        const char *channel_id = weeslack_cmd_channel_id(buffer);
+        channel_id = weeslack_cmd_channel_id(buffer);
         if (!channel_id)
         {
             weechat_printf(buffer, "%sweeslack: no channel selected",
@@ -874,39 +901,20 @@ weeslack_command_cslack(const void *pointer, void *data,
             return WEECHAT_RC_OK;
         }
 
-        slack_event_pin_message(ws, channel_id, argv[2], 1);
-        weechat_printf(buffer, "%sweeslack: message pinned",
-                        weechat_prefix("network"));
-    }
-    else if (weechat_strcasecmp(argv[1], "unpin") == 0)
-    {
-        struct t_weeslack_workspace *ws;
-        ws = weeslack_workspace_search("default");
-        if (!ws || !ws->connected)
+        ts = weeslack_cmd_message_ts(buffer, channel_id,
+                                     (argc >= 3) ? argv[2] : NULL);
+        if (!ts || !ts[0])
         {
-            weechat_printf(buffer, "%sweeslack: not connected",
-                            weechat_prefix("error"));
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack %s [timestamp]",
+                            weechat_prefix("error"), argv[1]);
             return WEECHAT_RC_OK;
         }
 
-        if (argc < 3)
-        {
-            weechat_printf(buffer, "%sweeslack: usage: /cslack unpin <timestamp>",
-                            weechat_prefix("error"));
-            return WEECHAT_RC_OK;
-        }
-
-        const char *channel_id = weeslack_cmd_channel_id(buffer);
-        if (!channel_id)
-        {
-            weechat_printf(buffer, "%sweeslack: no channel selected",
-                            weechat_prefix("error"));
-            return WEECHAT_RC_OK;
-        }
-
-        slack_event_pin_message(ws, channel_id, argv[2], 0);
-        weechat_printf(buffer, "%sweeslack: message unpinned",
-                        weechat_prefix("network"));
+        slack_event_pin_message(ws, channel_id, ts, pin);
+        weechat_printf(buffer, "%sweeslack: message %s",
+                        weechat_prefix("network"),
+                        pin ? "pinned" : "unpinned");
     }
     else if (weechat_strcasecmp(argv[1], "search") == 0)
     {
@@ -967,19 +975,13 @@ weeslack_command_cslack(const void *pointer, void *data,
         struct t_weeslack_workspace *ws;
         int add = (weechat_strcasecmp(argv[1], "star") == 0);
         const char *channel_id;
+        const char *ts;
 
         ws = weeslack_workspace_search("default");
         if (!ws || !ws->connected)
         {
             weechat_printf(buffer, "%sweeslack: not connected",
                             weechat_prefix("error"));
-            return WEECHAT_RC_OK;
-        }
-        if (argc < 3)
-        {
-            weechat_printf(buffer,
-                            "%sweeslack: usage: /cslack %s <timestamp>",
-                            weechat_prefix("error"), argv[1]);
             return WEECHAT_RC_OK;
         }
         channel_id = weeslack_cmd_channel_id(buffer);
@@ -989,7 +991,16 @@ weeslack_command_cslack(const void *pointer, void *data,
                             weechat_prefix("error"));
             return WEECHAT_RC_OK;
         }
-        slack_event_star_message(ws, channel_id, argv[2], add);
+        ts = weeslack_cmd_message_ts(buffer, channel_id,
+                                     (argc >= 3) ? argv[2] : NULL);
+        if (!ts || !ts[0])
+        {
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack %s [timestamp]",
+                            weechat_prefix("error"), argv[1]);
+            return WEECHAT_RC_OK;
+        }
+        slack_event_star_message(ws, channel_id, ts, add);
         weechat_printf(buffer, "%sweeslack: %s",
                         weechat_prefix("network"),
                         add ? "starred" : "unstarred");
@@ -1042,21 +1053,25 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sthread%s <ts>   Open thread by parent ts",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %sreact%s <ts> <emoji>  Add reaction",
+        weechat_printf(buffer, "  %sreact%s [ts] <emoji>  Add reaction (default: last msg)",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %sunreact%s <ts> <emoji> Remove reaction",
+        weechat_printf(buffer, "  %sunreact%s [ts] <emoji> Remove reaction",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %steams%s         List teams/workspaces",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %slinkarchive%s [ts] Get permalink",
+        weechat_printf(buffer, "  %slinkarchive%s [ts] Get permalink (default: last msg)",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %ssubscribe%s     Subscribe to thread",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sunsubscribe%s   Unsubscribe from thread",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %spin%s <ts>      Pin a message",
+        weechat_printf(buffer, "  %spin%s [ts]      Pin message (default: last)",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %sunpin%s <ts>    Unpin a message",
+        weechat_printf(buffer, "  %sunpin%s [ts]    Unpin message",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %sstar%s [ts]     Star message",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %sunstar%s [ts]   Unstar message",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %ssearch%s <query> Search messages",
                         weechat_color("cyan"), weechat_color("reset"));
@@ -1843,18 +1858,18 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "show:         Show hidden channel\n"
         "label:        Set buffer title locally\n"
         "thread:       Open thread by parent message ts\n"
-        "react:        Add emoji reaction to a message\n"
+        "react:        Add emoji reaction ([ts] emoji; default last msg)\n"
         "unreact:      Remove emoji reaction\n"
         "teams:        List workspaces\n"
-        "linkarchive:  Get message permalink\n"
+        "linkarchive:  Get message permalink ([ts]; default last msg)\n"
         "subscribe:    Subscribe to thread (local notify)\n"
         "unsubscribe:  Unsubscribe from thread\n"
-        "pin:          Pin a message\n"
+        "pin:          Pin a message ([ts]; default last msg)\n"
         "unpin:        Unpin a message\n"
         "search:       Search messages\n"
         "download:     Download a private Slack file URL\n"
         "stars:        List starred items\n"
-        "star:         Star a message by timestamp\n"
+        "star:         Star a message ([ts]; default last msg)\n"
         "unstar:       Unstar a message\n"
         "help:         Show help",
         "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|help",

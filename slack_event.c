@@ -355,6 +355,90 @@ slack_event_format_user(struct t_slack_user *user, const char *fallback_id,
     return strdup(buf);
 }
 
+/* Pull plain text out of Block Kit (section / rich_text) when "text" is empty. */
+static void
+slack_blocks_collect_text(struct json_object *node, char *out, size_t out_size,
+                          size_t *pos)
+{
+    enum json_type t;
+    size_t i, n;
+
+    if (!node || !out || !pos || *pos + 1 >= out_size)
+        return;
+
+    t = json_object_get_type(node);
+    if (t == json_type_object)
+    {
+        struct json_object *text_obj, *elements, *type_obj;
+        const char *type = NULL;
+
+        if (json_object_object_get_ex(node, "type", &type_obj))
+            type = json_object_get_string(type_obj);
+
+        /* section / header / button style: { "text": { "text": "..." } }
+         * or plain { "text": "..." } */
+        if (json_object_object_get_ex(node, "text", &text_obj))
+        {
+            if (json_object_is_type(text_obj, json_type_string))
+            {
+                const char *s = json_object_get_string(text_obj);
+                if (s && s[0] && *pos + 1 < out_size)
+                {
+                    int w = snprintf(out + *pos, out_size - *pos, "%s%s",
+                                     *pos ? " " : "", s);
+                    if (w > 0)
+                        *pos += (size_t)w < out_size - *pos
+                            ? (size_t)w : out_size - *pos - 1;
+                }
+            }
+            else if (json_object_is_type(text_obj, json_type_object))
+                slack_blocks_collect_text(text_obj, out, out_size, pos);
+        }
+
+        if (json_object_object_get_ex(node, "elements", &elements) &&
+            json_object_is_type(elements, json_type_array))
+        {
+            n = (size_t)json_object_array_length(elements);
+            for (i = 0; i < n; i++)
+                slack_blocks_collect_text(
+                    json_object_array_get_idx(elements, i),
+                    out, out_size, pos);
+        }
+
+        /* rich_text_section leaves often have "text" string already handled */
+        (void) type;
+    }
+    else if (t == json_type_array)
+    {
+        n = (size_t)json_object_array_length(node);
+        for (i = 0; i < n; i++)
+            slack_blocks_collect_text(json_object_array_get_idx(node, i),
+                                      out, out_size, pos);
+    }
+}
+
+static char *
+slack_event_message_text(struct json_object *msg_json)
+{
+    struct json_object *text_obj, *blocks_obj;
+    const char *text = NULL;
+    char buf[4096];
+    size_t pos = 0;
+
+    if (json_object_object_get_ex(msg_json, "text", &text_obj))
+        text = json_object_get_string(text_obj);
+    if (text && text[0])
+        return strdup(text);
+
+    buf[0] = '\0';
+    if (json_object_object_get_ex(msg_json, "blocks", &blocks_obj))
+        slack_blocks_collect_text(blocks_obj, buf, sizeof(buf), &pos);
+
+    if (buf[0])
+        return strdup(buf);
+    return strdup("");
+}
+
 static void
 slack_event_process_message(struct t_weeslack_workspace *workspace,
                              struct t_slack_channel *channel,
@@ -363,11 +447,13 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
 {
     (void) history;
 
-    struct json_object *ts_obj, *user_obj, *text_obj;
+    struct json_object *ts_obj, *user_obj;
     const char *ts_str = NULL;
     const char *user_id = NULL;
+    char *text_owned = NULL;
     const char *text = "";
     const char *subtype = NULL;
+    int is_me = 0;
 
     json_object_object_get_ex(msg_json, "ts", &ts_obj);
     if (ts_obj)
@@ -385,18 +471,23 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             user_id = json_object_get_string(bot_obj);
     }
 
-    json_object_object_get_ex(msg_json, "text", &text_obj);
-    if (text_obj)
-        text = json_object_get_string(text_obj);
+    text_owned = slack_event_message_text(msg_json);
+    text = text_owned ? text_owned : "";
 
     struct json_object *subtype_obj;
     if (json_object_object_get_ex(msg_json, "subtype", &subtype_obj))
         subtype = json_object_get_string(subtype_obj);
 
+    if (subtype && strcmp(subtype, "me_message") == 0)
+        is_me = 1;
+
     SlackTS ts = slack_ts_new(ts_str);
 
     if (!channel)
+    {
+        free(text_owned);
         return;
+    }
 
     /* ensure a buffer exists for live traffic */
     if (!channel->buffer && workspace)
@@ -406,9 +497,12 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     if (subtype && strcmp(subtype, "message_changed") == 0)
     {
         struct json_object *message_obj;
+        free(text_owned);
+        text_owned = NULL;
         if (json_object_object_get_ex(msg_json, "message", &message_obj))
         {
-            struct json_object *new_ts_obj, *new_text_obj;
+            struct json_object *new_ts_obj;
+            char *new_text_owned;
             const char *new_ts_str = NULL;
             const char *new_text = "";
             const char *edit_color;
@@ -417,9 +511,8 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             if (new_ts_obj)
                 new_ts_str = json_object_get_string(new_ts_obj);
 
-            json_object_object_get_ex(message_obj, "text", &new_text_obj);
-            if (new_text_obj)
-                new_text = json_object_get_string(new_text_obj);
+            new_text_owned = slack_event_message_text(message_obj);
+            new_text = new_text_owned ? new_text_owned : "";
 
             SlackTS new_ts = slack_ts_new(new_ts_str);
             struct t_slack_message *msg = slack_message_search(channel->messages, new_ts);
@@ -433,7 +526,8 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             if (channel->buffer)
             {
                 char *rendered = slack_event_render_formatting(new_text);
-                char *with_emoji = slack_event_replace_emoji(rendered ? rendered : new_text);
+                char *with_emoji = slack_event_apply_emoji_mode(
+                    rendered ? rendered : new_text);
                 edit_color = weechat_config_string(weeslack_config.color_edited_suffix);
                 if (!edit_color || !edit_color[0])
                     edit_color = "yellow";
@@ -450,6 +544,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                 free(rendered);
                 free(with_emoji);
             }
+            free(new_text_owned);
         }
         return;
     }
@@ -457,6 +552,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     if (subtype && strcmp(subtype, "message_deleted") == 0)
     {
         struct json_object *deleted_ts_obj;
+        free(text_owned);
         if (json_object_object_get_ex(msg_json, "deleted_ts", &deleted_ts_obj))
         {
             SlackTS deleted_ts = slack_ts_new(
@@ -485,18 +581,31 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         return;
     }
 
-    if (subtype && strcmp(subtype, "channel_topic") == 0)
+    if (subtype && (strcmp(subtype, "channel_topic") == 0 ||
+                    strcmp(subtype, "channel_purpose") == 0))
     {
-        struct json_object *topic_obj;
-        if (json_object_object_get_ex(msg_json, "topic", &topic_obj))
+        struct json_object *topic_obj = NULL;
+        const char *field = (strcmp(subtype, "channel_purpose") == 0)
+            ? "purpose" : "topic";
+        free(text_owned);
+        if (json_object_object_get_ex(msg_json, field, &topic_obj))
         {
             const char *topic = json_object_get_string(topic_obj);
-            free(channel->topic);
-            channel->topic = strdup(topic);
-
-            if (channel->buffer)
+            if (strcmp(field, "purpose") == 0)
             {
-                weechat_buffer_set(channel->buffer, "title", topic);
+                free(channel->purpose);
+                channel->purpose = topic ? strdup(topic) : NULL;
+            }
+            else
+            {
+                free(channel->topic);
+                channel->topic = topic ? strdup(topic) : NULL;
+            }
+
+            if (channel->buffer && topic)
+            {
+                if (strcmp(field, "topic") == 0)
+                    weechat_buffer_set(channel->buffer, "title", topic);
                 weechat_printf(channel->buffer,
                                 "%s%s%s",
                                 weechat_color("green"),
@@ -519,6 +628,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                             jname ? jname : user_id,
                             weechat_color("reset"));
         }
+        free(text_owned);
         return;
     }
 
@@ -534,6 +644,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                             lname ? lname : user_id,
                             weechat_color("reset"));
         }
+        free(text_owned);
         return;
     }
 
@@ -594,7 +705,10 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     /* create and store the message */
     struct t_slack_message *msg = slack_message_new(ts, user_id, text);
     if (!msg)
+    {
+        free(text_owned);
         return;
+    }
 
     slack_message_update(msg, msg_json);
 
@@ -666,6 +780,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             free(emoji_text);
             free(formatted);
         }
+        free(text_owned);
         return;
     }
 
@@ -686,6 +801,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         char *ts_tag = slack_ts_to_string(ts);
         const char *bcast = "";
         char bcast_buf[64];
+        char me_buf[512];
 
         if (thread_ts && !is_parent &&
             display_channel == channel)
@@ -701,23 +817,49 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             bcast = bcast_buf;
         }
 
+        /* /me style: * nick does something */
+        if (is_me)
+        {
+            const char *plain_nick = user ? slack_user_best_name(user)
+                : (user_id ? user_id : "?");
+            snprintf(me_buf, sizeof(me_buf), "%s* %s %s%s",
+                     weechat_color("magenta"),
+                     plain_nick ? plain_nick : "?",
+                     formatted ? formatted : "",
+                     weechat_color("reset"));
+        }
+
         snprintf(tags, sizeof(tags),
-                 "%s,slack_ts_%s",
+                 "%s,slack_ts_%s%s",
                  history
                      ? "no_highlight,notify_none,no_log,logger_backlog"
                      : (display_channel->is_muted
                         ? "no_highlight,notify_none,log1"
                         : "notify_message,log1"),
-                 ts_tag ? ts_tag : "0");
+                 ts_tag ? ts_tag : "0",
+                 is_me ? ",slack_me" : "");
 
-        weechat_printf_date_tags(
-            display_channel->buffer,
-            ts.sec,
-            tags,
-            "%s\t%s%s",
-            nick_str,
-            formatted,
-            bcast);
+        if (is_me)
+        {
+            weechat_printf_date_tags(
+                display_channel->buffer,
+                ts.sec,
+                tags,
+                " \t%s%s",
+                me_buf,
+                bcast);
+        }
+        else
+        {
+            weechat_printf_date_tags(
+                display_channel->buffer,
+                ts.sec,
+                tags,
+                "%s\t%s%s",
+                nick_str,
+                formatted,
+                bcast);
+        }
 
         if (ts_tag)
         {
@@ -766,6 +908,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         free(files);
         free(attachments);
     }
+    free(text_owned);
 }
 
 void
@@ -1136,6 +1279,92 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                                 weechat_color("reset"));
                 if (archived)
                     weechat_buffer_set(ch->buffer, "notify", "none");
+            }
+        }
+        return;
+    }
+
+    /* New channel / group / IM created while connected */
+    if (strcmp(type, "channel_created") == 0 ||
+        strcmp(type, "group_joined") == 0 ||
+        strcmp(type, "im_created") == 0 ||
+        strcmp(type, "mpim_joined") == 0)
+    {
+        struct json_object *channel_obj = NULL;
+        enum slack_channel_type ctype = SLACK_CHANNEL_TYPE_CHANNEL;
+        const char *cid = NULL, *cname = NULL;
+
+        if (strcmp(type, "im_created") == 0)
+            ctype = SLACK_CHANNEL_TYPE_DM;
+        else if (strcmp(type, "mpim_joined") == 0)
+            ctype = SLACK_CHANNEL_TYPE_MPDM;
+        else if (strcmp(type, "group_joined") == 0)
+            ctype = SLACK_CHANNEL_TYPE_GROUP;
+
+        if (json_object_object_get_ex(json, "channel", &channel_obj))
+        {
+            struct json_object *id_obj, *name_obj, *user_obj;
+            if (json_object_object_get_ex(channel_obj, "id", &id_obj))
+                cid = json_object_get_string(id_obj);
+            if (json_object_object_get_ex(channel_obj, "name", &name_obj))
+                cname = json_object_get_string(name_obj);
+            if (cid)
+            {
+                struct t_slack_channel *ch = slack_channel_search(cid);
+                if (!ch)
+                {
+                    ch = slack_channel_new(cid,
+                                           cname && cname[0] ? cname : cid,
+                                           ctype);
+                    if (ch)
+                    {
+                        slack_channel_update(ch, channel_obj);
+                        if (ctype == SLACK_CHANNEL_TYPE_DM &&
+                            json_object_object_get_ex(channel_obj, "user",
+                                                      &user_obj))
+                        {
+                            free(ch->user_id);
+                            ch->user_id = strdup(
+                                json_object_get_string(user_obj));
+                        }
+                        ch->is_member = 1;
+                        if (!ch->buffer)
+                            slack_buffer_new(workspace, ch);
+                        SLACK_WS_PRINTF(
+                            workspace,
+                            "%sweeslack: joined %s",
+                            weechat_prefix("network"),
+                            ch->name ? ch->name : cid);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, "team_join") == 0)
+    {
+        struct json_object *user_obj;
+        if (json_object_object_get_ex(json, "user", &user_obj))
+        {
+            struct json_object *id_obj, *name_obj;
+            const char *uid = NULL, *uname = NULL;
+            if (json_object_object_get_ex(user_obj, "id", &id_obj))
+                uid = json_object_get_string(id_obj);
+            if (json_object_object_get_ex(user_obj, "name", &name_obj))
+                uname = json_object_get_string(name_obj);
+            if (uid)
+            {
+                struct t_slack_user *u = slack_user_search(uid);
+                if (!u)
+                    u = slack_user_new(uid, uname && uname[0] ? uname : uid,
+                                      NULL);
+                if (u)
+                    slack_user_update(u, user_obj);
+                SLACK_WS_PRINTF(workspace,
+                                "%sweeslack: %s joined the team",
+                                weechat_prefix("network"),
+                                u ? slack_user_best_name(u) : uid);
             }
         }
         return;
