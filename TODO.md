@@ -1,6 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — remaining-gap pass (POST bodies, emoji.list, download, stars, upgrade reconnect, config wiring)
+**Last update:** 2026-07-20 — gap audit + fixes (emoji bootstrap split, thread
+auto-open, linkarchive ts, dead config, proxy, reactions, mentions)
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -9,15 +10,15 @@
 ## Phase 1: Core Connectivity
 
 - [x] WebSocket RTM — TLS+SNI, masking, ping/pong, reconnect backoff  
-- [x] HTTP — `hook_url`, Bearer + cookie, `ipresolve=V4`, POST form bodies  
+- [x] HTTP — `hook_url`, Bearer + cookie, `ipresolve=v4`, POST form bodies  
 - [x] **Request queue (wee-slack model)**  
   - Fast queue + **slow queue** (history/members; ≤1 promote/sec)  
   - Max **2** concurrent in-flight  
   - On 429: **global cooldown** from `Retry-After`, re-queue job (no stampede)  
   - Soft failures: quadratic backoff re-queue  
   - `conversations.mark` is **droppable** under cooldown  
-- [x] Proxy via WeeChat globals  
-- [~] Binary file **PUT** still uses curl
+- [x] Proxy via WeeChat globals — WS (`proxy_curl`) **and** HTTP (`hook_url` proxy URL)  
+- [~] Binary file **PUT** / download still use curl `hook_process` (not `hook_url`)  
 
 ---
 
@@ -25,9 +26,10 @@
 
 - [x] SlackTS / SlackUser / SlackChannel / SlackSubteam  
 - [x] Workspace stable `id` vs display `name`  
-- [x] Custom emoji map via **`emoji.list`** (+ refresh on `emoji_changed`)  
+- [x] Custom emoji map via **`emoji.list`** (+ **refresh-only** on `emoji_changed`; no re-bootstrap)  
 - [~] Bots — `bots.list` optional (often unavailable on xoxp)  
 - [~] SlackMessage — list model; edit not in-place line rewrite  
+- [x] Reaction list maintained on RTM add/remove (notice lines; no in-place rewrite)  
 
 ---
 
@@ -35,22 +37,25 @@
 
 - [x] Server + child hierarchy, localvars  
 - [x] Lazy history + serial queue; members on focus  
-- [x] Thread buffers + replies  
+- [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe), not every live reply  
 - [x] Buflist trigger includes `weeslack` (export conf)  
 - [~] Buffer close keeps model (by design)  
+- [x] `short_buffer_names` — `#channel` vs `team.#channel`  
 
 ---
 
 ## Phase 4: Message Handling
 
-- [x] Live + history; tags include `slack_ts_<ts>`  
-- [x] Reactions + react/unreact commands  
-- [x] Typing, mentions, mute tags, read markers  
+- [x] Live + history; tags include `slack_ts_<ts>`; `localvar_slack_timestamp` + `last_message_ts`  
+- [x] Reactions + react/unreact commands (+ model update)  
+- [x] Typing (title indicator), mentions (`<@U>`, `<!here>`, `<!subteam^…>`), mute tags, read markers  
 - [x] Emoji shortcodes + custom map + `emoji_render_mode`  
-- [x] Bold/italic honor `render_bold_as` / `render_italic_as`; safer `_italic_` boundaries  
-- [x] Thread-in-channel uses `thread_broadcast_prefix`  
+- [x] Bold/italic/strikethrough honor config (`render_*_as`)  
+- [x] Thread-in-channel uses `thread_broadcast_prefix` (also when no thread buffer open)  
 - [~] Edit/delete — notice lines (WeeChat has no public line-edit API)  
-- [~] Files — display + **`/cslack download <url>`** to `look.download_path`  
+- [~] Files — display + **`/cslack download <url>`** to `look.download_path` (`weechat_mkdir_parents`)  
+- [x] Join/leave show resolved names, not raw U… ids  
+- [x] `colorize_private_chats` gates nick color on DM/MPDM  
 
 ---
 
@@ -67,6 +72,7 @@
 
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
+- [x] **`linkarchive`** without args uses last printed message ts  
 - [~] subscribe = local thread notify only  
 
 ---
@@ -82,16 +88,16 @@
 
 ### Used
 
-- [x] token, emoji_render_mode, typing indicator, thread_messages_in_channel  
-- [x] thread_broadcast_prefix, render_bold_as, render_italic_as  
-- [x] **download_path**  
+- [x] token, emoji_render_mode, typing indicator (title), thread_messages_in_channel  
+- [x] thread_broadcast_prefix, render_bold_as / render_italic_as / **render_strikethrough_as**  
+- [x] **download_path**, **short_buffer_names**, **colorize_private_chats**  
 - [x] color options (typing/deleted/edited/thread/muted)  
+- [x] `color.thread_suffix` = `multiple` uses nick color for reply count suffix  
 
-### Still light / unused
+### Still light
 
-- [~] `short_buffer_names` — short names always set today  
-- [~] `colorize_private_chats` — nicks already colored; option not a hard gate  
-- [ ] `render_strikethrough_as` — still hardcoded red strike styling  
+- [~] History / members single-page only (rate-limit safe; no cursor pagination)  
+- [~] Stars / search list polish (raw ids, caps)  
 
 ---
 
@@ -107,7 +113,7 @@
 ## Phase 10: RTM
 
 - [x] Core events  
-- [x] emoji_changed → re-fetch emoji.list  
+- [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
 - [x] Rate-limit + auth messaging  
 
 ---
@@ -121,6 +127,7 @@ rtm.connect
  → bootstrap quiet ~8s (buffer_switch ignores history/members)
  → user focuses a buffer → history (slow lane) + members once
  → /cslack loadhistory forces re-fetch
+ → emoji_changed → emoji.list only (no conversations.list)
 ```
 
 **Do not** reload/connect while Slack is still cooling from earlier storms.
@@ -133,14 +140,20 @@ rtm.connect
 2. Full custom-emoji image rendering in TUI (URLs only)  
 3. Real Slack slash-command protocol for user tokens  
 4. Multi-workspace UI beyond one `default` id  
+5. Auto-open every thread on live reply (rejected — rate-limit / buffer storm)  
 
 ---
 
-## New commands (this pass)
+## Gap-fix notes (2026-07-20)
 
-| Command | Action |
-|---------|--------|
-| `/cslack download <url>` | Auth download to `weeslack.look.download_path` |
-| `/cslack stars` | List stars |
-| `/cslack star <ts>` | Star message |
-| `/cslack unstar <ts>` | Unstar message |
+Prior TODO marked many items complete while code still had:
+
+| Issue | Fix |
+|-------|-----|
+| `emoji_changed` re-chained full bootstrap | emoji cb: bootstrap only when `user_data` set |
+| Every thread reply opened a buffer + `fetch_replies` | open only if subscribed / explicit `/cslack thread` |
+| `linkarchive` read never-set localvar | set `localvar_slack_timestamp` + `channel->last_message_ts` on print |
+| Dead config: short names, private color, strikethrough | wired |
+| HTTP ignored proxy | `slack_http_apply_proxy` from `proxy_curl` |
+| Reaction model updated from wrong JSON | `slack_message_reaction_add/remove` |
+| `header=1` broke JSON parse | removed earlier (connect fix) |

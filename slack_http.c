@@ -272,6 +272,74 @@ slack_http_q_pop_ready(struct t_slack_http_request **head,
     return NULL;
 }
 
+/* Build a curl proxy URL from weechat.network.proxy_curl + weechat.proxy.* */
+static void
+slack_http_apply_proxy(struct t_hashtable *options)
+{
+    struct t_config_option *opt;
+    const char *name, *type, *address, *username, *password;
+    int port;
+    char proxy_url[512];
+    char key[128];
+    const char *scheme = "http";
+
+    if (!options)
+        return;
+
+    opt = weechat_config_get("weechat.network.proxy_curl");
+    if (!opt)
+        return;
+    name = weechat_config_string(opt);
+    if (!name || !name[0])
+        return;
+
+    snprintf(key, sizeof(key), "weechat.proxy.%s.address", name);
+    opt = weechat_config_get(key);
+    address = opt ? weechat_config_string(opt) : NULL;
+    if (!address || !address[0])
+        return;
+
+    snprintf(key, sizeof(key), "weechat.proxy.%s.port", name);
+    opt = weechat_config_get(key);
+    port = opt ? weechat_config_integer(opt) : 0;
+
+    snprintf(key, sizeof(key), "weechat.proxy.%s.type", name);
+    opt = weechat_config_get(key);
+    type = opt ? weechat_config_string(opt) : NULL;
+    if (type && type[0])
+    {
+        if (weechat_strcasecmp(type, "socks4") == 0)
+            scheme = "socks4";
+        else if (weechat_strcasecmp(type, "socks5") == 0)
+            scheme = "socks5";
+        else if (weechat_strcasecmp(type, "http") == 0)
+            scheme = "http";
+    }
+
+    snprintf(key, sizeof(key), "weechat.proxy.%s.username", name);
+    opt = weechat_config_get(key);
+    username = opt ? weechat_config_string(opt) : NULL;
+
+    snprintf(key, sizeof(key), "weechat.proxy.%s.password", name);
+    opt = weechat_config_get(key);
+    password = opt ? weechat_config_string(opt) : NULL;
+
+    if (username && username[0])
+    {
+        if (password && password[0])
+            snprintf(proxy_url, sizeof(proxy_url), "%s://%s:%s@%s:%d",
+                     scheme, username, password, address, port > 0 ? port : 1080);
+        else
+            snprintf(proxy_url, sizeof(proxy_url), "%s://%s@%s:%d",
+                     scheme, username, address, port > 0 ? port : 1080);
+    }
+    else
+        snprintf(proxy_url, sizeof(proxy_url), "%s://%s:%d",
+                 scheme, address, port > 0 ? port : 1080);
+
+    weechat_hashtable_set(options, "proxy", proxy_url);
+}
+
 static struct t_hashtable *
 slack_http_build_options(struct t_weeslack_workspace *workspace,
                          struct t_slack_http_request *request)
@@ -307,7 +375,9 @@ slack_http_build_options(struct t_weeslack_workspace *workspace,
                  workspace->token);
     }
     weechat_hashtable_set(options, "httpheader", httpheader);
-    weechat_hashtable_set(options, "ipresolve", "V4");
+    /* WeeChat curl option constants are lowercase (see plugin API docs). */
+    weechat_hashtable_set(options, "ipresolve", "v4");
+    slack_http_apply_proxy(options);
 
     if (request && request->use_post && request->postfields)
     {

@@ -15,6 +15,12 @@ static char *slack_event_render_formatting(const char *text);
 static char *slack_event_format_files(struct json_object *msg_json);
 static char *slack_event_format_attachments(struct json_object *msg_json);
 static char *slack_event_apply_emoji_mode(const char *text);
+static char *slack_event_format_user(struct t_slack_user *user,
+                                     const char *fallback_id,
+                                     struct t_slack_channel *channel);
+static void slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
+                                 int return_code, const char *output,
+                                 void *user_data);
 /* defined later in bootstrap chain */
 void slack_event_fetch_emoji(struct t_weeslack_workspace *workspace);
 
@@ -291,12 +297,24 @@ slack_event_apply_emoji_mode(const char *text)
 }
 
 static char *
-slack_event_format_user(struct t_slack_user *user, const char *fallback_id)
+slack_event_format_user(struct t_slack_user *user, const char *fallback_id,
+                        struct t_slack_channel *channel)
 {
     const char *name = "unknown";
     const char *color = "default";
     char hex_color[16];
     struct t_slack_bot *bot = NULL;
+    int is_private = 0;
+    int colorize = 1;
+
+    if (channel &&
+        (channel->type == SLACK_CHANNEL_TYPE_DM ||
+         channel->type == SLACK_CHANNEL_TYPE_MPDM))
+        is_private = 1;
+
+    if (is_private &&
+        !weechat_config_boolean(weeslack_config.colorize_private_chats))
+        colorize = 0;
 
     if (user)
     {
@@ -306,13 +324,16 @@ slack_event_format_user(struct t_slack_user *user, const char *fallback_id)
             name = user->real_name;
         else if (user->name && user->name[0])
             name = user->name;
-        color = slack_user_get_color(user);
-        if (color && color[0] && color[0] != '|' &&
-            strspn(color, "0123456789abcdefABCDEF") == strlen(color) &&
-            (strlen(color) == 6 || strlen(color) == 3))
+        if (colorize)
         {
-            snprintf(hex_color, sizeof(hex_color), "|#%s", color);
-            color = hex_color;
+            color = slack_user_get_color(user);
+            if (color && color[0] && color[0] != '|' &&
+                strspn(color, "0123456789abcdefABCDEF") == strlen(color) &&
+                (strlen(color) == 6 || strlen(color) == 3))
+            {
+                snprintf(hex_color, sizeof(hex_color), "|#%s", color);
+                color = hex_color;
+            }
         }
     }
     else if (fallback_id && fallback_id[0])
@@ -488,10 +509,12 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     {
         if (channel->buffer && user_id)
         {
+            struct t_slack_user *ju = slack_user_search(user_id);
+            const char *jname = ju ? slack_user_best_name(ju) : user_id;
             weechat_printf(channel->buffer,
                             "%s--> %s has joined%s",
                             weechat_color("green"),
-                            user_id,
+                            jname ? jname : user_id,
                             weechat_color("reset"));
         }
         return;
@@ -501,10 +524,12 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     {
         if (channel->buffer && user_id)
         {
+            struct t_slack_user *lu = slack_user_search(user_id);
+            const char *lname = lu ? slack_user_best_name(lu) : user_id;
             weechat_printf(channel->buffer,
                             "%s<-- %s has left%s",
                             weechat_color("red"),
-                            user_id,
+                            lname ? lname : user_id,
                             weechat_color("reset"));
         }
         return;
@@ -536,20 +561,29 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             thread = slack_thread_channel_create(channel, thread_ts, topic_buf);
         }
 
-        if (thread && !thread->buffer)
+        /*
+         * Do not auto-open a buffer for every live reply — that storms
+         * buffers + replies fetches. Open only when:
+         *  - the thread buffer is already open, or
+         *  - the user subscribed (/cslack subscribe), or
+         *  - this is history for an already-open thread (handled by fetch_replies).
+         * Explicit open: /cslack thread <ts>.
+         */
+        if (thread && !thread->buffer && thread->is_subscribed)
         {
             slack_buffer_new(workspace, thread);
-            if (thread->is_subscribed)
             {
-                struct t_slack_buffer *tb = slack_buffer_search_by_channel(thread->id);
+                struct t_slack_buffer *tb =
+                    slack_buffer_search_by_channel(thread->id);
                 if (tb)
                     weechat_buffer_set(tb->buffer, "notify", "highlight");
             }
-            slack_event_fetch_replies(workspace, thread);
+            if (!history)
+                slack_event_fetch_replies(workspace, thread);
         }
 
-        /* default: replies live in the thread buffer only */
-        if (thread && !show_in_parent)
+        /* Prefer open thread buffer when not broadcasting into parent */
+        if (thread && thread->buffer && !show_in_parent)
             display_channel = thread;
         else
             display_channel = channel;
@@ -571,7 +605,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         {
             int rc = json_object_get_int(reply_count_obj);
             struct t_slack_user *user = user_id ? slack_user_search(user_id) : NULL;
-            char *nick_str = slack_event_format_user(user, user_id);
+            char *nick_str = slack_event_format_user(user, user_id, channel);
             char *formatted_text = slack_event_render_formatting(text);
             char *emoji_text = slack_event_apply_emoji_mode(formatted_text);
             char *formatted = slack_event_format_mentions(workspace, emoji_text, channel);
@@ -579,8 +613,22 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             char *ts_tag = slack_ts_to_string(ts);
             const char *thread_color = weechat_config_string(
                 weeslack_config.color_thread_suffix);
-            if (!thread_color || !thread_color[0])
-                thread_color = "cyan";
+            const char *suffix_color = "cyan";
+
+            if (thread_color && thread_color[0] &&
+                strcmp(thread_color, "multiple") == 0)
+            {
+                /* reuse nick color already applied in nick_str; use a fixed
+                 * contrast default for the bracket text */
+                if (user)
+                {
+                    const char *uc = slack_user_get_color(user);
+                    if (uc && uc[0])
+                        suffix_color = uc;
+                }
+            }
+            else if (thread_color && thread_color[0])
+                suffix_color = thread_color;
 
             snprintf(tags, sizeof(tags),
                      "%s,slack_ts_%s",
@@ -598,9 +646,17 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                 "%s\t%s  %s[%d replies]%s",
                 nick_str,
                 formatted,
-                weechat_color(thread_color),
+                weechat_color(suffix_color),
                 rc,
                 weechat_color("reset"));
+
+            if (ts_tag)
+            {
+                free(channel->last_message_ts);
+                channel->last_message_ts = strdup(ts_tag);
+                weechat_buffer_set(channel->buffer,
+                                   "localvar_set_slack_timestamp", ts_tag);
+            }
             free(ts_tag);
 
             free(nick_str);
@@ -618,7 +674,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     if (display_channel->buffer)
     {
         struct t_slack_user *user = user_id ? slack_user_search(user_id) : NULL;
-        char *nick_str = slack_event_format_user(user, user_id);
+        char *nick_str = slack_event_format_user(user, user_id, display_channel);
         char *formatted_text = slack_event_render_formatting(text);
         char *emoji_text = slack_event_apply_emoji_mode(formatted_text);
         char *formatted = slack_event_format_mentions(workspace, emoji_text, channel);
@@ -630,13 +686,14 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         char bcast_buf[64];
 
         if (thread_ts && !is_parent &&
-            display_channel == channel &&
-            weechat_config_boolean(weeslack_config.thread_messages_in_channel))
+            display_channel == channel)
         {
             const char *pfx = weechat_config_string(
                 weeslack_config.thread_broadcast_prefix);
             if (!pfx || !pfx[0])
                 pfx = "thread";
+            /* Prefix when showing a reply in the parent (either by config
+             * or because no dedicated thread buffer is open). */
             snprintf(bcast_buf, sizeof(bcast_buf), " %s[%s]%s",
                      weechat_color("cyan"), pfx, weechat_color("reset"));
             bcast = bcast_buf;
@@ -659,6 +716,23 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             nick_str,
             formatted,
             bcast);
+
+        if (ts_tag)
+        {
+            free(display_channel->last_message_ts);
+            display_channel->last_message_ts = strdup(ts_tag);
+            weechat_buffer_set(display_channel->buffer,
+                               "localvar_set_slack_timestamp", ts_tag);
+            /* also update parent when displaying a reply there */
+            if (display_channel != channel && channel)
+            {
+                free(channel->last_message_ts);
+                channel->last_message_ts = strdup(ts_tag);
+                if (channel->buffer)
+                    weechat_buffer_set(channel->buffer,
+                                       "localvar_set_slack_timestamp", ts_tag);
+            }
+        }
         free(ts_tag);
 
         if (files && files[0])
@@ -952,13 +1026,12 @@ slack_event_handle_reaction(struct t_weeslack_workspace *workspace,
 
     SlackTS ts = slack_ts_new(ts_str);
     struct t_slack_message *msg = slack_message_search(channel->messages, ts);
-    if (msg)
-        slack_message_update(msg, item_obj);
 
     struct json_object *name_obj, *user_obj;
     const char *reaction_name = "";
     const char *reaction_user_id = "";
     const char *who = "?";
+    int removed = 0;
 
     if (json_object_object_get_ex(json, "reaction", &name_obj))
         reaction_name = json_object_get_string(name_obj);
@@ -977,13 +1050,25 @@ slack_event_handle_reaction(struct t_weeslack_workspace *workspace,
     if (json_object_object_get_ex(json, "type", &type_obj))
         type_str = json_object_get_string(type_obj);
 
+    removed = (type_str && strcmp(type_str, "reaction_removed") == 0);
+
+    /* Maintain reaction list on the message model (item is not a message JSON). */
+    if (msg && reaction_name && reaction_name[0] &&
+        reaction_user_id && reaction_user_id[0])
+    {
+        if (removed)
+            slack_message_reaction_remove(msg, reaction_name, reaction_user_id);
+        else
+            slack_message_reaction_add(msg, reaction_name, reaction_user_id);
+    }
+
     weechat_printf_date_tags(
         channel->buffer,
         ts.sec,
         "no_highlight,notify_none,slack_reaction",
         "%s%s:%s: by %s%s",
         weechat_color("blue"),
-        (strcmp(type_str, "reaction_removed") == 0) ? "-" : "+",
+        removed ? "-" : "+",
         reaction_name,
         who,
         weechat_color("reset"));
@@ -1045,8 +1130,16 @@ slack_event_render_formatting(const char *text)
             const char *end = strchr(src + 1, '~');
             if (end)
             {
+                const char *style = weechat_config_string(
+                    weeslack_config.render_strikethrough_as);
+                /* "weechat" / empty → red; "irc" → lightred (common IRC map);
+                 * any other value is treated as a WeeChat color/attr name. */
+                if (!style || !style[0] || strcmp(style, "weechat") == 0)
+                    style = "red";
+                else if (strcmp(style, "irc") == 0)
+                    style = "lightred";
                 dst += sprintf(dst, "%s%.*s%s",
-                               weechat_color("red"),
+                               weechat_color(style),
                                (int)(end - (src + 1)), src + 1,
                                weechat_color("reset"));
                 src = end + 1;
@@ -1314,44 +1407,120 @@ slack_event_format_mentions(struct t_weeslack_workspace *workspace,
     if (!text)
         return strdup("");
 
-    /* for now, just highlight @here, @channel, @everyone and user IDs */
+    /* Highlight <@U…>, <!here>, <!channel>, <!everyone>, <!subteam^S…|name>,
+     * and plain @here/@channel/@everyone text. */
     size_t len = strlen(text);
-    char *result = malloc(len * 2 + 1);
+    char *result = malloc(len * 4 + 64);
     if (!result)
         return strdup(text);
 
     const char *src = text;
     char *dst = result;
+    char *dst_end = result + len * 4 + 63;
 
-    while (*src)
+    while (*src && dst + 32 < dst_end)
     {
         if (src[0] == '<' && src[1] == '@')
         {
-            /* user mention like <@U12345> */
+            /* user mention like <@U12345> or <@U12345|label> */
             const char *end = strchr(src + 2, '>');
             if (end)
             {
                 size_t id_len = end - (src + 2);
                 char user_id[64];
+                const char *bar;
                 if (id_len < sizeof(user_id))
                 {
                     memcpy(user_id, src + 2, id_len);
                     user_id[id_len] = '\0';
+                    bar = strchr(user_id, '|');
+                    if (bar)
+                        *((char *)bar) = '\0';
 
                     struct t_slack_user *user = slack_user_search(user_id);
                     const char *name = user
                         ? (user->display_name && user->display_name[0]
                            ? user->display_name : user->name)
-                        : user_id;
+                        : (bar ? bar + 1 : user_id);
                     const char *color = user ? slack_user_get_color(user) : "default";
 
-                    dst += sprintf(dst, "%s@%s%s",
-                                   weechat_color(color),
-                                   name,
-                                   weechat_color("reset"));
+                    dst += snprintf(dst, (size_t)(dst_end - dst), "%s@%s%s",
+                                    weechat_color(color),
+                                    name,
+                                    weechat_color("reset"));
                     src = end + 1;
                     continue;
                 }
+            }
+        }
+
+        /* Slack special mentions: <!here> <!channel> <!everyone>
+         * and <!subteam^S123|handle> */
+        if (src[0] == '<' && src[1] == '!')
+        {
+            const char *end = strchr(src + 2, '>');
+            if (end)
+            {
+                const char *body = src + 2;
+                size_t blen = (size_t)(end - body);
+                const char *label = "mention";
+                char label_buf[128];
+
+                if (blen == 4 && memcmp(body, "here", 4) == 0)
+                    label = "here";
+                else if (blen == 7 && memcmp(body, "channel", 7) == 0)
+                    label = "channel";
+                else if (blen == 8 && memcmp(body, "everyone", 8) == 0)
+                    label = "everyone";
+                else if (blen > 8 && memcmp(body, "subteam^", 8) == 0)
+                {
+                    const char *bar = memchr(body, '|', blen);
+                    const char *sid = body + 8;
+                    size_t sid_len;
+                    char sub_id[64];
+                    struct t_slack_subteam *st;
+
+                    if (bar)
+                    {
+                        size_t l_len = (size_t)(end - (bar + 1));
+                        if (l_len >= sizeof(label_buf))
+                            l_len = sizeof(label_buf) - 1;
+                        memcpy(label_buf, bar + 1, l_len);
+                        label_buf[l_len] = '\0';
+                        label = label_buf;
+                        sid_len = (size_t)(bar - sid);
+                    }
+                    else
+                    {
+                        sid_len = blen - 8;
+                        label = label_buf;
+                        label_buf[0] = '\0';
+                    }
+                    if (sid_len >= sizeof(sub_id))
+                        sid_len = sizeof(sub_id) - 1;
+                    memcpy(sub_id, sid, sid_len);
+                    sub_id[sid_len] = '\0';
+                    st = slack_subteam_search(sub_id);
+                    if (st && st->name && st->name[0] && !label_buf[0])
+                        label = st->name;
+                    else if (!label[0])
+                        label = sub_id;
+                }
+                else
+                {
+                    /* unknown special — strip brackets */
+                    size_t copy = blen < sizeof(label_buf) - 1 ? blen : sizeof(label_buf) - 1;
+                    memcpy(label_buf, body, copy);
+                    label_buf[copy] = '\0';
+                    label = label_buf;
+                }
+
+                dst += snprintf(dst, (size_t)(dst_end - dst), "%s@%s%s",
+                                weechat_color("yellow"),
+                                label,
+                                weechat_color("reset"));
+                src = end + 1;
+                continue;
             }
         }
 
@@ -1362,27 +1531,27 @@ slack_event_format_mentions(struct t_weeslack_workspace *workspace,
             if (remaining >= 5 && memcmp(src, "@here", 5) == 0 &&
                 (src[5] == '\0' || src[5] == ' ' || src[5] == ','))
             {
-                dst += sprintf(dst, "%s@here%s",
-                               weechat_color("yellow"),
-                               weechat_color("reset"));
+                dst += snprintf(dst, (size_t)(dst_end - dst), "%s@here%s",
+                                weechat_color("yellow"),
+                                weechat_color("reset"));
                 src += 5;
                 continue;
             }
             if (remaining >= 8 && memcmp(src, "@channel", 8) == 0 &&
                 (src[8] == '\0' || src[8] == ' ' || src[8] == ','))
             {
-                dst += sprintf(dst, "%s@channel%s",
-                               weechat_color("yellow"),
-                               weechat_color("reset"));
+                dst += snprintf(dst, (size_t)(dst_end - dst), "%s@channel%s",
+                                weechat_color("yellow"),
+                                weechat_color("reset"));
                 src += 8;
                 continue;
             }
             if (remaining >= 9 && memcmp(src, "@everyone", 9) == 0 &&
                 (src[9] == '\0' || src[9] == ' ' || src[9] == ','))
             {
-                dst += sprintf(dst, "%s@everyone%s",
-                               weechat_color("yellow"),
-                               weechat_color("reset"));
+                dst += snprintf(dst, (size_t)(dst_end - dst), "%s@everyone%s",
+                                weechat_color("yellow"),
+                                weechat_color("reset"));
                 src += 9;
                 continue;
             }
@@ -1395,8 +1564,11 @@ slack_event_format_mentions(struct t_weeslack_workspace *workspace,
             if (end && (end - src) < 32)
             {
                 /* skip emoji shortcodes for now (just display raw) */
-                memcpy(dst, src, end - src + 1);
-                dst += end - src + 1;
+                size_t n = (size_t)(end - src + 1);
+                if (dst + n >= dst_end)
+                    break;
+                memcpy(dst, src, n);
+                dst += n;
                 src = end + 1;
                 continue;
             }
@@ -1829,7 +2001,10 @@ slack_event_bots_cb(struct t_weeslack_workspace *workspace,
         }
     }
 
-    slack_event_fetch_emoji(workspace);
+    /* Bootstrap path: emoji.list then usergroups → channels (via non-NULL
+     * user_data on the emoji callback). */
+    slack_http_request_new(workspace, "emoji.list", NULL,
+                           slack_event_emoji_cb, (void *)1);
 }
 
 void
@@ -1848,7 +2023,10 @@ slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
                      int return_code, const char *output,
                      void *user_data)
 {
-    (void) user_data;
+    /* user_data non-NULL = continue connect bootstrap (usergroups → channels).
+     * emoji_changed / manual refresh must pass NULL so we do not re-list
+     * conversations and recreate buffers. */
+    int bootstrap = (user_data != NULL);
 
     if (return_code == 0 && output)
     {
@@ -1886,7 +2064,8 @@ slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
         }
     }
 
-    slack_event_fetch_usergroups(workspace);
+    if (bootstrap)
+        slack_event_fetch_usergroups(workspace);
 }
 
 void
@@ -1894,6 +2073,7 @@ slack_event_fetch_emoji(struct t_weeslack_workspace *workspace)
 {
     if (!workspace)
         return;
+    /* Refresh only — do not re-enter connect bootstrap. */
     slack_http_request_new(workspace, "emoji.list", NULL,
                            slack_event_emoji_cb, NULL);
 }
@@ -3330,15 +3510,35 @@ slack_event_download_file(struct t_weeslack_workspace *workspace,
                  home ? home : "/tmp");
     }
 
-    {
-        char cmd[640];
-        snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir);
-        system(cmd);
-    }
+    /* Avoid system("mkdir -p …") — config path must not go through a shell. */
+    weechat_mkdir_parents(dir, 0755);
 
     base = strrchr(url, '/');
     base = base ? base + 1 : "download.bin";
-    snprintf(path, sizeof(path), "%s/%s", dir, base);
+    /* strip query string from basename */
+    {
+        char base_buf[256];
+        const char *q = strchr(base, '?');
+        size_t blen = q ? (size_t)(q - base) : strlen(base);
+        if (blen == 0)
+        {
+            snprintf(base_buf, sizeof(base_buf), "download.bin");
+        }
+        else
+        {
+            if (blen >= sizeof(base_buf))
+                blen = sizeof(base_buf) - 1;
+            memcpy(base_buf, base, blen);
+            base_buf[blen] = '\0';
+            /* strip unsafe path chars */
+            for (char *p = base_buf; *p; p++)
+            {
+                if (*p == '/' || *p == '\\' || *p == '\0')
+                    *p = '_';
+            }
+        }
+        snprintf(path, sizeof(path), "%s/%s", dir, base_buf);
+    }
 
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx)

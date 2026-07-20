@@ -137,6 +137,13 @@ extern void slack_message_update(struct t_slack_message *msg,
                                  struct json_object *json);
 extern struct t_slack_message *slack_message_prepend(struct t_slack_message *list,
                                                       struct t_slack_message *msg);
+/* RTM reaction_added / reaction_removed — update in-memory reaction list */
+extern void slack_message_reaction_add(struct t_slack_message *msg,
+                                       const char *name,
+                                       const char *user_id);
+extern void slack_message_reaction_remove(struct t_slack_message *msg,
+                                          const char *name,
+                                          const char *user_id);
 
 /* ---- SlackChannel ---- */
 
@@ -167,6 +174,8 @@ struct t_slack_channel
     int history_retries;
     int members_loaded;
     SlackTS last_read;
+    /* last displayed message ts (string form) for /cslack linkarchive */
+    char *last_message_ts;
     struct t_gui_buffer *buffer;
     struct t_slack_message *messages;
     /* typing indicator: clear hook + name currently typing */

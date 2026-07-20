@@ -337,13 +337,32 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
 
         slack_buffer_set_common_localvars(sbuf->buffer, workspace, type);
 
-        if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
-            channel->type == SLACK_CHANNEL_TYPE_GROUP)
-            snprintf(short_name, sizeof(short_name), "#%s",
-                     channel->name ? channel->name : channel->id);
-        else
-            snprintf(short_name, sizeof(short_name), "%s",
-                     channel->name ? channel->name : channel->id);
+        {
+            const char *ch_name = channel->name ? channel->name : channel->id;
+            const char *team = workspace->name ? workspace->name : workspace->id;
+            int use_short = weechat_config_boolean(
+                weeslack_config.short_buffer_names);
+
+            if (use_short)
+            {
+                if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
+                    channel->type == SLACK_CHANNEL_TYPE_GROUP)
+                    snprintf(short_name, sizeof(short_name), "#%s", ch_name);
+                else
+                    snprintf(short_name, sizeof(short_name), "%s", ch_name);
+            }
+            else
+            {
+                /* longer short_name: team.#channel (full_name stays hierarchical) */
+                if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
+                    channel->type == SLACK_CHANNEL_TYPE_GROUP)
+                    snprintf(short_name, sizeof(short_name), "%s.#%s",
+                             team ? team : "slack", ch_name);
+                else
+                    snprintf(short_name, sizeof(short_name), "%s.%s",
+                             team ? team : "slack", ch_name);
+            }
+        }
 
         weechat_buffer_set(sbuf->buffer, "short_name", short_name);
         weechat_buffer_set(sbuf->buffer, "localvar_set_channel",

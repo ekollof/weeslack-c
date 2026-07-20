@@ -15,7 +15,7 @@
 WEECHAT_PLUGIN_NAME("weeslack")
 WEECHAT_PLUGIN_DESCRIPTION("Slack protocol support for WeeChat (migrates from wee-slack)")
 WEECHAT_PLUGIN_VERSION("0.1.0")
-WEECHAT_PLUGIN_AUTHOR("")
+WEECHAT_PLUGIN_AUTHOR("Emiel Kollof")
 WEECHAT_PLUGIN_LICENSE("BSD-2-Clause")
 
 struct t_weechat_plugin *weechat_plugin = NULL;
@@ -779,15 +779,23 @@ weeslack_command_cslack(const void *pointer, void *data,
         }
 
         const char *ts = (argc >= 3) ? argv[2] : NULL;
-        if (!ts)
+        if (!ts || !ts[0])
         {
-            /* Use the buffer's localvar_slack_timestamp if available */
+            /* Prefer buffer localvar (set on each printed message), then
+             * channel model last_message_ts. */
             ts = weechat_buffer_get_string(buffer, "localvar_slack_timestamp");
+            if (!ts || !ts[0])
+            {
+                struct t_slack_channel *ch = slack_channel_search(channel_id);
+                if (ch && ch->last_message_ts && ch->last_message_ts[0])
+                    ts = ch->last_message_ts;
+            }
         }
 
-        if (!ts)
+        if (!ts || !ts[0])
         {
-            weechat_printf(buffer, "%sweeslack: usage: /cslack linkarchive <timestamp>",
+            weechat_printf(buffer, "%sweeslack: no message timestamp; "
+                            "usage: /cslack linkarchive [timestamp]",
                             weechat_prefix("error"));
             return WEECHAT_RC_OK;
         }
@@ -1112,7 +1120,7 @@ weeslack_config_init(void)
     weeslack_config.render_bold_as = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "render_bold_as", "string",
-        "How to render bold: 'bold' (WeeChat bold), 'ansi' (ANSI escape)",
+        "WeeChat color/attr name for *bold* text (default: bold)",
         NULL, 0, 0, "bold", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
@@ -1121,7 +1129,7 @@ weeslack_config_init(void)
     weeslack_config.render_italic_as = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "render_italic_as", "string",
-        "How to render italic: 'italic' (WeeChat italic), 'ansi' (ANSI escape)",
+        "WeeChat color/attr name for _italic_ text (default: italic)",
         NULL, 0, 0, "italic", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
@@ -1130,7 +1138,7 @@ weeslack_config_init(void)
     weeslack_config.render_strikethrough_as = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "render_strikethrough_as", "string",
-        "How to render strikethrough: 'weechat' or 'irc'",
+        "Strikethrough style: weechat (red), irc (lightred), or any WeeChat color name",
         NULL, 0, 0, "weechat", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
@@ -1166,7 +1174,7 @@ weeslack_config_init(void)
     weeslack_config.channel_name_typing_indicator = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "channel_name_typing_indicator", "boolean",
-        "Show typing indicator in channel name",
+        "Show typing indicator in the buffer title (not short_name)",
         NULL, 0, 0, "on", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,

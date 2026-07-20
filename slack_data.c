@@ -769,6 +769,92 @@ slack_message_prepend(struct t_slack_message *list, struct t_slack_message *msg)
     return msg;
 }
 
+void
+slack_message_reaction_add(struct t_slack_message *msg,
+                           const char *name,
+                           const char *user_id)
+{
+    SlackReaction *r;
+    int i;
+
+    if (!msg || !name || !name[0] || !user_id || !user_id[0])
+        return;
+
+    for (r = msg->reactions; r; r = r->next)
+    {
+        if (r->name && strcmp(r->name, name) == 0)
+            break;
+    }
+
+    if (!r)
+    {
+        r = slack_reaction_new(name);
+        if (!r)
+            return;
+        r->next = msg->reactions;
+        msg->reactions = r;
+    }
+
+    for (i = 0; i < r->users_count; i++)
+    {
+        if (r->users[i] && strcmp(r->users[i], user_id) == 0)
+            return; /* already present */
+    }
+
+    {
+        char **nu = realloc(r->users, (size_t)(r->users_count + 1) * sizeof(char *));
+        if (!nu)
+            return;
+        r->users = nu;
+        r->users[r->users_count] = strdup(user_id);
+        if (!r->users[r->users_count])
+            return;
+        r->users_count++;
+    }
+}
+
+void
+slack_message_reaction_remove(struct t_slack_message *msg,
+                              const char *name,
+                              const char *user_id)
+{
+    SlackReaction *r, *prev = NULL;
+    int i, j;
+
+    if (!msg || !name || !name[0] || !user_id || !user_id[0])
+        return;
+
+    for (r = msg->reactions; r; prev = r, r = r->next)
+    {
+        if (r->name && strcmp(r->name, name) == 0)
+            break;
+    }
+    if (!r)
+        return;
+
+    for (i = 0; i < r->users_count; i++)
+    {
+        if (r->users[i] && strcmp(r->users[i], user_id) == 0)
+            break;
+    }
+    if (i >= r->users_count)
+        return;
+
+    free(r->users[i]);
+    for (j = i; j < r->users_count - 1; j++)
+        r->users[j] = r->users[j + 1];
+    r->users_count--;
+
+    if (r->users_count == 0)
+    {
+        if (prev)
+            prev->next = r->next;
+        else
+            msg->reactions = r->next;
+        slack_reaction_free(r);
+    }
+}
+
 /* ============================================================
  * SlackChannel
  * ============================================================ */
@@ -861,6 +947,7 @@ slack_channel_free(struct t_slack_channel *channel)
     free(channel->topic);
     free(channel->purpose);
     free(channel->user_id);
+    free(channel->last_message_ts);
     free(channel->typing_user);
     if (channel->typing_clear_hook)
         weechat_unhook(channel->typing_clear_hook);
