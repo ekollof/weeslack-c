@@ -22,6 +22,8 @@ extern struct t_slack_buffer *slack_buffer_new(struct t_weeslack_workspace *work
 extern struct t_slack_buffer *slack_buffer_search(struct t_gui_buffer *buffer);
 extern struct t_slack_buffer *slack_buffer_search_by_channel(const char *channel_id);
 extern void slack_buffer_free(struct t_slack_buffer *sbuf);
+/* Close every weeslack buffer (runs close_cb). Call on plugin unload first. */
+extern void slack_buffer_close_all(void);
 extern void slack_buffer_set_topic(struct t_slack_buffer *sbuf, const char *topic);
 extern void slack_buffer_set_title(struct t_slack_buffer *sbuf, const char *title);
 extern void slack_buffer_print_message(struct t_slack_buffer *sbuf,

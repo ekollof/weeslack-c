@@ -880,10 +880,15 @@ slack_buffer_free(struct t_slack_buffer *sbuf)
         /*
          * Allow focus / loadhistory to re-fetch after the user reopens the
          * buffer (live message, /cslack join|show). Channel model is kept.
+         * On full unload, channels may already be gone — only touch if still
+         * linked (caller must free buffers before channel models).
          */
-        sbuf->channel->history_state = 0;
-        sbuf->channel->members_loaded = 0;
-        sbuf->channel->info_fetched = 0;
+        if (!weeslack_plugin_unloading)
+        {
+            sbuf->channel->history_state = 0;
+            sbuf->channel->members_loaded = 0;
+            sbuf->channel->info_fetched = 0;
+        }
     }
 
     if (sbuf->workspace && sbuf->workspace->server_buffer == sbuf->buffer)
@@ -891,6 +896,25 @@ slack_buffer_free(struct t_slack_buffer *sbuf)
 
     sbuf->buffer = NULL;
     free(sbuf);
+}
+
+void
+slack_buffer_close_all(void)
+{
+    /*
+     * Close WeeChat buffers while models are still valid so close_cb can
+     * free wrappers safely. WeeChat would close them after plugin_end
+     * otherwise, with dangling channel pointers (UAF → abort).
+     */
+    while (slack_buffer_list)
+    {
+        struct t_gui_buffer *buf = slack_buffer_list->buffer;
+
+        if (buf)
+            weechat_buffer_close(buf);
+        else
+            slack_buffer_free(slack_buffer_list);
+    }
 }
 
 void

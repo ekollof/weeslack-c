@@ -78,6 +78,12 @@ clean:
 	rm -f $(OBJS) $(PLUGIN_FILE)
 
 install: $(PLUGIN_FILE)
+	@if pgrep -x weechat >/dev/null 2>&1; then \
+	  echo "NOTE: WeeChat is running. Overwriting a loaded weeslack.so leaves a"; \
+	  echo "      (deleted) mapping — unload first, or restart after install."; \
+	  echo "      Prefer:  /plugin unload weeslack  →  make install  →  /plugin load weeslack"; \
+	  echo "      Do not unload a pre-fix build (curl_global_cleanup / buffer UAF)."; \
+	fi
 	install -d $(DESTDIR)$(LIBDIR)
 	install -m 755 $(PLUGIN_FILE) $(DESTDIR)$(LIBDIR)/
 

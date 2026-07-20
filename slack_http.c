@@ -491,7 +491,11 @@ slack_http_queue_init(void)
 {
     if (g_queue_timer)
         return;
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+    /*
+     * Do NOT call curl_global_init/cleanup here. WeeChat already owns
+     * libcurl global state for hook_url and other plugins; cleaning up on
+     * /plugin unload aborts the process (double free in glibc).
+     */
     g_queue_timer = weechat_hook_timer(
         SLACK_HTTP_TICK_MS, 0, 0,
         &slack_http_queue_timer_cb, NULL, NULL);
@@ -502,13 +506,14 @@ slack_http_queue_shutdown(void)
 {
     struct t_slack_http_request *req, *next;
 
-    slack_http_curl_multi_shutdown();
-
     if (g_queue_timer)
     {
         weechat_unhook(g_queue_timer);
         g_queue_timer = NULL;
     }
+
+    /* Abort multi transfers first (detaches/frees in-flight API reqs). */
+    slack_http_curl_multi_shutdown();
 
     /* free anything still waiting */
     for (req = g_fast_head; req; req = next)
@@ -523,6 +528,11 @@ slack_http_queue_shutdown(void)
     }
     g_fast_head = g_fast_tail = NULL;
     g_slow_head = g_slow_tail = NULL;
+
+    /* Orphan registry entries (should be empty). */
+    while (slack_http_requests)
+        slack_http_request_free(slack_http_requests);
+
     g_inflight = 0;
     g_cooldown_until = 0;
 }
@@ -1594,6 +1604,7 @@ slack_http_curl_multi_shutdown(void)
 {
     struct t_slack_curl_xfer *x, *next;
     struct curl_slist *hdr;
+    struct t_slack_http_request *req;
 
     if (g_curl_timer)
     {
@@ -1612,7 +1623,16 @@ slack_http_curl_multi_shutdown(void)
         /* Do not invoke callbacks on unload — user_data may be mid-free. */
         x->callback = NULL;
         x->body_cb = NULL;
+        req = x->api_req;
         x->api_req = NULL;
+        if (req)
+        {
+            req->in_flight = 0;
+            if (g_inflight > 0)
+                g_inflight--;
+            /* Free without re-entering cancel (api_req already detached). */
+            slack_http_request_free(req);
+        }
         slack_http_curl_xfer_free(x);
     }
     g_curl_xfers = NULL;
@@ -1623,5 +1643,5 @@ slack_http_curl_multi_shutdown(void)
         g_curl_multi = NULL;
     }
     g_curl_still_running = 0;
-    curl_global_cleanup();
+    /* Never curl_global_cleanup() — WeeChat and other plugins own libcurl. */
 }

@@ -4850,6 +4850,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     (void) argv;
 
     weechat_plugin = plugin;
+    weeslack_plugin_unloading = 0;
 
     slack_http_queue_init();
 
@@ -5067,7 +5068,16 @@ weechat_plugin_end(struct t_weechat_plugin *plugin)
     /* Closing buffers on unload must not leave Slack channels remotely. */
     weeslack_plugin_unloading = 1;
 
+    /* Stop network before tearing down buffers/models. */
     slack_http_queue_shutdown();
+
+    /*
+     * Close all plugin buffers while channel models still exist.
+     * WeeChat closes leftover buffers after plugin_end; if we free channels
+     * first, close_cb UAF's channel pointers (glibc abort on free).
+     */
+    slack_buffer_close_all();
+
     slack_event_unload_weemoji();
 
     for (channel = weeslack_channels; channel; channel = next_channel)

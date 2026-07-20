@@ -7987,13 +7987,16 @@ slack_event_download_build_path(char *path, size_t path_size,
     snprintf(dir, sizeof(dir), "%s/weeslack/%s/%s", root, origin_s, date_s);
     weechat_mkdir_parents(dir, 0755);
 
-    snprintf(path, path_size, "%s/%s", dir, name_s);
+    if (snprintf(path, path_size, "%s/%s", dir, name_s) >= (int)path_size)
+        return 0;
 
     /* uniqueness: file, file.1, file.2, … (Xepher-style) */
     suffix = 1;
     while (stat(path, &st) == 0 && suffix < 10000)
     {
-        snprintf(path, path_size, "%s/%s.%d", dir, name_s, suffix);
+        if (snprintf(path, path_size, "%s/%s.%d", dir, name_s, suffix) >=
+            (int)path_size)
+            return 0;
         suffix++;
     }
 
