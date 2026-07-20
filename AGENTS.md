@@ -200,7 +200,9 @@ a session). Prefer small, reviewable commits.
   roughly ≤72 chars. Focus on *what* changed, not a full essay.
 - **Body (after a blank line):** explain *why* / *how* when it is not obvious:
   tradeoffs, rate-limit rationale, user-visible behavior, follow-ups.
-- No AI attribution footers; no “Co-authored-by” unless the user asked.
+- The project already discloses AI assistance (see README). Do not pad every
+  commit with tool/agent footers or “Co-authored-by” noise unless the user
+  asks for that on a given change.
 
 Examples:
 
