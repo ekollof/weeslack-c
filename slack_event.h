@@ -21,6 +21,9 @@ extern void slack_event_handle_reaction(struct t_weeslack_workspace *workspace,
 /* Suppress auto history/members for a few seconds after mass buffer create */
 extern void slack_event_bootstrap_quiet(int seconds);
 extern int slack_event_in_bootstrap_quiet(void);
+/* After quiet period: enqueue history for open member channels if configured. */
+extern void slack_event_schedule_background_history(
+    struct t_weeslack_workspace *workspace);
 
 extern void slack_event_fetch_history(struct t_weeslack_workspace *workspace,
                                        struct t_slack_channel *channel);
@@ -32,10 +35,32 @@ extern void slack_event_fetch_users(struct t_weeslack_workspace *workspace);
 extern void slack_event_fetch_bots(struct t_weeslack_workspace *workspace);
 extern void slack_event_fetch_emoji(struct t_weeslack_workspace *workspace);
 extern void slack_event_fetch_usergroups(struct t_weeslack_workspace *workspace);
+/* List members of a usergroup (handle with or without @, or S… id). */
+extern void slack_event_usergroup_list_users(struct t_weeslack_workspace *workspace,
+                                              const char *handle_or_id,
+                                              struct t_gui_buffer *buffer);
 extern void slack_event_fetch_channels(struct t_weeslack_workspace *workspace);
+/* conversations.info — fill topic/purpose when list omitted them */
+extern void slack_event_fetch_channel_info(struct t_weeslack_workspace *workspace,
+                                            struct t_slack_channel *channel);
+/*
+ * Authenticated download →
+ *   <root>/weeslack/<origin>/<YYYY-MM-DD>/<file>
+ * (Xepher-style; root from look.download_path / $XDG_DOWNLOAD_DIR / ~/Downloads).
+ * origin/preferred_name optional (defaults: "misc" / URL basename).
+ * Existing files get .1 .2 … suffix.
+ */
 extern void slack_event_download_file(struct t_weeslack_workspace *workspace,
                                        const char *url,
-                                       struct t_gui_buffer *buffer);
+                                       struct t_gui_buffer *buffer,
+                                       const char *origin,
+                                       const char *preferred_name);
+/* Auto-save message files when look.auto_download_files is on (live only). */
+extern void slack_event_auto_download_message_files(
+    struct t_weeslack_workspace *workspace,
+    struct t_slack_channel *channel,
+    struct json_object *msg_json,
+    struct t_gui_buffer *buffer);
 extern void slack_event_stars_list(struct t_weeslack_workspace *workspace,
                                     struct t_gui_buffer *buffer);
 extern void slack_event_star_message(struct t_weeslack_workspace *workspace,
@@ -61,7 +86,11 @@ extern void slack_event_send_message(struct t_weeslack_workspace *workspace,
 extern int slack_api_check_error(struct t_weeslack_workspace *workspace,
                                   struct json_object *json,
                                   const char *context);
-extern char *slack_event_replace_emoji(const char *text);
+extern char *slack_event_replace_emoji(struct t_weeslack_workspace *workspace,
+                                        const char *text);
+/* Free users/bots/subteams/custom emoji owned by a workspace (unregister). */
+extern void slack_event_free_workspace_data(
+    struct t_weeslack_workspace *workspace);
 /* Load/unload standard emoji map from weemoji.json (WeeChat data dir). */
 extern void slack_event_load_weemoji(void);
 extern void slack_event_unload_weemoji(void);
@@ -80,8 +109,9 @@ extern char *slack_event_format_mentions(struct t_weeslack_workspace *workspace,
 extern void slack_event_set_topic(struct t_weeslack_workspace *workspace,
                                    const char *channel_id,
                                    const char *topic);
+/* Open DM or MPDM. user_spec is one nick/id or comma-separated list (mpim). */
 extern void slack_event_open_dm(struct t_weeslack_workspace *workspace,
-                                 const char *user_id);
+                                 const char *user_spec);
 extern void slack_event_set_dnd(struct t_weeslack_workspace *workspace,
                                  int enable);
 extern void slack_event_set_presence(struct t_weeslack_workspace *workspace,
@@ -142,5 +172,8 @@ extern void slack_event_refresh_members(struct t_weeslack_workspace *workspace,
                                         struct t_slack_channel *channel);
 /* Apply Slack muted_channels preference after connect. */
 extern void slack_event_load_mute_prefs(struct t_weeslack_workspace *workspace);
+/* Prefs keywords + self nick + member @usergroups → buffer highlight_words */
+extern void slack_event_apply_highlight_words(
+    struct t_weeslack_workspace *workspace);
 
 #endif

@@ -224,6 +224,14 @@ slack_ws_handle_frame(struct t_slack_ws *ws, const char *frame, size_t len)
 
     struct json_object *json;
 
+    /* Raw RTM payload for look.record_events / debug_mode */
+    if (frame && frame[0])
+    {
+        weeslack_record_json(frame);
+        weeslack_debug_at(3, "rtm: %.200s%s", frame,
+                          strlen(frame) > 200 ? "…" : "");
+    }
+
     json = slack_json_decode(frame);
     if (json)
     {

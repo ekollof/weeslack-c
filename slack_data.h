@@ -23,6 +23,9 @@ extern SlackTS slack_ts_zero(void);
 
 /* ---- SlackUser ---- */
 
+/* Forward (workspace ownership for multi-team). */
+struct t_weeslack_workspace;
+
 struct t_slack_user
 {
     char *id;
@@ -39,15 +42,21 @@ struct t_slack_user
     char *status_emoji;
     char *status_text;
     struct json_object *profile_json;
+    /* Owning workspace (set from that team's users.list / RTM). */
+    struct t_weeslack_workspace *workspace;
     struct t_slack_user *next;
     struct t_slack_user *prev;
 };
 
 extern struct t_slack_user *slack_user_new(const char *id, const char *name,
-                                           const char *team_id);
+                                           struct t_weeslack_workspace *workspace);
+/* Prefer workspace match when ws non-NULL; else first id match. */
 extern struct t_slack_user *slack_user_search(const char *id);
+extern struct t_slack_user *slack_user_search_ws(
+    struct t_weeslack_workspace *workspace, const char *id);
 extern struct t_slack_user *slack_user_list_global(void);
 extern void slack_user_free(struct t_slack_user *user);
+extern void slack_user_free_workspace(struct t_weeslack_workspace *workspace);
 extern const char *slack_user_get_color(struct t_slack_user *user);
 /* display_name → real_name → @handle → id; never NULL if user non-NULL */
 extern const char *slack_user_best_name(struct t_slack_user *user);
@@ -65,19 +74,27 @@ struct t_slack_bot
     char *username;
     char *avatar_72;
     int deleted;
+    struct t_weeslack_workspace *workspace;
     struct t_slack_bot *next;
     struct t_slack_bot *prev;
 };
 
-extern struct t_slack_bot *slack_bot_new(const char *id, const char *name);
+extern struct t_slack_bot *slack_bot_new(const char *id, const char *name,
+                                         struct t_weeslack_workspace *workspace);
 extern struct t_slack_bot *slack_bot_search(const char *id);
+extern struct t_slack_bot *slack_bot_search_ws(
+    struct t_weeslack_workspace *workspace, const char *id);
 extern struct t_slack_bot *slack_bot_list_global(void);
 extern void slack_bot_free(struct t_slack_bot *bot);
+extern void slack_bot_free_workspace(struct t_weeslack_workspace *workspace);
 extern void slack_bot_update(struct t_slack_bot *bot, struct json_object *json);
 extern const char *slack_bot_best_name(struct t_slack_bot *bot);
 
 /* resolve user by id, @name, display_name, or real_name (case-insensitive) */
 extern struct t_slack_user *slack_user_search_name(const char *name);
+/* Prefer matches from workspace when non-NULL (multi-team name collisions). */
+extern struct t_slack_user *slack_user_search_name_ws(
+    struct t_weeslack_workspace *workspace, const char *name);
 
 /* ---- SlackSubteam (user groups) ---- */
 
@@ -90,16 +107,27 @@ struct t_slack_subteam
     char **members;
     int members_count;
     int is_usergroup;
+    /* 1 if our user is in this usergroup (for highlights) */
+    int is_member;
+    struct t_weeslack_workspace *workspace;
     struct t_slack_subteam *next;
     struct t_slack_subteam *prev;
 };
 
-extern struct t_slack_subteam *slack_subteam_new(const char *id, const char *name);
+extern struct t_slack_subteam *slack_subteam_new(
+    const char *id, const char *name,
+    struct t_weeslack_workspace *workspace);
 extern struct t_slack_subteam *slack_subteam_search(const char *id);
+extern struct t_slack_subteam *slack_subteam_search_ws(
+    struct t_weeslack_workspace *workspace, const char *id);
 extern struct t_slack_subteam *slack_subteam_list_global(void);
 extern void slack_subteam_free(struct t_slack_subteam *subteam);
+extern void slack_subteam_free_workspace(struct t_weeslack_workspace *workspace);
 extern void slack_subteam_update(struct t_slack_subteam *subteam,
                                  struct json_object *json);
+/* Set is_member from members[] vs my_user_id (or explicit flag). */
+extern void slack_subteam_set_member_flag(struct t_slack_subteam *subteam,
+                                           const char *my_user_id);
 
 /* ---- SlackMessage ---- */
 
@@ -187,11 +215,15 @@ struct t_slack_channel
     int is_member;
     int is_muted;
     int is_subscribed;
+    /* Shared / Slack Connect channel — uses look.shared_name_prefix */
+    int is_shared;
     int unread_count;
     /* 0=not loaded, 1=queued, 2=in flight, 3=done (success or empty) */
     int history_state;
     int history_retries;
     int members_loaded;
+    /* conversations.info fetched (topic/purpose fill-in) */
+    int info_fetched;
     SlackTS last_read;
     /* last displayed message ts (string form) for /cslack linkarchive */
     char *last_message_ts;
@@ -200,17 +232,26 @@ struct t_slack_channel
     /* typing indicator: clear hook + name currently typing */
     struct t_hook *typing_clear_hook;
     char *typing_user;
+    /* multi-team: which workspace owns this channel model (may be NULL) */
+    struct t_weeslack_workspace *workspace;
     struct t_slack_channel *next;
     struct t_slack_channel *prev;
 };
 
 extern struct t_slack_channel *slack_channel_new(const char *id, const char *name,
                                                    enum slack_channel_type type);
+/* Create or update ownership pointer for multi-team cleanup. */
+extern void slack_channel_set_workspace(struct t_slack_channel *channel,
+                                         struct t_weeslack_workspace *workspace);
+/* Free all channel models owned by workspace (after buffers closed). */
+extern void slack_channel_free_workspace(struct t_weeslack_workspace *workspace);
 extern struct t_slack_channel *slack_channel_search(const char *id);
 extern struct t_slack_channel *slack_channel_list_global(void);
 extern void slack_channel_free(struct t_slack_channel *channel);
 extern void slack_channel_update(struct t_slack_channel *channel,
                                  struct json_object *json);
+/* Topic if set, else purpose (wee-slack buffer title). Never empty string. */
+extern const char *slack_channel_display_topic(const struct t_slack_channel *channel);
 extern const char *slack_channel_type_string(enum slack_channel_type type);
 extern struct t_slack_channel *slack_thread_channel_find(struct t_slack_channel *parent,
                                                           const char *thread_ts);

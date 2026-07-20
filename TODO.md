@@ -1,8 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — crash fix (hsignal free), typing throttle,
-thread subscribe API + RTM, slack_typing_notice bar, colorize_attachments,
-shared_name_prefix
+**Last update:** 2026-07-21 — v0.2.0: reconnect, join/show reopen closed
+buffers, live-only auto-reopen, history reset on close
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -20,8 +19,9 @@ shared_name_prefix
   - On 429: **global cooldown** from `Retry-After`, re-queue job (no stampede)  
   - Soft failures: quadratic backoff re-queue  
   - `conversations.mark` is **droppable** under cooldown  
-- [x] Proxy via WeeChat globals — WS, HTTP `hook_url`, **and** curl upload/download (`-x`)  
-- [~] Binary file **PUT** / download still use curl `hook_process` (not `hook_url`); proxy wired  
+- [x] Proxy via WeeChat globals — WS, `hook_url`, **and** libcurl multi  
+- [x] Binary **PUT** (upload) + authenticated **GET** (download) via **libcurl
+      multi** (async; Bearer + cookie; no curl CLI / `hook_process`)  
 
 ---
 
@@ -29,10 +29,12 @@ shared_name_prefix
 
 - [x] SlackTS / SlackUser / SlackChannel / SlackSubteam  
 - [x] Workspace stable `id` vs display `name`  
-- [x] Custom emoji map via **`emoji.list`** (+ **refresh-only** on `emoji_changed`; no re-bootstrap)  
-- [x] Bots — `is_bot` / `is_app_user` registered in bot map; **hidden from nicklist** (wee-slack style)  
+- [x] Custom emoji map via **`emoji.list`** (+ **refresh-only** on `emoji_changed`)  
+- [x] **Multi-workspace model isolation** — users / bots / subteams / custom emoji
+      carry `workspace`; free on `unregister`; name/search prefers current team  
+- [x] Bots — `is_bot` / `is_app_user` registered in bot map; **hidden from nicklist**  
 - [x] SlackMessage — list model + **in-place line rewrite** via `hdata_update`  
-- [x] Reaction list maintained; **rewrites line** on RTM add/remove (notice fallback)  
+- [x] Reaction list maintained; **rewrites line** on RTM add/remove  
 - [x] Message **`$hash` short-ids** (SHA1 of ts, min 3 hex, wee-slack style)  
 
 ---
@@ -41,14 +43,20 @@ shared_name_prefix
 
 - [x] Server + child hierarchy, localvars  
 - [x] Lazy history + serial queue; members on focus  
-- [x] History pagination — multi-page slow queue (`history_fetch_count`, hard page cap)  
-- [x] Members pagination — up to **3×200** on slow queue  
+- [x] History pagination — multi-page slow queue (`history_fetch_count`, page cap)  
+- [x] Members pagination — configurable pages (default 3, hard max **50** ×200)  
 - [x] Unknown members → **`users.info`** (slow, capped); no stub nicks  
 - [x] Nicklist **Here / Away** groups + **`presence_sub`** (RTM); bots purged  
 - [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe)  
-- [x] `/cslack thread` without args → last parent with replies; accepts `$hash`/N/ts  
+- [x] `/cslack thread` without args → last parent with replies; `$hash`/N/ts  
 - [x] Buflist trigger includes `weeslack` (export conf)  
-- [~] Buffer close keeps model (by design)  
+- [x] Buffer close **frees wrapper** (`t_slack_buffer`); channel model kept;
+      history/members state reset so reopen can re-fetch  
+- [x] Live messages **reopen** closed channel buffers; history does not  
+- [x] **`/cslack join` / `show #ch`** reopen member buffers without API join  
+- [x] **`/cslack reconnect [all]`** re-issue `rtm.connect`  
+- [x] **`look.leave_channel_on_buffer_close`** (default off)  
+- [x] **`unread_count_display`** → WeeChat hotlist on buffer create  
 - [x] `short_buffer_names` — `#channel` vs `team.#channel`  
 - [x] Mute prefs from **`users.prefs.get`** applied after channel list  
 
@@ -56,107 +64,67 @@ shared_name_prefix
 
 ## Phase 4: Message Handling
 
-- [x] Live + history; tags include `slack_ts_<ts>`; `localvar_slack_timestamp` + `last_message_ts`  
-- [x] Reactions + react/unreact commands (+ model update)  
-- [x] Reaction **suffixes** on history/live print (`[:name:count]`, own colored)  
-- [x] **`show_reaction_nicks`** + reaction color options  
-- [x] Thread suffix shows **`$hash` + reply count** (wee-slack style)  
+- [x] Live + history; tags include `slack_ts_<ts>`; localvars for timestamps  
+- [x] Reactions + react/unreact; suffixes; `show_reaction_nicks` + colors  
+- [x] Thread suffix **`$hash` + reply count**  
 - [x] **`use_full_names`**, **`external_user_suffix`**  
-- [x] Typing (title indicator), mentions (`<@U>`, `<!here>`, `<!subteam^…>`), mute tags, read markers  
-- [x] Emoji shortcodes + custom map + `emoji_render_mode`  
-- [x] **weemoji.json** from WeeChat data/sharedir (standard unicode map + completion)  
-- [x] Bold/italic/strikethrough honor config (`render_*_as`)  
-- [x] Thread-in-channel uses `thread_broadcast_prefix`  
-- [x] Edit/delete — **in-place** `hdata_update` on `line_data` (wee-slack style; notice fallback)  
-- [x] Input **`s/old/new/[gi]`** / `s///` delete → `chat.update` / `chat.delete`  
-- [x] Input **`+emoji` / `-emoji`** reaction shortcuts on last (or Nth) message  
-- [x] Files — display (size/mime/download URL) + **`/cslack download <url>`**  
-- [x] Message markdown render uses capacity-tracked `snprintf` (no `sprintf`)  
-- [x] Join/leave show resolved names  
-- [x] `colorize_private_chats` gates nick color on DM/MPDM  
-- [x] Blockquotes, Block Kit text fallback, HTML entity unescape  
-- [x] Self-mention → `notify_highlight`  
-- [x] **`colorize_attachments`** (none / prefix / all)  
+- [x] Typing, mentions, mute tags, read markers  
+- [x] Emoji shortcodes + custom map + `emoji_render_mode` + weemoji.json  
+- [x] Custom emoji **images** via `/icat` when enabled (cached)  
+- [x] Bold/italic/strikethrough honor config  
+- [x] Thread-in-channel + `thread_broadcast_prefix`  
+- [x] Edit/delete in-place; input `s///`, `+emoji`/`-emoji`, `//` escape  
+- [x] Input `/cmd` → `chat.command`; files + download  
+- [x] Blockquotes, Block Kit fallback, HTML unescape, attachments colors  
 
 ---
 
 ## Phase 5: Outgoing
 
-- [x] postMessage / threads / reply  
-- [x] Upload pipeline (getUploadURL → PUT → complete); PUT uses proxy when configured  
-- [x] **`/cslack slash /cmd [args]`** → `chat.command` (session token)  
-- [x] Input emoji shortcodes  
-- [x] `/me text` → **`chat.meMessage`**  
-- [x] Outgoing underline/bold IRC codes → Slack markers (`map_underline_to`)  
+- [x] postMessage / threads / reply / upload (libcurl)  
+- [x] **`/cslack slash`**, `/me` → meMessage, underline map  
 
 ---
 
 ## Phase 6: Commands
 
-- [x] Full prior set + workspace-id fix + focused buffer  
-- [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
-- [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
-- [x] **`whois`** (+ live presence), **`join`**, **`leave`/`part`**, **`refresh`**, **`names`**  
-- [x] **`rehistory`** alias for loadhistory; reply/react/thread accept `$hash`  
-- [x] **`status`** profile emoji/text (`users.profile.set`) + `-delete`; legacy dnd/away/active  
-- [x] **`create`** (`conversations.create` [-private]), **`invite`**, **`showmuted`**  
-- [x] **`distracting`** / **`nodistractions`**; **`slash`** → `chat.command`  
-- [x] Cursor/mouse **`$hash` actions** (M/D/L/R/T + right-click)  
-- [x] Stars / search list polish  
-- [x] **`subscribe` / `unsubscribe`** → `subscriptions.thread.add|remove` (+ local notify)  
+- [x] Full set: connect/disconnect/migrate/register/unregister, channels, users,
+      usergroups, history, talk/open, mute, status, create/invite, threads,
+      react, stars, pin, search, download, whois, join/leave, IRC command_run  
+- [x] **`debug`**, **`queue`**, **`version`**, **`info`** (status summary)  
+- [x] Cursor/mouse `$hash` actions  
 
 ---
 
 ## Phase 7: Completions
 
-- [x] Hooks wired to `/cslack`  
-- [x] Nick completion prefers **buffer nicklist**, else all users  
-- [x] Join completion via `%(slack_channels)`  
-- [x] Thread completion offers `$hash` for parents with replies  
+- [x] Nicks (buffer nicklist / workspace-scoped users + `@nick`)  
+- [x] Channels, threads `$hash`, topic, emoji, usergroups  
 
 ---
 
 ## Phase 8: Configuration
 
-### Used
-
-- [x] token, emoji_render_mode, typing indicator (title), thread_messages_in_channel  
-- [x] thread_broadcast_prefix, render_bold_as / render_italic_as / **render_strikethrough_as**  
-- [x] **download_path**, **short_buffer_names**, **colorize_private_chats**  
-- [x] color options (typing/deleted/edited/thread/muted/reaction)  
-- [x] `color.thread_suffix` = `multiple` uses nick color for reply count suffix  
-- [x] **`look.never_away`** — 5‑min timer sets presence `auto` when enabled  
-- [x] **`look.send_typing_notice`** — typing via `input_text_changed` (**≤1 / 4s**)  
-- [x] Bar items **`slack_away`**, **`slack_typing_notice`** (not core `away`)  
-- [x] **`history_fetch_count`**, **`group_name_prefix`**, **`shared_name_prefix`**  
-- [x] **`switch_buffer_on_join`**, **`unhide_buffers_with_activity`**  
-- [x] **`muted_channels_activity`**, **`map_underline_to`**, **`link_previews`**  
-- [x] **`notify_subscribed_threads`**, **`colorize_attachments`**, **`show_reaction_nicks`**  
-- [x] **`use_full_names`**, **`external_user_suffix`**, **`distracting_channels`**  
+- [x] Multi-token, auto_connect, server_aliases, debug/record, background history  
+- [x] **`auto_open_threads`**: `off` | `subscribed` | `all`  
+- [x] download/icat/Xepher layout, shared_name_prefix, leave_on_buffer_close  
+- [x] All major wee-slack look/color options wired  
 
 ---
 
 ## Phase 9: Advanced
 
 - [x] Hdata / infolist  
-- [x] **`/upgrade` auto-reconnect** (timer + token after upgrade read)  
-- [x] stars.list / stars.add / stars.remove  
-- [x] pin / search / permalink / react  
-- [x] ASAN build: `make asan` / `make asan-install` (see Makefile)  
+- [x] `/upgrade` auto-reconnect  
+- [x] ASAN build targets  
+- [x] OAuth register + unregister (token retire beyond wee-slack)  
 
 ---
 
 ## Phase 10: RTM
 
-- [x] Core events + lifecycle (create/rename/archive/leave/delete/join)  
-- [x] `channel_joined` / `im_open` / `im_created` (member vs created semantics)  
-- [x] pin / emoji_changed / dnd / presence / team_join  
-- [x] `me_message`, pin subtypes, channel_name, purpose  
-- [x] RTM `reconnect_url` stored for next WS session  
-- [x] Rate-limit + auth messaging  
-- [x] Reconnect with fresh rtm.connect  
-- [x] `user_change` → DM buffer title from status emoji/text  
-- [x] **`thread_subscribed` / `thread_unsubscribed`**  
+- [x] Core message/lifecycle/presence/pin/emoji/thread subscribe events  
+- [x] Reconnect with fresh rtm.connect; reconnect_url stored  
 
 ---
 
@@ -164,79 +132,48 @@ shared_name_prefix
 
 ```
 rtm.connect
- → users.list (is_bot → bot map + hide from nicklist) / bots.list / emoji.list / usergroups.list
+ → users.list / bots.list / emoji.list / usergroups.list
  → conversations.list → create buffers (NO history, NO members)
- → users.prefs.get → apply muted_channels
- → bootstrap quiet ~8s (buffer_switch ignores history/members)
- → user focuses a buffer → history (slow, multi-page) + members (≤3×200)
-      unknown members → users.info (slow, capped); bots never nicklisted
+ → users.prefs.get → muted_channels
+ → bootstrap quiet ~8s
+ → focus → history (slow) + members
  → /cslack loadhistory | names | refresh as needed
  → emoji_changed → emoji.list only
- → WS drop / goodbye → rtm.connect (fresh URL), no full bootstrap
+ → WS drop → rtm.connect (fresh URL)
 ```
 
-**Do not** reload/connect while Slack is still cooling from earlier storms.  
-**Do not** `make install` over a loaded plugin — unload first or restart.  
-Prefer **process restart** over `/plugin unload|load` when hunting crashes.
+**Do not** reload/connect while Slack is still cooling.  
+**Do not** `make install` over a loaded plugin — unload first.  
+Prefer process restart over unload/load when hunting crashes.
 
 ---
 
-## Intentionally remaining (low ROI / platform limits)
+## Intentionally out of scope / platform limits
 
-1. Full custom-emoji image rendering in TUI (URLs only)  
-2. Multi-workspace UI beyond one `default` id  
-3. Auto-open every thread on live reply / `auto_open_threads` (rate-limit)  
-4. Unlimited history/members pagination (hard caps keep the queue healthy)  
-5. Binary upload via `hook_url` (raw PUT still needs curl/process)  
-6. Background load all history on connect (rate-limit sensitive)  
-7. Full `record_events` debug mode  
-8. `server_aliases` multi-team polish  
-9. Leading `/` still posts as chat when not `/me` or sed/react shortcuts  
+1. **Unlimited** members with no page cap — hard max **50** pages (~10k);
+   higher risks API storms (use `look.members_max_pages`)  
+2. True inline custom emoji **inside** a chat line (TUI); we use `/icat`
+   tiles under the message instead  
+3. Replacing WeeChat’s `hook_url` Web API with pure libcurl for form POSTs
+   (queue + `hook_url` already work; multi is for binary bodies)  
 
 ---
 
-## Gap-fix notes (2026-07-20)
+## Recent fixes (2026-07-21)
 
 | Issue | Fix |
 |-------|-----|
-| `emoji_changed` re-chained full bootstrap | emoji cb: bootstrap only when `user_data` set |
-| Every thread reply opened a buffer + `fetch_replies` | open only if subscribed / explicit `/cslack thread` |
-| Bots in nicklist (Drive, USLACKBOT) | `is_bot`/`is_app_user` + purge; no member stubs; users.info for unknowns |
-| Stale WS reconnect URL | re-issue `rtm.connect` |
-| Dead config options | wired short names / private color / strikethrough |
-| HTTP / curl ignored proxy | `slack_http_*_proxy` helpers |
-| History/members single page | capped multi-page slow queue |
-| No mute from Slack prefs | `users.prefs.get` after channel list |
-| Flat nicklist | Here/Away groups + `nicklist_display_groups=1` |
-| Here/Away stuck on Away | RTM `presence_sub` after hello/users.list |
-| Mute/highlight prefs only on connect | also `pref_change` RTM |
-| Reactions only as notices | also suffix `[:name:n]` on message print |
-| No `reconnect_url` handling | store URL on workspace |
-| `channel_created` opened + forced member | created = model only; join/open separate |
-| DM title stale on status change | `user_change` updates peer DM title |
-| `/cslack status` only dnd/away | also profile emoji/text via `users.profile.set` |
-| No create/invite/showmuted | conversations.create / invite + muted list |
-| Appear away while idle | optional `look.never_away` timer |
-| `/me` posted as plain text | `chat.meMessage` |
-| Edit/delete/reaction only notices | `hdata_update` on line with `slack_ts_*` tag |
-| No s/// message edit | input `s/old/new/[gi]` + `s///` delete via chat API |
-| No $hash message ids | SHA1 short hash like wee-slack hashed_messages |
-| thread required raw ts | optional; default last thread parent; $hash/N |
-| Typing flood on every keystroke | throttle **4s** per channel (wee-slack) |
-| No reaction nicks / colors | show_reaction_nicks + color options |
-| No distracting channel lists | distracting / nodistractions |
-| No chat.command slash | /cslack slash /cmd args |
-| No cursor $hash actions | mouse+cursor hsignals on weeslack buffers |
-| Thread suffix without hash | `[ Thread: $hash Replies: N ]` |
-| Fixed history page size | `history_fetch_count` (capped pages still) |
-| Muted always silent | `muted_channels_activity` modes |
-| Private channels use # | `group_name_prefix` (`&` default) |
-| Always switch on join | gated by `switch_buffer_on_join` |
-| Hidden buffers stay hidden | optional `unhide_buffers_with_activity` |
-| Always show link unfurls | `link_previews` |
-| Underline not mapped on send | `map_underline_to` |
-| **`free(): invalid pointer` on unload** | hsignal `callback_data` must be **NULL** (WeeChat free()s it; no string literals) |
-| Core input bar crash with `(away)` | do **not** register bar item named `away`; use `slack_away` only |
-| Cursor `_buffer` cast | resolve via `_buffer_full_name` + hdata walk |
-| Subscribe local only | also `subscriptions.thread.add|remove` + RTM subscribe events |
-| No typing bar item | `slack_typing_notice` bar item |
+| Upload/download used curl CLI | libcurl multi async |
+| Custom emoji images | `/icat` + cache under `weeslack/emoji/` |
+| Auto-open only subscribed | `auto_open_threads` off/subscribed/all |
+| Multi-ws users mixed | workspace ownership + free on unregister |
+| Buffer close leaked `t_slack_buffer` | free wrapper on close_cb |
+| members hard max 15 | raised to 50 (config) |
+| No status overview | `/cslack info` |
+| Dead curl CLI proxy helper | removed (`hook_process` gone) |
+| Closed buffer stayed gone | live reopen; join/show local reopen; history_state reset |
+| No reconnect command | `/cslack reconnect [all]` |
+| Version | **0.2.0** |
+
+Earlier gap-fix history lives in git; the checklist above is the source of
+truth for parity status.

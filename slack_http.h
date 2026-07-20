@@ -70,9 +70,35 @@ extern int slack_http_body_is_ratelimited(const char *body);
 extern void slack_http_queue_init(void);
 extern void slack_http_queue_shutdown(void);
 
-/* Proxy helpers for hook_url and curl hook_process (caller frees URL). */
+/* Fill buf with queue/cooldown summary (for /cslack queue). Returns buf. */
+extern char *slack_http_queue_status(char *buf, size_t buflen);
+
+/* Proxy URL from WeeChat globals (caller frees). Used by hook_url + libcurl multi. */
 extern char *slack_http_get_proxy_url(void);
-/* Append curl -x <proxy> starting at *arg_index (1-based argN keys). */
-extern void slack_http_curl_add_proxy(struct t_hashtable *options, int *arg_index);
+
+/*
+ * libcurl multi (async, non-blocking via WeeChat timer):
+ * binary PUT for upload, GET for emoji/image cache.
+ * callback: ok=1 on HTTP 2xx, else 0. http_code may be 0 on transport error.
+ */
+typedef void (*t_slack_curl_done_cb)(void *user_data, int ok, long http_code);
+
+/* PUT local file to url (Slack upload_url). Optional Content-Type. */
+extern int slack_http_curl_put_file(const char *url, const char *file_path,
+                                    const char *content_type,
+                                    t_slack_curl_done_cb callback,
+                                    void *user_data);
+
+/* GET url → path (creates parent dirs).
+ * authorization: "Bearer …" or NULL (public CDN).
+ * cookie: raw cookie value (optional "d=…"); NULL if none. */
+extern int slack_http_curl_get_file(const char *url, const char *path,
+                                    const char *authorization,
+                                    const char *cookie,
+                                    t_slack_curl_done_cb callback,
+                                    void *user_data);
+
+/* Cancel all multi transfers (plugin end). */
+extern void slack_http_curl_multi_shutdown(void);
 
 #endif

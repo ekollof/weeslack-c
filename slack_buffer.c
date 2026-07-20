@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <regex.h>
+#include <stdint.h>
 
 #include "weeslack.h"
 #include "slack_buffer.h"
@@ -10,6 +11,12 @@
 #include "slack_event.h"
 
 static struct t_slack_buffer *slack_buffer_list = NULL;
+
+static void slack_buffer_typing_reset(struct t_gui_buffer *buffer);
+static void slack_buffer_typing_set_nick(struct t_gui_buffer *buffer,
+                                         const char *state,
+                                         const char *nick);
+static void slack_buffer_refresh_short_name(struct t_slack_buffer *sbuf);
 
 /*
  * Buffer layout — IRC-style, isolated from python wee-slack:
@@ -85,25 +92,51 @@ slack_buffer_set_common_localvars(struct t_gui_buffer *buffer,
 
     weechat_buffer_set(buffer, "localvar_set_type", type);
     weechat_buffer_set(buffer, "localvar_set_server", team);
+    if (workspace->id && workspace->id[0])
+        weechat_buffer_set(buffer, "localvar_set_slack_workspace_id",
+                           workspace->id);
     /* Keep distinct from python wee-slack (script_name=slack / python.slack.*) */
     weechat_buffer_set(buffer, "localvar_set_no_python_slack", "1");
 }
+
+/* Set in plugin_end so closing buffers on unload does not leave Slack channels. */
+int weeslack_plugin_unloading = 0;
+
+/* free is defined later — close_cb needs it. */
+void slack_buffer_free(struct t_slack_buffer *sbuf);
 
 static int
 slack_buffer_close_cb(const void *pointer, void *data,
                       struct t_gui_buffer *buffer)
 {
     (void) data;
-    (void) buffer;
 
     struct t_slack_buffer *sbuf = (struct t_slack_buffer *)pointer;
 
     if (sbuf)
     {
-        /* keep t_slack_buffer / channel model for API history; clear links */
-        if (sbuf->channel)
-            sbuf->channel->buffer = NULL;
-        sbuf->buffer = NULL;
+        /*
+         * Optional: leave/close channel on Slack when the buffer is closed
+         * (wee-slack destroy_buffer update_remote). Off by default.
+         */
+        if (!weeslack_plugin_unloading &&
+            weechat_config_boolean(weeslack_config.leave_channel_on_buffer_close) &&
+            sbuf->workspace && sbuf->workspace->connected &&
+            sbuf->channel && sbuf->channel->id &&
+            sbuf->channel->type != SLACK_CHANNEL_TYPE_THREAD)
+        {
+            slack_event_leave_channel(sbuf->workspace, sbuf->channel->id);
+        }
+
+        /* Server buffer: drop workspace pointer before free. */
+        if (sbuf->workspace && sbuf->workspace->server_buffer == buffer)
+            sbuf->workspace->server_buffer = NULL;
+
+        /*
+         * Free wrapper; channel/user model stays for reconnect / re-open.
+         * Do not keep a zombie t_slack_buffer in the list (leak + stale search).
+         */
+        slack_buffer_free(sbuf);
     }
 
     return WEECHAT_RC_OK;
@@ -526,11 +559,11 @@ slack_buffer_input_cb(const void *pointer, void *data,
         return WEECHAT_RC_OK;
 
     /* replace emoji shortcodes with unicode before sending */
-    processed = slack_event_replace_emoji(input_data);
+    processed = slack_event_replace_emoji(sbuf->workspace, input_data);
     if (!processed)
         return WEECHAT_RC_OK;
 
-    /* /me action → chat.meMessage (wee-slack style) */
+    /* /me action → chat.meMessage (also handled via hook_command_run) */
     if (strncmp(processed, "/me ", 4) == 0 && processed[4])
     {
         slack_event_send_me_message(sbuf->workspace, channel_id,
@@ -540,35 +573,59 @@ slack_buffer_input_cb(const void *pointer, void *data,
     }
 
     /*
-     * Leading / that is not a WeeChat command: post as chat text
-     * (emoji already expanded). Real Slack slash APIs are app-specific.
+     * wee-slack: "//foo" or " /foo" → strip one leading char so you can post
+     * text that starts with / or a space (unknown /cmds land here when
+     * input_get_unknown_commands is on).
+     *
+     * Single leading /cmd [args] → Slack chat.command (session token).
      */
-    slack_event_send_message(sbuf->workspace,
-                              channel_id,
-                              processed,
-                              thread_ts);
+    {
+        const char *send = processed;
+
+        if (send[0] == '/' && send[1] == '/')
+        {
+            send++;
+            slack_event_send_message(sbuf->workspace, channel_id, send,
+                                      thread_ts);
+        }
+        else if (send[0] == ' ' && send[1] != '\0')
+        {
+            send++;
+            slack_event_send_message(sbuf->workspace, channel_id, send,
+                                      thread_ts);
+        }
+        else if (send[0] == '/' && send[1] && send[1] != ' ')
+        {
+            char cmd[128];
+            const char *sp = strchr(send, ' ');
+            const char *text = "";
+            size_t n;
+
+            if (sp)
+            {
+                n = (size_t)(sp - send);
+                if (n >= sizeof(cmd))
+                    n = sizeof(cmd) - 1;
+                memcpy(cmd, send, n);
+                cmd[n] = '\0';
+                text = sp + 1;
+                while (*text == ' ')
+                    text++;
+            }
+            else
+            {
+                snprintf(cmd, sizeof(cmd), "%s", send);
+            }
+            slack_event_slash_command(sbuf->workspace, channel_id, cmd, text);
+        }
+        else
+        {
+            slack_event_send_message(sbuf->workspace, channel_id, send,
+                                      thread_ts);
+        }
+    }
 
     free(processed);
-
-    return WEECHAT_RC_OK;
-}
-
-static int
-slack_buffer_signal_close_cb(const void *pointer, void *data,
-                              const char *signal, const char *type_data,
-                              void *signal_data)
-{
-    (void) signal;
-    (void) type_data;
-    (void) signal_data;
-
-    struct t_slack_buffer *sbuf = (struct t_slack_buffer *)pointer;
-    struct t_gui_buffer *buffer = (struct t_gui_buffer *)data;
-
-    (void) buffer;
-
-    if (sbuf)
-        sbuf->buffer = NULL;
 
     return WEECHAT_RC_OK;
 }
@@ -620,9 +677,6 @@ slack_buffer_new_server(struct t_weeslack_workspace *workspace)
     }
 
     weechat_buffer_set(sbuf->buffer, "nicklist", "0");
-
-    weechat_hook_signal("buffer_closing",
-                         &slack_buffer_signal_close_cb, sbuf, NULL);
 
     workspace->server_buffer = sbuf->buffer;
 
@@ -697,58 +751,13 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
 
     {
         const char *type = "channel";
-        char short_name[128];
 
         if (channel->type == SLACK_CHANNEL_TYPE_DM ||
             channel->type == SLACK_CHANNEL_TYPE_MPDM)
             type = "private";
 
         slack_buffer_set_common_localvars(sbuf->buffer, workspace, type);
-
-        {
-            const char *ch_name = channel->name ? channel->name : channel->id;
-            const char *team = workspace->name ? workspace->name : workspace->id;
-            int use_short = weechat_config_boolean(
-                weeslack_config.short_buffer_names);
-
-            if (use_short)
-            {
-                if (channel->type == SLACK_CHANNEL_TYPE_GROUP)
-                {
-                    const char *gpfx = weechat_config_string(
-                        weeslack_config.group_name_prefix);
-                    if (!gpfx || !gpfx[0])
-                        gpfx = "&";
-                    snprintf(short_name, sizeof(short_name), "%s%s",
-                             gpfx, ch_name);
-                }
-                else if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL)
-                    snprintf(short_name, sizeof(short_name), "#%s", ch_name);
-                else
-                    snprintf(short_name, sizeof(short_name), "%s", ch_name);
-            }
-            else
-            {
-                /* longer short_name: team.#channel (full_name stays hierarchical) */
-                if (channel->type == SLACK_CHANNEL_TYPE_GROUP)
-                {
-                    const char *gpfx = weechat_config_string(
-                        weeslack_config.group_name_prefix);
-                    if (!gpfx || !gpfx[0])
-                        gpfx = "&";
-                    snprintf(short_name, sizeof(short_name), "%s.%s%s",
-                             team ? team : "slack", gpfx, ch_name);
-                }
-                else if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL)
-                    snprintf(short_name, sizeof(short_name), "%s.#%s",
-                             team ? team : "slack", ch_name);
-                else
-                    snprintf(short_name, sizeof(short_name), "%s.%s",
-                             team ? team : "slack", ch_name);
-            }
-        }
-
-        weechat_buffer_set(sbuf->buffer, "short_name", short_name);
+        slack_buffer_refresh_short_name(sbuf);
         weechat_buffer_set(sbuf->buffer, "localvar_set_channel",
                            channel->name ? channel->name : channel->id);
         weechat_buffer_set(sbuf->buffer, "localvar_set_slack_channel_id",
@@ -775,8 +784,14 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
         weechat_buffer_set(sbuf->buffer, "nicklist_display_groups", "1");
     }
 
-    if (channel->topic && channel->topic[0])
-        weechat_buffer_set(sbuf->buffer, "title", channel->topic);
+    /* Title bar: channel topic, else purpose (wee-slack). */
+    {
+        const char *disp = slack_channel_display_topic(channel);
+        weechat_buffer_set(sbuf->buffer, "title", disp ? disp : "");
+    }
+
+    /* Prefs + nick + usergroup keywords for WeeChat highlight engine */
+    slack_event_apply_highlight_words(workspace);
 
     /* place after server buffer in the list */
     if (workspace->server_buffer)
@@ -788,9 +803,6 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
         weechat_buffer_set(sbuf->buffer, "number", numbuf);
     }
 
-    weechat_hook_signal("buffer_closing",
-                         &slack_buffer_signal_close_cb, sbuf, NULL);
-
     channel->buffer = sbuf->buffer;
 
     sbuf->next = slack_buffer_list;
@@ -801,6 +813,9 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
 
     if (channel->is_muted)
         slack_buffer_set_muted(sbuf, 1);
+
+    /* Buflist badges from Slack unread_count_display (conversations.list). */
+    slack_buffer_apply_unread_hotlist(channel);
 
     /*
      * Do not fetch history at create. Opening many buffers at connect
@@ -848,6 +863,9 @@ slack_buffer_free(struct t_slack_buffer *sbuf)
     if (!sbuf)
         return;
 
+    if (sbuf->buffer)
+        slack_buffer_typing_reset(sbuf->buffer);
+
     if (sbuf->prev)
         sbuf->prev->next = sbuf->next;
     else
@@ -857,8 +875,21 @@ slack_buffer_free(struct t_slack_buffer *sbuf)
         sbuf->next->prev = sbuf->prev;
 
     if (sbuf->channel)
+    {
         sbuf->channel->buffer = NULL;
+        /*
+         * Allow focus / loadhistory to re-fetch after the user reopens the
+         * buffer (live message, /cslack join|show). Channel model is kept.
+         */
+        sbuf->channel->history_state = 0;
+        sbuf->channel->members_loaded = 0;
+        sbuf->channel->info_fetched = 0;
+    }
 
+    if (sbuf->workspace && sbuf->workspace->server_buffer == sbuf->buffer)
+        sbuf->workspace->server_buffer = NULL;
+
+    sbuf->buffer = NULL;
     free(sbuf);
 }
 
@@ -1200,10 +1231,69 @@ slack_buffer_clear_hotlist(struct t_gui_buffer *buffer)
     weechat_buffer_set(buffer, "hotlist", "-1");
 }
 
+void
+slack_buffer_apply_unread_hotlist(struct t_slack_channel *channel)
+{
+    int i;
+    const char *level;
+
+    if (!channel || !channel->buffer || channel->unread_count <= 0)
+        return;
+
+    /* Muted: only show hotlist when muted_channels_activity = all (wee-slack). */
+    if (channel->is_muted &&
+        weechat_config_integer(weeslack_config.muted_channels_activity) != 3)
+        return;
+
+    /* WeeChat: 1=message, 2=private (DM) — match wee-slack set_unread_count */
+    if (channel->type == SLACK_CHANNEL_TYPE_DM ||
+        channel->type == SLACK_CHANNEL_TYPE_MPDM)
+        level = "2";
+    else
+        level = "1";
+
+    for (i = 0; i < channel->unread_count && i < 50; i++)
+        weechat_buffer_set(channel->buffer, "hotlist", level);
+}
+
+/*
+ * Drive WeeChat's built-in typing plugin (bar item "typing").
+ * Signal format matches IRC: "0x%lx;state;nick" with state
+ * typing|paused|off|cleared. Requires typing.look.enabled_nicks on
+ * and the "typing" item in a bar.
+ */
+static void
+slack_buffer_typing_set_nick(struct t_gui_buffer *buffer, const char *state,
+                             const char *nick)
+{
+    char signal_data[1024];
+
+    if (!buffer || !state || !state[0] || !nick || !nick[0])
+        return;
+
+    snprintf(signal_data, sizeof(signal_data), "0x%lx;%s;%s",
+             (unsigned long)(uintptr_t)buffer, state, nick);
+    weechat_hook_signal_send("typing_set_nick",
+                             WEECHAT_HOOK_SIGNAL_STRING,
+                             signal_data);
+}
+
+static void
+slack_buffer_typing_reset(struct t_gui_buffer *buffer)
+{
+    if (!buffer)
+        return;
+    weechat_hook_signal_send("typing_reset_buffer",
+                             WEECHAT_HOOK_SIGNAL_POINTER,
+                             buffer);
+}
+
 static int
 slack_buffer_typing_clear_cb(const void *pointer, void *data, int remaining_calls)
 {
     struct t_slack_channel *channel = (struct t_slack_channel *)pointer;
+    char *nick;
+
     (void) data;
     (void) remaining_calls;
 
@@ -1211,13 +1301,21 @@ slack_buffer_typing_clear_cb(const void *pointer, void *data, int remaining_call
         return WEECHAT_RC_OK;
 
     channel->typing_clear_hook = NULL;
-    free(channel->typing_user);
+    nick = channel->typing_user;
     channel->typing_user = NULL;
+
+    if (channel->buffer && nick && nick[0])
+        slack_buffer_typing_set_nick(channel->buffer, "off", nick);
+
+    free(nick);
 
     if (channel->buffer)
     {
-        weechat_buffer_set(channel->buffer, "title",
-                           channel->topic ? channel->topic : "");
+        {
+            const char *disp = slack_channel_display_topic(channel);
+            weechat_buffer_set(channel->buffer, "title",
+                               disp ? disp : "");
+        }
     }
     weechat_bar_item_update("slack_typing_notice");
 
@@ -1229,28 +1327,44 @@ slack_buffer_set_typing(struct t_slack_channel *channel, const char *user_name)
 {
     char title[320];
     const char *color;
+    const char *disp;
 
     if (!channel || !channel->buffer || !user_name || !user_name[0])
         return;
 
+    /* Clear previous nick in the typing plugin when the active typer changes. */
+    if (channel->typing_user && channel->typing_user[0] &&
+        strcmp(channel->typing_user, user_name) != 0)
+    {
+        slack_buffer_typing_set_nick(channel->buffer, "off",
+                                     channel->typing_user);
+    }
+
     free(channel->typing_user);
     channel->typing_user = strdup(user_name);
-    weechat_bar_item_update("slack_typing_notice");
-
-    if (!weechat_config_boolean(weeslack_config.channel_name_typing_indicator))
+    if (!channel->typing_user)
         return;
 
-    color = weechat_config_string(weeslack_config.color_typing_notice);
-    if (!color || !color[0])
-        color = "cyan";
+    /* Built-in typing bar item (typing.so). */
+    slack_buffer_typing_set_nick(channel->buffer, "typing", user_name);
 
-    snprintf(title, sizeof(title), "%s%s is typing…%s%s%s",
-             weechat_color(color),
-             user_name,
-             weechat_color("reset"),
-             channel->topic && channel->topic[0] ? " — " : "",
-             channel->topic ? channel->topic : "");
-    weechat_buffer_set(channel->buffer, "title", title);
+    weechat_bar_item_update("slack_typing_notice");
+
+    if (weechat_config_boolean(weeslack_config.channel_name_typing_indicator))
+    {
+        color = weechat_config_string(weeslack_config.color_typing_notice);
+        if (!color || !color[0])
+            color = "cyan";
+        disp = slack_channel_display_topic(channel);
+
+        snprintf(title, sizeof(title), "%s%s is typing…%s%s%s",
+                 weechat_color(color),
+                 user_name,
+                 weechat_color("reset"),
+                 disp && disp[0] ? " — " : "",
+                 disp ? disp : "");
+        weechat_buffer_set(channel->buffer, "title", title);
+    }
 
     if (channel->typing_clear_hook)
         weechat_unhook(channel->typing_clear_hook);
@@ -1284,6 +1398,130 @@ slack_buffer_purge_hidden_nicks(void)
     }
 }
 
+/*
+ * Buflist short_name — wee-slack style:
+ *   channels: #name / &name / team.#name
+ *   DMs: "+name" when peer active (show_buflist_presence), else " name" or name
+ */
+static void
+slack_buffer_refresh_short_name(struct t_slack_buffer *sbuf)
+{
+    struct t_slack_channel *channel;
+    struct t_weeslack_workspace *workspace;
+    char short_name[128];
+    const char *ch_name, *team;
+    int use_short;
+
+    if (!sbuf || !sbuf->buffer || !sbuf->channel || !sbuf->workspace)
+        return;
+
+    channel = sbuf->channel;
+    workspace = sbuf->workspace;
+    ch_name = channel->name ? channel->name : channel->id;
+    team = workspace->name ? workspace->name : workspace->id;
+    use_short = weechat_config_boolean(weeslack_config.short_buffer_names);
+
+    if (channel->type == SLACK_CHANNEL_TYPE_DM)
+    {
+        struct t_slack_user *peer = NULL;
+        int present = 0;
+        int show_pres = weechat_config_boolean(
+            weeslack_config.show_buflist_presence);
+        const char *base = ch_name;
+
+        if (channel->user_id)
+            peer = slack_user_search(channel->user_id);
+        if (!peer && channel->name)
+            peer = slack_user_search(channel->name);
+        if (peer && peer->presence &&
+            strcmp(peer->presence, "active") == 0)
+            present = 1;
+
+        if (use_short)
+        {
+            if (show_pres && present)
+                snprintf(short_name, sizeof(short_name), "+%s", base);
+            else if (show_pres)
+                snprintf(short_name, sizeof(short_name), " %s", base);
+            else
+                snprintf(short_name, sizeof(short_name), "%s", base);
+        }
+        else
+        {
+            if (show_pres && present)
+                snprintf(short_name, sizeof(short_name), "%s.+%s",
+                         team ? team : "slack", base);
+            else if (show_pres)
+                snprintf(short_name, sizeof(short_name), "%s. %s",
+                         team ? team : "slack", base);
+            else
+                snprintf(short_name, sizeof(short_name), "%s.%s",
+                         team ? team : "slack", base);
+        }
+    }
+    else if (use_short)
+    {
+        if (channel->is_shared &&
+            (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
+             channel->type == SLACK_CHANNEL_TYPE_GROUP))
+        {
+            const char *spfx = weechat_config_string(
+                weeslack_config.shared_name_prefix);
+            if (!spfx || !spfx[0])
+                spfx = "%";
+            snprintf(short_name, sizeof(short_name), "%s%s", spfx, ch_name);
+        }
+        else if (channel->type == SLACK_CHANNEL_TYPE_GROUP)
+        {
+            const char *gpfx = weechat_config_string(
+                weeslack_config.group_name_prefix);
+            if (!gpfx || !gpfx[0])
+                gpfx = "&";
+            snprintf(short_name, sizeof(short_name), "%s%s", gpfx, ch_name);
+        }
+        else if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL)
+            snprintf(short_name, sizeof(short_name), "#%s", ch_name);
+        else if (channel->type == SLACK_CHANNEL_TYPE_MPDM)
+            snprintf(short_name, sizeof(short_name), "@%s", ch_name);
+        else
+            snprintf(short_name, sizeof(short_name), "%s", ch_name);
+    }
+    else
+    {
+        if (channel->is_shared &&
+            (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
+             channel->type == SLACK_CHANNEL_TYPE_GROUP))
+        {
+            const char *spfx = weechat_config_string(
+                weeslack_config.shared_name_prefix);
+            if (!spfx || !spfx[0])
+                spfx = "%";
+            snprintf(short_name, sizeof(short_name), "%s.%s%s",
+                     team ? team : "slack", spfx, ch_name);
+        }
+        else if (channel->type == SLACK_CHANNEL_TYPE_GROUP)
+        {
+            const char *gpfx = weechat_config_string(
+                weeslack_config.group_name_prefix);
+            if (!gpfx || !gpfx[0])
+                gpfx = "&";
+            snprintf(short_name, sizeof(short_name), "%s.%s%s",
+                     team ? team : "slack", gpfx, ch_name);
+        }
+        else if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL)
+            snprintf(short_name, sizeof(short_name), "%s.#%s",
+                     team ? team : "slack", ch_name);
+        else if (channel->type == SLACK_CHANNEL_TYPE_MPDM)
+            snprintf(short_name, sizeof(short_name), "%s.@%s",
+                     team ? team : "slack", ch_name);
+        else
+            snprintf(short_name, sizeof(short_name), "%s.%s",
+                     team ? team : "slack", ch_name);
+    }
+
+    weechat_buffer_set(sbuf->buffer, "short_name", short_name);
+}
+
 void
 slack_buffer_update_user_presence(struct t_slack_user *user)
 {
@@ -1314,7 +1552,7 @@ slack_buffer_update_user_presence(struct t_slack_user *user)
     if (!nick)
         return;
 
-    /* Re-home nick into Here vs Away (wee-slack style). */
+    /* Re-home nick into Here vs Away; refresh DM buflist presence marker. */
     for (ch = slack_channel_list_global(); ch; ch = ch->next)
     {
         struct t_slack_buffer *sbuf;
@@ -1326,6 +1564,11 @@ slack_buffer_update_user_presence(struct t_slack_user *user)
             sbuf = slack_buffer_search_by_channel(ch->id);
         if (!sbuf)
             continue;
+
+        if (ch->type == SLACK_CHANNEL_TYPE_DM && ch->user_id && user->id &&
+            strcmp(ch->user_id, user->id) == 0)
+            slack_buffer_refresh_short_name(sbuf);
+
         /* only touch channels that already show this user */
         if (!weechat_nicklist_search_nick(ch->buffer, NULL, nick))
             continue;

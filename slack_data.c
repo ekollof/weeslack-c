@@ -92,16 +92,52 @@ slack_ts_to_string(SlackTS ts)
 static struct t_slack_user *slack_user_list = NULL;
 
 struct t_slack_user *
-slack_user_new(const char *id, const char *name, const char *team_id)
+slack_user_search_ws(struct t_weeslack_workspace *workspace, const char *id)
+{
+    struct t_slack_user *user, *fallback = NULL;
+
+    if (!id)
+        return NULL;
+
+    for (user = slack_user_list; user; user = user->next)
+    {
+        if (strcmp(user->id, id) != 0)
+            continue;
+        if (workspace && user->workspace == workspace)
+            return user;
+        if (!fallback)
+            fallback = user;
+    }
+    /* Prefer exact workspace; else first id match (single-team / untagged). */
+    if (workspace)
+    {
+        for (user = slack_user_list; user; user = user->next)
+        {
+            if (strcmp(user->id, id) == 0 &&
+                (user->workspace == NULL || user->workspace == workspace))
+                return user;
+        }
+        return NULL;
+    }
+    return fallback;
+}
+
+struct t_slack_user *
+slack_user_new(const char *id, const char *name,
+               struct t_weeslack_workspace *workspace)
 {
     struct t_slack_user *user;
 
     if (!id || !name)
         return NULL;
 
-    user = slack_user_search(id);
+    user = slack_user_search_ws(workspace, id);
     if (user)
+    {
+        if (!user->workspace && workspace)
+            user->workspace = workspace;
         return user;
+    }
 
     user = calloc(1, sizeof(struct t_slack_user));
     if (!user)
@@ -110,6 +146,7 @@ slack_user_new(const char *id, const char *name, const char *team_id)
     user->id = strdup(id);
     user->name = strdup(name);
     user->presence = strdup("unknown");
+    user->workspace = workspace;
 
     user->next = slack_user_list;
     user->prev = NULL;
@@ -117,25 +154,13 @@ slack_user_new(const char *id, const char *name, const char *team_id)
         slack_user_list->prev = user;
     slack_user_list = user;
 
-    (void) team_id;
-
     return user;
 }
 
 struct t_slack_user *
 slack_user_search(const char *id)
 {
-    struct t_slack_user *user;
-
-    if (!id)
-        return NULL;
-
-    for (user = slack_user_list; user; user = user->next)
-    {
-        if (strcmp(user->id, id) == 0)
-            return user;
-    }
-    return NULL;
+    return slack_user_search_ws(NULL, id);
 }
 
 struct t_slack_user *
@@ -170,6 +195,22 @@ slack_user_free(struct t_slack_user *user)
     if (user->profile_json)
         json_object_put(user->profile_json);
     free(user);
+}
+
+void
+slack_user_free_workspace(struct t_weeslack_workspace *workspace)
+{
+    struct t_slack_user *u, *next;
+
+    if (!workspace)
+        return;
+
+    for (u = slack_user_list; u; u = next)
+    {
+        next = u->next;
+        if (u->workspace == workspace)
+            slack_user_free(u);
+    }
 }
 
 const char *
@@ -360,16 +401,51 @@ slack_user_update(struct t_slack_user *user, struct json_object *json)
 static struct t_slack_bot *slack_bot_list = NULL;
 
 struct t_slack_bot *
-slack_bot_new(const char *id, const char *name)
+slack_bot_search_ws(struct t_weeslack_workspace *workspace, const char *id)
+{
+    struct t_slack_bot *bot, *fallback = NULL;
+
+    if (!id)
+        return NULL;
+
+    for (bot = slack_bot_list; bot; bot = bot->next)
+    {
+        if (strcmp(bot->id, id) != 0)
+            continue;
+        if (workspace && bot->workspace == workspace)
+            return bot;
+        if (!fallback)
+            fallback = bot;
+    }
+    if (workspace)
+    {
+        for (bot = slack_bot_list; bot; bot = bot->next)
+        {
+            if (strcmp(bot->id, id) == 0 &&
+                (bot->workspace == NULL || bot->workspace == workspace))
+                return bot;
+        }
+        return NULL;
+    }
+    return fallback;
+}
+
+struct t_slack_bot *
+slack_bot_new(const char *id, const char *name,
+              struct t_weeslack_workspace *workspace)
 {
     struct t_slack_bot *bot;
 
     if (!id || !name)
         return NULL;
 
-    bot = slack_bot_search(id);
+    bot = slack_bot_search_ws(workspace, id);
     if (bot)
+    {
+        if (!bot->workspace && workspace)
+            bot->workspace = workspace;
         return bot;
+    }
 
     bot = calloc(1, sizeof(struct t_slack_bot));
     if (!bot)
@@ -377,6 +453,7 @@ slack_bot_new(const char *id, const char *name)
 
     bot->id = strdup(id);
     bot->name = strdup(name);
+    bot->workspace = workspace;
 
     bot->next = slack_bot_list;
     bot->prev = NULL;
@@ -390,17 +467,7 @@ slack_bot_new(const char *id, const char *name)
 struct t_slack_bot *
 slack_bot_search(const char *id)
 {
-    struct t_slack_bot *bot;
-
-    if (!id)
-        return NULL;
-
-    for (bot = slack_bot_list; bot; bot = bot->next)
-    {
-        if (strcmp(bot->id, id) == 0)
-            return bot;
-    }
-    return NULL;
+    return slack_bot_search_ws(NULL, id);
 }
 
 struct t_slack_bot *
@@ -459,9 +526,10 @@ slack_bot_update(struct t_slack_bot *bot, struct json_object *json)
 }
 
 struct t_slack_user *
-slack_user_search_name(const char *name)
+slack_user_search_name_ws(struct t_weeslack_workspace *workspace,
+                          const char *name)
 {
-    struct t_slack_user *user;
+    struct t_slack_user *user, *fallback = NULL;
     const char *q;
 
     if (!name || !name[0])
@@ -471,21 +539,41 @@ slack_user_search_name(const char *name)
     if (q[0] == '@')
         q++;
 
-    /* exact id */
-    user = slack_user_search(q);
+    user = slack_user_search_ws(workspace, q);
     if (user)
         return user;
 
     for (user = slack_user_list; user; user = user->next)
     {
+        int match = 0;
+
+        if (workspace && user->workspace && user->workspace != workspace)
+            continue;
+
         if (user->name && weechat_strcasecmp(user->name, q) == 0)
+            match = 1;
+        else if (user->display_name &&
+                 weechat_strcasecmp(user->display_name, q) == 0)
+            match = 1;
+        else if (user->real_name &&
+                 weechat_strcasecmp(user->real_name, q) == 0)
+            match = 1;
+
+        if (!match)
+            continue;
+
+        if (workspace && user->workspace == workspace)
             return user;
-        if (user->display_name && weechat_strcasecmp(user->display_name, q) == 0)
-            return user;
-        if (user->real_name && weechat_strcasecmp(user->real_name, q) == 0)
-            return user;
+        if (!fallback)
+            fallback = user;
     }
-    return NULL;
+    return fallback;
+}
+
+struct t_slack_user *
+slack_user_search_name(const char *name)
+{
+    return slack_user_search_name_ws(NULL, name);
 }
 
 void
@@ -510,6 +598,22 @@ slack_bot_free(struct t_slack_bot *bot)
     free(bot);
 }
 
+void
+slack_bot_free_workspace(struct t_weeslack_workspace *workspace)
+{
+    struct t_slack_bot *b, *next;
+
+    if (!workspace)
+        return;
+
+    for (b = slack_bot_list; b; b = next)
+    {
+        next = b->next;
+        if (b->workspace == workspace)
+            slack_bot_free(b);
+    }
+}
+
 /* ============================================================
  * SlackSubteam
  * ============================================================ */
@@ -517,16 +621,52 @@ slack_bot_free(struct t_slack_bot *bot)
 static struct t_slack_subteam *slack_subteam_list = NULL;
 
 struct t_slack_subteam *
-slack_subteam_new(const char *id, const char *name)
+slack_subteam_search_ws(struct t_weeslack_workspace *workspace, const char *id)
+{
+    struct t_slack_subteam *subteam, *fallback = NULL;
+
+    if (!id)
+        return NULL;
+
+    for (subteam = slack_subteam_list; subteam; subteam = subteam->next)
+    {
+        if (strcmp(subteam->id, id) != 0)
+            continue;
+        if (workspace && subteam->workspace == workspace)
+            return subteam;
+        if (!fallback)
+            fallback = subteam;
+    }
+    if (workspace)
+    {
+        for (subteam = slack_subteam_list; subteam; subteam = subteam->next)
+        {
+            if (strcmp(subteam->id, id) == 0 &&
+                (subteam->workspace == NULL ||
+                 subteam->workspace == workspace))
+                return subteam;
+        }
+        return NULL;
+    }
+    return fallback;
+}
+
+struct t_slack_subteam *
+slack_subteam_new(const char *id, const char *name,
+                  struct t_weeslack_workspace *workspace)
 {
     struct t_slack_subteam *subteam;
 
     if (!id || !name)
         return NULL;
 
-    subteam = slack_subteam_search(id);
+    subteam = slack_subteam_search_ws(workspace, id);
     if (subteam)
+    {
+        if (!subteam->workspace && workspace)
+            subteam->workspace = workspace;
         return subteam;
+    }
 
     subteam = calloc(1, sizeof(struct t_slack_subteam));
     if (!subteam)
@@ -534,6 +674,7 @@ slack_subteam_new(const char *id, const char *name)
 
     subteam->id = strdup(id);
     subteam->name = strdup(name);
+    subteam->workspace = workspace;
 
     subteam->next = slack_subteam_list;
     subteam->prev = NULL;
@@ -547,17 +688,7 @@ slack_subteam_new(const char *id, const char *name)
 struct t_slack_subteam *
 slack_subteam_search(const char *id)
 {
-    struct t_slack_subteam *subteam;
-
-    if (!id)
-        return NULL;
-
-    for (subteam = slack_subteam_list; subteam; subteam = subteam->next)
-    {
-        if (strcmp(subteam->id, id) == 0)
-            return subteam;
-    }
-    return NULL;
+    return slack_subteam_search_ws(NULL, id);
 }
 
 struct t_slack_subteam *
@@ -588,6 +719,22 @@ slack_subteam_free(struct t_slack_subteam *subteam)
         free(subteam->members[i]);
     free(subteam->members);
     free(subteam);
+}
+
+void
+slack_subteam_free_workspace(struct t_weeslack_workspace *workspace)
+{
+    struct t_slack_subteam *st, *next;
+
+    if (!workspace)
+        return;
+
+    for (st = slack_subteam_list; st; st = next)
+    {
+        next = st->next;
+        if (st->workspace == workspace)
+            slack_subteam_free(st);
+    }
 }
 
 void
@@ -623,6 +770,28 @@ slack_subteam_update(struct t_slack_subteam *subteam, struct json_object *json)
 
         subteam->members = members;
         subteam->members_count = count;
+    }
+}
+
+void
+slack_subteam_set_member_flag(struct t_slack_subteam *subteam,
+                               const char *my_user_id)
+{
+    int i;
+
+    if (!subteam)
+        return;
+    subteam->is_member = 0;
+    if (!my_user_id || !my_user_id[0] || !subteam->members)
+        return;
+    for (i = 0; i < subteam->members_count; i++)
+    {
+        if (subteam->members[i] &&
+            strcmp(subteam->members[i], my_user_id) == 0)
+        {
+            subteam->is_member = 1;
+            return;
+        }
     }
 }
 
@@ -1118,6 +1287,8 @@ slack_channel_new(const char *id, const char *name,
     channel->type = type;
     channel->last_read = slack_ts_zero();
 
+    channel->workspace = NULL;
+
     channel->next = slack_channel_list;
     channel->prev = NULL;
     if (slack_channel_list)
@@ -1125,6 +1296,42 @@ slack_channel_new(const char *id, const char *name,
     slack_channel_list = channel;
 
     return channel;
+}
+
+void
+slack_channel_set_workspace(struct t_slack_channel *channel,
+                             struct t_weeslack_workspace *workspace)
+{
+    if (channel && workspace)
+        channel->workspace = workspace;
+}
+
+const char *
+slack_channel_display_topic(const struct t_slack_channel *channel)
+{
+    if (!channel)
+        return NULL;
+    if (channel->topic && channel->topic[0])
+        return channel->topic;
+    if (channel->purpose && channel->purpose[0])
+        return channel->purpose;
+    return NULL;
+}
+
+void
+slack_channel_free_workspace(struct t_weeslack_workspace *workspace)
+{
+    struct t_slack_channel *ch, *next;
+
+    if (!workspace)
+        return;
+
+    for (ch = slack_channel_list; ch; ch = next)
+    {
+        next = ch->next;
+        if (ch->workspace == workspace)
+            slack_channel_free(ch);
+    }
 }
 
 struct t_slack_channel *
@@ -1214,24 +1421,52 @@ slack_channel_update(struct t_slack_channel *channel, struct json_object *json)
         }
     }
 
-    if (json_object_object_get_ex(json, "topic", &obj))
+    if (json_object_object_get_ex(json, "topic", &obj) && obj)
     {
-        struct json_object *value;
-        if (json_object_object_get_ex(obj, "value", &value))
+        const char *t = NULL;
+        if (json_object_is_type(obj, json_type_string))
+            t = json_object_get_string(obj);
+        else if (json_object_is_type(obj, json_type_object))
         {
-            free(channel->topic);
-            channel->topic = strdup(json_object_get_string(value));
+            struct json_object *value;
+            if (json_object_object_get_ex(obj, "value", &value))
+                t = json_object_get_string(value);
         }
+        free(channel->topic);
+        channel->topic = (t && t[0]) ? strdup(t) : NULL;
     }
 
-    if (json_object_object_get_ex(json, "purpose", &obj))
+    if (json_object_object_get_ex(json, "purpose", &obj) && obj)
     {
-        struct json_object *value;
-        if (json_object_object_get_ex(obj, "value", &value))
+        const char *p = NULL;
+        if (json_object_is_type(obj, json_type_string))
+            p = json_object_get_string(obj);
+        else if (json_object_is_type(obj, json_type_object))
         {
-            free(channel->purpose);
-            channel->purpose = strdup(json_object_get_string(value));
+            struct json_object *value;
+            if (json_object_object_get_ex(obj, "value", &value))
+                p = json_object_get_string(value);
         }
+        free(channel->purpose);
+        channel->purpose = (p && p[0]) ? strdup(p) : NULL;
+    }
+
+    /* Slack Connect / shared channels (conversations.list flags). */
+    if (json_object_object_get_ex(json, "is_shared", &obj) ||
+        json_object_object_get_ex(json, "is_ext_shared", &obj) ||
+        json_object_object_get_ex(json, "is_org_shared", &obj))
+    {
+        int shared = 0;
+        if (json_object_object_get_ex(json, "is_shared", &obj) &&
+            json_object_get_boolean(obj))
+            shared = 1;
+        if (json_object_object_get_ex(json, "is_ext_shared", &obj) &&
+            json_object_get_boolean(obj))
+            shared = 1;
+        if (json_object_object_get_ex(json, "is_org_shared", &obj) &&
+            json_object_get_boolean(obj))
+            shared = 1;
+        channel->is_shared = shared;
     }
 
     if (json_object_object_get_ex(json, "is_member", &obj))
@@ -1240,7 +1475,27 @@ slack_channel_update(struct t_slack_channel *channel, struct json_object *json)
     if (json_object_object_get_ex(json, "last_read", &obj))
         channel->last_read = slack_ts_new(json_object_get_string(obj));
 
-    if (json_object_object_get_ex(json, "unread_count", &obj))
+    /* Keep WeeChat title bar in sync when model already has a buffer. */
+    if (channel->topic || channel->purpose)
+        channel->info_fetched = 1;
+    if (channel->buffer)
+    {
+        const char *disp = slack_channel_display_topic(channel);
+        /* Do not clobber a typing indicator title (contains "typing"). */
+        {
+            const char *cur = weechat_buffer_get_string(channel->buffer, "title");
+            if (cur && strstr(cur, "typing"))
+                ; /* leave typing rewrite path to clear later */
+            else
+                weechat_buffer_set(channel->buffer, "title",
+                                   disp ? disp : "");
+        }
+    }
+
+    /* Prefer unread_count_display (what Slack shows the user). */
+    if (json_object_object_get_ex(json, "unread_count_display", &obj))
+        channel->unread_count = json_object_get_int(obj);
+    else if (json_object_object_get_ex(json, "unread_count", &obj))
         channel->unread_count = json_object_get_int(obj);
 }
 
@@ -1283,6 +1538,8 @@ slack_thread_channel_create(struct t_slack_channel *parent,
                                                         SLACK_CHANNEL_TYPE_THREAD);
     if (!thread)
         return NULL;
+
+    thread->workspace = parent->workspace;
 
     if (topic && topic[0])
     {

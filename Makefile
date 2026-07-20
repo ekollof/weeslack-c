@@ -1,5 +1,5 @@
 # weeslack - Slack plugin for WeeChat
-# Requires: weechat-dev, json-c, openssl
+# Requires: weechat-dev, json-c, openssl, libcurl
 #
 # Normal build:
 #   make && make install
@@ -16,8 +16,8 @@ PLUGIN_NAME = weeslack
 PLUGIN_FILE = $(PLUGIN_NAME).so
 
 CC ?= gcc
-PKG_CFLAGS := $(shell pkg-config --cflags weechat json-c openssl)
-PKG_LIBS   := $(shell pkg-config --libs weechat json-c openssl)
+PKG_CFLAGS := $(shell pkg-config --cflags weechat json-c openssl libcurl)
+PKG_LIBS   := $(shell pkg-config --libs weechat json-c openssl libcurl)
 
 # Base flags; -O2 for release, ASAN uses -O1 -g (set below).
 CFLAGS_COMMON := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \

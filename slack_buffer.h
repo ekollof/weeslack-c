@@ -38,6 +38,8 @@ extern void slack_buffer_clear_nicks(struct t_slack_buffer *sbuf);
 extern void slack_buffer_purge_hidden_nicks(void);
 extern void slack_buffer_set_muted(struct t_slack_buffer *sbuf, int muted);
 extern void slack_buffer_clear_hotlist(struct t_gui_buffer *buffer);
+/* Apply unread_count to WeeChat hotlist (DM=private, channel=message). */
+extern void slack_buffer_apply_unread_hotlist(struct t_slack_channel *channel);
 extern void slack_buffer_set_typing(struct t_slack_channel *channel,
                                      const char *user_name);
 extern void slack_buffer_update_user_presence(struct t_slack_user *user);

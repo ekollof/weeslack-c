@@ -15,7 +15,7 @@ make install    # → ~/.local/share/weechat/plugins/weeslack.so
 make clean
 ```
 
-Dependencies: WeeChat headers, json-c, OpenSSL.
+Dependencies: WeeChat headers, json-c, OpenSSL, libcurl.
 
 ## Architecture
 
@@ -43,7 +43,8 @@ All `slack_http_request_new*` calls **enqueue**; nothing stampedes the API.
 
 Call `slack_http_queue_init()` in plugin init and `slack_http_queue_shutdown()` on end.
 
-Binary file **PUT** for upload still uses curl via `hook_process` (required for raw upload URL).
+Binary file **PUT** (upload) and authenticated **download** use **libcurl multi**
+(async; Bearer + cookie; WeeChat proxy).
 
 ### Connect bootstrap (rate-limit safe)
 
@@ -84,10 +85,11 @@ History tags include `slack_ts_<ts>` for tooling.
 
 | Command | Notes |
 |---------|--------|
-| `/cslack connect` / `disconnect` / `migrate` | Token from `weeslack.workspace.token` or migrate from Python |
+| `/cslack connect` / `disconnect` / `migrate` / `register` | Token from config, OAuth, or Python migrate |
+| `/cslack unregister` / `forget -yes [id]` | Retire workspace: drop token + close buffers |
 | `/cslack loadhistory [id]` | Uses focused buffer if command buffer is core |
 | `/cslack talk` | Name or user id |
-| `/cslack download <url>` | Auth download → `look.download_path` or `~/Downloads/weeslack` |
+| `/cslack download <url>` | Auth download → `<root>/weeslack/<origin>/<YYYY-MM-DD>/<file>` |
 | `/cslack stars` / `star` / `unstar` | Slack stars API |
 | `/cslack react` / `unreact` | Reactions |
 
@@ -96,9 +98,29 @@ When `/cslack` is run from `core.weechat` (debug socket), buffer-local ops use
 
 ### Config highlights (`weeslack.conf`)
 
-- `workspace.token` — xoxp/xoxb or `xoxc-token:cookie`  
+- `workspace.token` — xoxp/xoxb or `xoxc-token:cookie`; **comma-separated multi-team**  
+- `workspace.auto_connect` — connect on plugin load if token valid (default on; respects WeeChat auto_connect/`-a`)  
+- `workspace.server_aliases` — `subdomain:alias` pairs for team display name  
+- Workspace ids: first token → `default`, then `ws1`, `ws2`… (staggered connect)  
+- Buffers set `localvar_slack_workspace_id`; commands resolve via `weeslack_workspace_from_buffer`  
+- `look.debug_mode` / `look.record_events` — debug buffer + RTM JSONL log  
+- `look.background_load_all_history` — opt-in post-quiet history queue (default off)  
+- `look.slack_timeout` — HTTP/libcurl timeout ms (default 30000)  
+- `look.auto_open_threads` — `off` / `subscribed` / `all` (default off)  
+- `look.leave_channel_on_buffer_close` — remote leave when closing buffer (default off)  
+- `look.show_buflist_presence` — DM short_name `+nick` when peer active  
+- `look.unfurl_auto_link_display` (`both`/`text`/`url`), `unfurl_ignore_alt_text`  
+- `look.notify_usergroup_handle_updated`  
 - `look.emoji_render_mode`, typing indicator, thread_messages_in_channel  
-- `look.download_path`, render_bold_as / render_italic_as  
+- IRC cmds on weeslack buffers: `/me` `/join` `/query` `/msg` `/part` `/topic` `/invite` `/away` `/whois`  
+- Input `/cmd args` → Slack slash (`chat.command`); `//text` posts literally  
+- `/cslack talk a,b` / `/query a,b` → MPDM  
+- `/cslack info` — version, queue, options, workspaces  
+
+- `look.download_path` — root; files go to `<root>/weeslack/<origin>/<YYYY-MM-DD>/<file>`  
+- `look.auto_download_files` — live attachments auto-saved under that layout (default on)  
+- `look.icat_enabled` — Kitty `/icat` for files **and** custom emoji (requires icat.py)  
+- `render_bold_as` / `render_italic_as`  
 - Color options for typing / deleted / edited / thread / muted  
 
 ## Live testing / automation
@@ -157,7 +179,7 @@ These rules are **mandatory**.
 ### Concurrency / Reentrancy
 
 - WeeChat callbacks are main-thread; do not block.
-- HTTP is async (`hook_url`); binary upload uses `hook_process` + curl.
+- HTTP is async (`hook_url`); binary upload/download use libcurl multi + timer.
 - Queue pump is timer-driven (`slack_http_queue_init`).
 
 ### Code Style
