@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 
 #include "weeslack.h"
@@ -91,6 +92,244 @@ struct t_slack_custom_emoji
 };
 
 static struct t_slack_custom_emoji *slack_custom_emoji_list = NULL;
+
+/*
+ * Standard emoji from weemoji.json (wee-slack file in WeeChat data dir).
+ * Separate from workspace custom emoji so emoji.list refresh does not wipe it.
+ */
+struct t_slack_weemoji
+{
+    char *name;
+    char *unicode;
+    struct t_slack_weemoji *next;
+};
+
+#define SLACK_WEEMOJI_BUCKETS 512
+static struct t_slack_weemoji *slack_weemoji_buckets[SLACK_WEEMOJI_BUCKETS];
+static int slack_weemoji_count = 0;
+
+static unsigned int
+slack_weemoji_hash(const char *name)
+{
+    unsigned int h = 5381;
+    unsigned char c;
+
+    if (!name)
+        return 0;
+    while ((c = (unsigned char)*name++) != '\0')
+        h = ((h << 5) + h) + c;
+    return h % SLACK_WEEMOJI_BUCKETS;
+}
+
+static void
+slack_weemoji_clear(void)
+{
+    int i;
+
+    for (i = 0; i < SLACK_WEEMOJI_BUCKETS; i++)
+    {
+        struct t_slack_weemoji *e, *next;
+        for (e = slack_weemoji_buckets[i]; e; e = next)
+        {
+            next = e->next;
+            free(e->name);
+            free(e->unicode);
+            free(e);
+        }
+        slack_weemoji_buckets[i] = NULL;
+    }
+    slack_weemoji_count = 0;
+}
+
+static void
+slack_weemoji_add(const char *name, const char *unicode)
+{
+    struct t_slack_weemoji *e;
+    unsigned int b;
+
+    if (!name || !name[0] || !unicode || !unicode[0])
+        return;
+
+    b = slack_weemoji_hash(name);
+    for (e = slack_weemoji_buckets[b]; e; e = e->next)
+    {
+        if (strcmp(e->name, name) == 0)
+        {
+            free(e->unicode);
+            e->unicode = strdup(unicode);
+            return;
+        }
+    }
+
+    e = calloc(1, sizeof(*e));
+    if (!e)
+        return;
+    e->name = strdup(name);
+    e->unicode = strdup(unicode);
+    if (!e->name || !e->unicode)
+    {
+        free(e->name);
+        free(e->unicode);
+        free(e);
+        return;
+    }
+    e->next = slack_weemoji_buckets[b];
+    slack_weemoji_buckets[b] = e;
+    slack_weemoji_count++;
+}
+
+static const char *
+slack_weemoji_lookup(const char *name)
+{
+    struct t_slack_weemoji *e;
+
+    if (!name || !name[0] || slack_weemoji_count <= 0)
+        return NULL;
+    for (e = slack_weemoji_buckets[slack_weemoji_hash(name)]; e; e = e->next)
+    {
+        if (strcmp(e->name, name) == 0)
+            return e->unicode;
+    }
+    return NULL;
+}
+
+/*
+ * Load weemoji.json like wee-slack:
+ *   $weechat_data_dir/weemoji.json (or weechat_dir)
+ *   else $weechat_sharedir/weemoji.json
+ * Silent no-op if missing; keeps static fallback table.
+ */
+void
+slack_event_load_weemoji(void)
+{
+    const char *data_dir;
+    const char *share_dir;
+    char path[1024];
+    struct json_object *root = NULL;
+    struct json_object *old_fmt;
+    int path_ok = 0;
+
+    slack_weemoji_clear();
+
+    data_dir = weechat_info_get("weechat_data_dir", "");
+    if (!data_dir || !data_dir[0])
+        data_dir = weechat_info_get("weechat_dir", "");
+    share_dir = weechat_info_get("weechat_sharedir", "");
+
+    if (data_dir && data_dir[0])
+    {
+        snprintf(path, sizeof(path), "%s/weemoji.json", data_dir);
+        if (access(path, R_OK) == 0)
+            path_ok = 1;
+    }
+    if (!path_ok && share_dir && share_dir[0])
+    {
+        snprintf(path, sizeof(path), "%s/weemoji.json", share_dir);
+        if (access(path, R_OK) == 0)
+            path_ok = 1;
+    }
+    if (!path_ok)
+        return;
+
+    root = json_object_from_file(path);
+    if (!root)
+    {
+        weechat_printf(NULL,
+                       "%sweeslack: failed to parse weemoji.json (%s)",
+                       weechat_prefix("error"), path);
+        return;
+    }
+
+    /* Old wee-slack format was { "emoji": { ... } } */
+    if (json_object_object_get_ex(root, "emoji", &old_fmt))
+    {
+        weechat_printf(NULL,
+                       "%sweeslack: weemoji.json is an old format; update it "
+                       "(expected name → {unicode, …} map)",
+                       weechat_prefix("error"));
+        json_object_put(root);
+        return;
+    }
+
+    if (!json_object_is_type(root, json_type_object))
+    {
+        weechat_printf(NULL,
+                       "%sweeslack: weemoji.json root is not an object",
+                       weechat_prefix("error"));
+        json_object_put(root);
+        return;
+    }
+
+    {
+        json_object_object_foreach(root, key, val)
+        {
+            struct json_object *uni_obj, *skins_obj;
+
+            if (!json_object_is_type(val, json_type_object))
+                continue;
+            if (json_object_object_get_ex(val, "unicode", &uni_obj))
+            {
+                const char *uni = json_object_get_string(uni_obj);
+                if (uni && uni[0])
+                    slack_weemoji_add(key, uni);
+            }
+            if (json_object_object_get_ex(val, "skinVariations", &skins_obj) &&
+                json_object_is_type(skins_obj, json_type_object))
+            {
+                json_object_object_foreach(skins_obj, sk_key, sk_val)
+                {
+                    struct json_object *sk_name, *sk_uni;
+                    const char *sname = NULL, *suni = NULL;
+
+                    (void)sk_key;
+                    if (!json_object_is_type(sk_val, json_type_object))
+                        continue;
+                    if (json_object_object_get_ex(sk_val, "name", &sk_name))
+                        sname = json_object_get_string(sk_name);
+                    if (json_object_object_get_ex(sk_val, "unicode", &sk_uni))
+                        suni = json_object_get_string(sk_uni);
+                    if (sname && sname[0] && suni && suni[0])
+                        slack_weemoji_add(sname, suni);
+                }
+            }
+        }
+    }
+
+    weechat_printf(NULL,
+                   "%sweeslack: loaded %d emoji from %s",
+                   weechat_prefix("network"),
+                   slack_weemoji_count, path);
+    json_object_put(root);
+}
+
+void
+slack_event_unload_weemoji(void)
+{
+    slack_weemoji_clear();
+}
+
+int
+slack_event_weemoji_count(void)
+{
+    return slack_weemoji_count;
+}
+
+void
+slack_event_weemoji_foreach(void (*cb)(const char *name, const char *unicode,
+                                       void *data),
+                            void *data)
+{
+    int i;
+
+    if (!cb)
+        return;
+    for (i = 0; i < SLACK_WEEMOJI_BUCKETS; i++)
+    {
+        struct t_slack_weemoji *e;
+        for (e = slack_weemoji_buckets[i]; e; e = e->next)
+            cb(e->name, e->unicode, data);
+    }
+}
 
 static void
 slack_custom_emoji_clear(void)
@@ -189,7 +428,8 @@ slack_event_replace_emoji(const char *text)
         return strdup("");
 
     size_t len = strlen(text);
-    char *result = malloc(len * 4 + 1);
+    /* unicode replacements can be multi-codepoint (ZWJ sequences) */
+    char *result = malloc(len * 8 + 1);
     if (!result)
         return strdup(text);
 
@@ -201,42 +441,68 @@ slack_event_replace_emoji(const char *text)
         if (*src == ':')
         {
             const char *end = strchr(src + 1, ':');
-            if (end && (end - src - 1) > 0 && (end - src - 1) < 32)
+            /* weemoji names up to ~54 chars; allow skin-tone compound forms */
+            if (end && (end - src - 1) > 0 && (end - src - 1) < 64)
             {
-                char shortcode[32];
-                size_t sc_len = end - src - 1;
+                char shortcode[64];
+                size_t sc_len = (size_t)(end - src - 1);
+                const char *replacement = NULL;
+                size_t i;
+                int valid = 1;
+
                 memcpy(shortcode, src + 1, sc_len);
                 shortcode[sc_len] = '\0';
 
-                const char *custom = slack_custom_emoji_lookup(shortcode);
-                if (custom && custom[0])
+                /* wee-slack: [a-z0-9_+-]+ (also allow uppercase for safety) */
+                for (i = 0; i < sc_len; i++)
                 {
-                    /* alias:foo → resolve once; URLs stay as :name: for TUI */
-                    if (strncmp(custom, "alias:", 6) == 0)
+                    char c = shortcode[i];
+                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_' || c == '+' ||
+                          c == '-'))
                     {
-                        const char *a = slack_custom_emoji_lookup(custom + 6);
-                        if (a && a[0] && strncmp(a, "http", 4) != 0)
-                            custom = a;
-                        else
-                            custom = NULL;
-                    }
-                    if (custom && strncmp(custom, "http", 4) != 0)
-                    {
-                        size_t u_len = strlen(custom);
-                        memcpy(dst, custom, u_len);
-                        dst += u_len;
-                        src = end + 1;
-                        goto next;
+                        valid = 0;
+                        break;
                     }
                 }
 
-                const struct slack_emoji_entry *e;
-                for (e = slack_emoji_common; e->name; e++)
+                if (valid)
                 {
-                    if (strcmp(e->name, shortcode) == 0)
+                    const char *custom = slack_custom_emoji_lookup(shortcode);
+                    if (custom && custom[0])
                     {
-                        size_t u_len = strlen(e->unicode);
-                        memcpy(dst, e->unicode, u_len);
+                        /* alias:foo → resolve once; URLs stay as :name: for TUI */
+                        if (strncmp(custom, "alias:", 6) == 0)
+                        {
+                            const char *a = slack_custom_emoji_lookup(custom + 6);
+                            if (!a || !a[0])
+                                a = slack_weemoji_lookup(custom + 6);
+                            if (a && a[0] && strncmp(a, "http", 4) != 0)
+                                custom = a;
+                            else
+                                custom = NULL;
+                        }
+                        if (custom && strncmp(custom, "http", 4) != 0)
+                            replacement = custom;
+                    }
+                    if (!replacement)
+                        replacement = slack_weemoji_lookup(shortcode);
+                    if (!replacement)
+                    {
+                        const struct slack_emoji_entry *e;
+                        for (e = slack_emoji_common; e->name; e++)
+                        {
+                            if (strcmp(e->name, shortcode) == 0)
+                            {
+                                replacement = e->unicode;
+                                break;
+                            }
+                        }
+                    }
+                    if (replacement && replacement[0])
+                    {
+                        size_t u_len = strlen(replacement);
+                        memcpy(dst, replacement, u_len);
                         dst += u_len;
                         src = end + 1;
                         goto next;

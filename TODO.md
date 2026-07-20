@@ -58,6 +58,7 @@ thread_broadcast prefix; channel_joined/im_open; DM title from status
 - [x] Reaction **suffixes** on history/live print (`[:name:count]`, own = lightgreen)  
 - [x] Typing (title indicator), mentions (`<@U>`, `<!here>`, `<!subteam^…>`), mute tags, read markers  
 - [x] Emoji shortcodes + custom map + `emoji_render_mode`  
+- [x] **weemoji.json** from WeeChat data/sharedir (standard unicode map + completion)  
 - [x] Bold/italic/strikethrough honor config (`render_*_as`)  
 - [x] Thread-in-channel uses `thread_broadcast_prefix`  
 - [~] Edit/delete — notice lines (WeeChat has no public line-edit API)  

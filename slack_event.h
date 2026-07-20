@@ -62,6 +62,14 @@ extern int slack_api_check_error(struct t_weeslack_workspace *workspace,
                                   struct json_object *json,
                                   const char *context);
 extern char *slack_event_replace_emoji(const char *text);
+/* Load/unload standard emoji map from weemoji.json (WeeChat data dir). */
+extern void slack_event_load_weemoji(void);
+extern void slack_event_unload_weemoji(void);
+extern int slack_event_weemoji_count(void);
+extern void slack_event_weemoji_foreach(void (*cb)(const char *name,
+                                                   const char *unicode,
+                                                   void *data),
+                                       void *data);
 extern void slack_event_upload_file(struct t_weeslack_workspace *workspace,
                                      const char *channel_id,
                                      const char *file_path,

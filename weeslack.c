@@ -1533,6 +1533,23 @@ static const char *slack_emoji_shortcodes[] = {
     NULL
 };
 
+static void
+weeslack_emoji_completion_add_cb(const char *name, const char *unicode,
+                                 void *data)
+{
+    struct t_gui_completion *completion = data;
+    char buf[80];
+
+    (void)unicode;
+    if (!name || !name[0] || !completion)
+        return;
+    /* Skip skin-tone compounds in tab completion (noisy). */
+    if (strstr(name, "::"))
+        return;
+    snprintf(buf, sizeof(buf), ":%s:", name);
+    weechat_completion_list_add(completion, buf, 0, WEECHAT_LIST_POS_SORT);
+}
+
 static int
 weeslack_emoji_completion_cb(const void *pointer, void *data,
                               const char *completion_item,
@@ -1544,12 +1561,21 @@ weeslack_emoji_completion_cb(const void *pointer, void *data,
     (void) completion_item;
     (void) buffer;
 
-    for (int i = 0; slack_emoji_shortcodes[i]; i++)
+    if (slack_event_weemoji_count() > 0)
     {
-        char buf[64];
-        snprintf(buf, sizeof(buf), ":%s:", slack_emoji_shortcodes[i]);
-        weechat_completion_list_add(completion, buf, 0,
-                                     WEECHAT_LIST_POS_SORT);
+        slack_event_weemoji_foreach(weeslack_emoji_completion_add_cb,
+                                    completion);
+    }
+    else
+    {
+        int i;
+        for (i = 0; slack_emoji_shortcodes[i]; i++)
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), ":%s:", slack_emoji_shortcodes[i]);
+            weechat_completion_list_add(completion, buf, 0,
+                                         WEECHAT_LIST_POS_SORT);
+        }
     }
 
     return WEECHAT_RC_OK;
@@ -2095,6 +2121,9 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     if (weeslack_config_init() == WEECHAT_RC_ERROR)
         return WEECHAT_RC_ERROR;
 
+    /* Optional standard emoji table (same file as Python wee-slack). */
+    slack_event_load_weemoji();
+
     weeslack_upgrade_file = weechat_upgrade_new(
         "weeslack",
         &weeslack_upgrade_read_cb, NULL, NULL);
@@ -2173,6 +2202,7 @@ weechat_plugin_end(struct t_weechat_plugin *plugin)
     struct t_weeslack_channel *channel, *next_channel;
 
     slack_http_queue_shutdown();
+    slack_event_unload_weemoji();
 
     for (channel = weeslack_channels; channel; channel = next_channel)
     {
