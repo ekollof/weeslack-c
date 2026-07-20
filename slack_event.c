@@ -743,6 +743,13 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                             weechat_color("green"),
                             jname ? jname : user_id,
                             weechat_color("reset"));
+            if (ju)
+            {
+                struct t_slack_buffer *sb =
+                    slack_buffer_search_by_channel(channel->id);
+                if (sb)
+                    slack_buffer_add_nick(sb, ju);
+            }
         }
         free(text_owned);
         return;
@@ -759,8 +766,62 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                             weechat_color("red"),
                             lname ? lname : user_id,
                             weechat_color("reset"));
+            if (lu)
+            {
+                struct t_slack_buffer *sb =
+                    slack_buffer_search_by_channel(channel->id);
+                if (sb)
+                    slack_buffer_remove_nick(sb, lu);
+            }
         }
         free(text_owned);
+        return;
+    }
+
+    if (subtype && (strcmp(subtype, "pinned_item") == 0 ||
+                    strcmp(subtype, "unpinned_item") == 0))
+    {
+        int pinned = (strcmp(subtype, "pinned_item") == 0);
+        if (channel->buffer)
+        {
+            struct t_slack_user *pu = user_id ? slack_user_search(user_id) : NULL;
+            const char *pname = pu ? slack_user_best_name(pu)
+                : (user_id ? user_id : "?");
+            weechat_printf(channel->buffer,
+                            "%s%s a message%s%s",
+                            weechat_prefix("network"),
+                            pinned ? "pinned" : "unpinned",
+                            pname ? " — " : "",
+                            pname ? pname : "");
+        }
+        free(text_owned);
+        return;
+    }
+
+    if (subtype && strcmp(subtype, "channel_name") == 0)
+    {
+        struct json_object *name_obj;
+        free(text_owned);
+        if (json_object_object_get_ex(msg_json, "name", &name_obj))
+        {
+            const char *n = json_object_get_string(name_obj);
+            if (n && n[0])
+            {
+                free(channel->name);
+                channel->name = strdup(n);
+                if (channel->buffer)
+                {
+                    char short_name[128];
+                    snprintf(short_name, sizeof(short_name), "#%s", n);
+                    weechat_buffer_set(channel->buffer, "short_name", short_name);
+                    weechat_buffer_set(channel->buffer,
+                                       "localvar_set_channel", n);
+                    weechat_printf(channel->buffer,
+                                    "%schannel renamed to #%s",
+                                    weechat_prefix("network"), n);
+                }
+            }
+        }
         return;
     }
 
@@ -1137,7 +1198,8 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
         return;
     }
 
-    if (strcmp(type, "presence_change") == 0)
+    if (strcmp(type, "presence_change") == 0 ||
+        strcmp(type, "manual_presence_change") == 0)
     {
         struct json_object *user_obj;
         if (json_object_object_get_ex(json, "user", &user_obj))
@@ -1929,6 +1991,25 @@ slack_event_render_formatting(const char *text)
                 src = end + 1;
                 continue;
             }
+        }
+
+        /* blockquote: > text at line start */
+        if (src[0] == '>' &&
+            (src == text || src[-1] == '\n') &&
+            (src[1] == ' ' || src[1] == '>'))
+        {
+            const char *line_end = strchr(src, '\n');
+            size_t qlen = line_end ? (size_t)(line_end - src) : strlen(src);
+            const char *body = src;
+            /* skip leading > and spaces */
+            while (*body == '>' || *body == ' ')
+                body++;
+            slack_fmt_append(result, &pos, cap, "%s│ %.*s%s",
+                             weechat_color("lightblue"),
+                             (int)(src + qlen - body), body,
+                             weechat_color("reset"));
+            src += qlen;
+            continue;
         }
 
         result[pos++] = *src++;
@@ -3341,6 +3422,25 @@ slack_event_fetch_members(struct t_weeslack_workspace *workspace,
     }
 }
 
+void
+slack_event_refresh_members(struct t_weeslack_workspace *workspace,
+                            struct t_slack_channel *channel)
+{
+    struct t_slack_buffer *sbuf;
+
+    if (!workspace || !channel)
+        return;
+
+    channel->members_loaded = 0;
+    sbuf = slack_buffer_search_by_channel(channel->id);
+    if (!sbuf && channel->buffer)
+        sbuf = slack_buffer_search(channel->buffer);
+    if (sbuf)
+        slack_buffer_clear_nicks(sbuf);
+
+    slack_event_fetch_members(workspace, channel);
+}
+
 /* ============================================================
  * Mark as read
  * ============================================================ */
@@ -4099,7 +4199,11 @@ slack_event_simple_api_cb(struct t_weeslack_workspace *workspace,
     struct json_object *json = slack_json_decode(output);
     if (json)
     {
-        slack_api_check_error(workspace, json, ctx);
+        if (!slack_api_check_error(workspace, json, ctx))
+        {
+            SLACK_WS_PRINTF(workspace, "%sweeslack: %s ok",
+                            weechat_prefix("network"), ctx);
+        }
         json_object_put(json);
     }
 }

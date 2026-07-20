@@ -102,5 +102,8 @@ extern void slack_event_whois(struct t_weeslack_workspace *workspace,
 extern void slack_event_rtm_reconnect(struct t_weeslack_workspace *workspace);
 /* Refresh users.list + emoji.list without full connect bootstrap. */
 extern void slack_event_refresh_directory(struct t_weeslack_workspace *workspace);
+/* Force re-fetch of channel members into nicklist (clears members_loaded). */
+extern void slack_event_refresh_members(struct t_weeslack_workspace *workspace,
+                                        struct t_slack_channel *channel);
 
 #endif

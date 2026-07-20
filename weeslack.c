@@ -1085,6 +1085,37 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_prefix("network"));
         slack_event_refresh_directory(ws);
     }
+    else if (weechat_strcasecmp(argv[1], "names") == 0)
+    {
+        struct t_weeslack_workspace *ws;
+        const char *channel_id;
+        struct t_slack_channel *channel;
+
+        ws = weeslack_workspace_search("default");
+        if (!ws || !ws->connected)
+        {
+            weechat_printf(buffer, "%sweeslack: not connected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        channel_id = weeslack_cmd_channel_id(buffer);
+        if (!channel_id)
+        {
+            weechat_printf(buffer, "%sweeslack: no channel selected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        channel = slack_channel_search(channel_id);
+        if (!channel)
+        {
+            weechat_printf(buffer, "%sweeslack: channel not found",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        weechat_printf(buffer, "%sweeslack: refreshing nicklist…",
+                        weechat_prefix("network"));
+        slack_event_refresh_members(ws, channel);
+    }
     else if (weechat_strcasecmp(argv[1], "join") == 0)
     {
         struct t_weeslack_workspace *ws;
@@ -1223,6 +1254,8 @@ weeslack_command_cslack(const void *pointer, void *data,
         weechat_printf(buffer, "  %sleave%s [id]    Leave channel (alias: part)",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %srefresh%s       Re-fetch users + emoji",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %snames%s         Refresh channel nicklist",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %shelp%s         Show this help",
                         weechat_color("cyan"), weechat_color("reset"));
@@ -1984,7 +2017,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_command(
         "cslack",
         "Slack protocol commands",
-        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || help",
+        "connect || disconnect || migrate || list || channels || loadhistory || typing || upload || reply || topic || talk || mute || unmute || status || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
         "connect:      Connect to Slack using configured token\n"
         "disconnect:   Disconnect from Slack\n"
         "migrate:      Import token from wee-slack (python) config\n"
@@ -2024,8 +2057,9 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "join:         Join a channel by name or id\n"
         "leave / part: Leave current (or given) channel\n"
         "refresh:      Re-fetch users.list + emoji.list (no re-bootstrap)\n"
+        "names:        Refresh nicklist for the current channel\n"
         "help:         Show help",
-        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join|leave|part|refresh|help",
+        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
         &weeslack_command_cslack,
         NULL,
         NULL);

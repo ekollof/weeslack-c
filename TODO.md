@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — fresh rtm reconnect, goodbye/error RTM,
-whois presence, /cslack refresh
+**Last update:** 2026-07-20 — blockquotes, pin subtypes, names command,
+API ok feedback, join/leave nicklist
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -78,7 +78,7 @@ whois presence, /cslack refresh
 - [x] Full prior set + workspace-id fix + focused buffer  
 - [x] **`download`**, **`stars`**, **`star`**, **`unstar`**  
 - [x] **`linkarchive` / pin / star / react / reply** default to last printed message ts  
-- [x] **`whois`** (+ live `users.getPresence`), **`join`**, **`leave`/`part`**, **`refresh`**  
+- [x] **`whois`** (+ live `users.getPresence`), **`join`**, **`leave`/`part`**, **`refresh`**, **`names`**  
 - [x] Stars list — resolve channel/user names, format text (cap 40 shown)  
 - [x] Search list — resolve names, format text (cap 20 shown)  
 - [~] subscribe = local thread notify only  
@@ -122,7 +122,11 @@ whois presence, /cslack refresh
 - [x] `pin_added` / `pin_removed`, `channel_left` / `group_left` / `im_close` / `mpim_close`  
 - [x] Self-mention → `notify_highlight` (raw `<@U…>` or `@display_name`)  
 - [x] `me_message` (/me style), `channel_purpose`, Block Kit text fallback  
+- [x] Blockquotes (`> …`), `pinned_item` / `unpinned_item` / `channel_name` subtypes  
 - [x] HTML entity unescape (`&amp;`, numeric entities, …)  
+- [x] Join/leave message subtypes update nicklist  
+- [x] `manual_presence_change`  
+- [x] Simple API callbacks log success (`… ok`)  
 - [x] `dnd_updated` / `channel_deleted`  
 - [x] emoji_changed → re-fetch emoji.list **without** re-running channel bootstrap  
 - [x] Rate-limit + auth messaging  
