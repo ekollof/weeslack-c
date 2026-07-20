@@ -36,7 +36,7 @@ All `slack_http_request_new*` calls **enqueue**; nothing stampedes the API.
 |-----------|----------|
 | Fast queue | Normal Web API calls |
 | Slow queue (`SLACK_HTTP_SLOW`) | History + members; ≤1 promote/sec into fast |
-| Max concurrent | **2** libcurl multi handles total (API + binary + OAuth body) |
+| Max concurrent | **4** libcurl multi handles total (API + binary + OAuth body) |
 | 429 / `ratelimited` | Global cooldown from `Retry-After` (else ~8s); re-queue job |
 | Soft failure | Quadratic backoff re-queue (max 3 tries) |
 | `SLACK_HTTP_MARK` | `conversations.mark` — dropped under cooldown |

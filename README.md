@@ -21,7 +21,7 @@ Plugin binary: `weeslack.so` · Command: `/cslack` · Config: `weeslack.conf`
 - Slack RTM WebSocket (TLS + SNI, RFC6455 masking, ping/pong, reconnect)
 - Fresh `rtm.connect` URL after drops / `goodbye` (no stale WS reuse)
 - Web API via **libcurl multi** with a **paced request queue** (wee-slack model)
-- Rate-limit handling: max 2 concurrent, slow queue for history/members,
+- Rate-limit handling: max 4 concurrent, slow queue for history/members,
   global cooldown on 429 / `Retry-After`
 - Proxy via WeeChat globals for WebSocket and all libcurl traffic
 - Binary upload + authenticated download on the same multi (async)

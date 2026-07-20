@@ -28,7 +28,9 @@ struct t_slack_http_request *slack_http_requests = NULL;
 enum
 {
     SLACK_HTTP_MAX_TRIES         = 3,
-    SLACK_HTTP_MAX_CONCURRENT    = 2,
+    /* 2 felt too slow once API + binary shared the multi budget; 4 is a
+     * better default. Still far below unlimited stampede. */
+    SLACK_HTTP_MAX_CONCURRENT    = 4,
     SLACK_HTTP_TICK_MS           = 100,
     SLACK_HTTP_RETRY_DEFAULT_SEC = 8,
     SLACK_HTTP_RETRY_MAX_SEC     = 90,
