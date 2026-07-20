@@ -30,6 +30,8 @@ static void slack_event_presence_subscribe(struct t_weeslack_workspace *workspac
 static void slack_event_try_icat_preview(struct t_gui_buffer *buffer,
                                           const char *path,
                                           const char *mimetype);
+static void slack_event_remember_self_upload(const char *file_id);
+static int slack_event_is_recent_self_upload(const char *file_id);
 static void slack_event_custom_emoji_icat(
     struct t_weeslack_workspace *workspace,
     struct t_gui_buffer *buffer,
@@ -6059,24 +6061,36 @@ slack_event_upload_complete_cb(struct t_weeslack_workspace *workspace,
     slack_format_bytes(size_buf, sizeof(size_buf), ctx->length);
 
     /*
-     * Status line only — the RTM message event paints the chat [file] line
-     * (synthetic lines doubled when Slack does echo the share).
-     * Local /icat now (file is already on disk); RTM path also downloads
-     * for remote viewers' files.
+     * Status line only — RTM paints the chat [file] line.
+     * Local /icat once; mark file id so auto-download skips a second /icat.
      */
     {
         struct json_object *files_obj = NULL, *f0 = NULL, *url_obj = NULL;
+        struct json_object *id_obj = NULL;
         struct t_gui_buffer *buf;
         const char *permalink = NULL;
+        const char *fid = ctx->file_id;
 
         if (json_object_object_get_ex(json, "files", &files_obj) &&
             json_object_is_type(files_obj, json_type_array) &&
             json_object_array_length(files_obj) > 0)
         {
             f0 = json_object_array_get_idx(files_obj, 0);
-            if (f0 && json_object_object_get_ex(f0, "permalink", &url_obj))
-                permalink = json_object_get_string(url_obj);
+            if (f0)
+            {
+                if (json_object_object_get_ex(f0, "permalink", &url_obj))
+                    permalink = json_object_get_string(url_obj);
+                if (json_object_object_get_ex(f0, "id", &id_obj))
+                {
+                    const char *rid = json_object_get_string(id_obj);
+                    if (rid && rid[0])
+                        fid = rid;
+                }
+            }
         }
+
+        if (fid && fid[0])
+            slack_event_remember_self_upload(fid);
 
         slack_event_upload_printf(ctx, 0, "uploaded %s (%s)%s%s",
                                   name, size_buf,
@@ -7590,6 +7604,68 @@ struct t_slack_dl_ctx
 
 /* ---- Kitty /icat previews (weechat-icat), Xepher-style ---- */
 
+/*
+ * Own uploads call /icat on the local path, then the RTM message triggers
+ * auto-download + /icat again → double graphic. Remember file ids briefly.
+ */
+#define SLACK_RECENT_SELF_UPLOAD_MAX 16
+#define SLACK_RECENT_SELF_UPLOAD_SEC 120
+
+static struct
+{
+    char id[48];
+    time_t when;
+} g_recent_self_uploads[SLACK_RECENT_SELF_UPLOAD_MAX];
+
+static void
+slack_event_remember_self_upload(const char *file_id)
+{
+    int i, oldest;
+    time_t now, oldest_t;
+
+    if (!file_id || !file_id[0])
+        return;
+    now = time(NULL);
+    oldest = 0;
+    oldest_t = g_recent_self_uploads[0].when;
+    for (i = 0; i < SLACK_RECENT_SELF_UPLOAD_MAX; i++)
+    {
+        if (g_recent_self_uploads[i].id[0] &&
+            strcmp(g_recent_self_uploads[i].id, file_id) == 0)
+        {
+            g_recent_self_uploads[i].when = now;
+            return;
+        }
+        if (g_recent_self_uploads[i].when < oldest_t)
+        {
+            oldest_t = g_recent_self_uploads[i].when;
+            oldest = i;
+        }
+    }
+    snprintf(g_recent_self_uploads[oldest].id,
+             sizeof(g_recent_self_uploads[oldest].id), "%s", file_id);
+    g_recent_self_uploads[oldest].when = now;
+}
+
+static int
+slack_event_is_recent_self_upload(const char *file_id)
+{
+    int i;
+    time_t now;
+
+    if (!file_id || !file_id[0])
+        return 0;
+    now = time(NULL);
+    for (i = 0; i < SLACK_RECENT_SELF_UPLOAD_MAX; i++)
+    {
+        if (g_recent_self_uploads[i].id[0] &&
+            strcmp(g_recent_self_uploads[i].id, file_id) == 0 &&
+            now - g_recent_self_uploads[i].when <= SLACK_RECENT_SELF_UPLOAD_SEC)
+            return 1;
+    }
+    return 0;
+}
+
 static int
 slack_event_icat_command_registered(void)
 {
@@ -8413,6 +8489,14 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
             json_object_get_string(mode_obj) &&
             strcmp(json_object_get_string(mode_obj), "tombstone") == 0)
             continue;
+
+        /* Already previewed from local path after our /upload. */
+        if (json_object_object_get_ex(f, "id", &obj))
+        {
+            const char *fid = json_object_get_string(obj);
+            if (slack_event_is_recent_self_upload(fid))
+                continue;
+        }
 
         if (json_object_object_get_ex(f, "url_private_download", &obj))
             url = json_object_get_string(obj);
