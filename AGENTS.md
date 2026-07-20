@@ -189,6 +189,30 @@ These rules are **mandatory**.
 - `static` for file-local symbols; `(void)param` for unused.
 - One module per `.c`/`.h` pair; header guards.
 
+### Git commits
+
+Commit **regularly** between logical batches (not one giant dump at the end of
+a session). Prefer small, reviewable commits.
+
+**Message style:**
+
+- **Subject (first line):** short and terse — imperative, no trailing period,
+  roughly ≤72 chars. Focus on *what* changed, not a full essay.
+- **Body (after a blank line):** explain *why* / *how* when it is not obvious:
+  tradeoffs, rate-limit rationale, user-visible behavior, follow-ups.
+- No AI attribution footers; no “Co-authored-by” unless the user asked.
+
+Examples:
+
+```text
+Good subject:  Reopen closed channels on live message
+Bad subject:   This commit updates the buffer handling so that when a user
+               closes a channel we can still recreate it later when needed
+
+Good body:     Keep channel model after free; reset history_state so focus
+               re-fetches. History loads must not recreate buffers.
+```
+
 ## Live testing (vendored weechat-cmd)
 
 This tree vendors **agent automation** under `tools/`:
