@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <assert.h>
 
 #include <curl/curl.h>
 
@@ -23,11 +24,31 @@
 
 struct t_slack_http_request *slack_http_requests = NULL;
 
-#define SLACK_HTTP_MAX_TRIES         3
-#define SLACK_HTTP_MAX_CONCURRENT    2
-#define SLACK_HTTP_TICK_MS           100
-#define SLACK_HTTP_RETRY_DEFAULT_SEC 8
-#define SLACK_HTTP_RETRY_MAX_SEC     90
+/* Integer constant expressions (C11-friendly; prefer over #define). */
+enum
+{
+    SLACK_HTTP_MAX_TRIES         = 3,
+    SLACK_HTTP_MAX_CONCURRENT    = 2,
+    SLACK_HTTP_TICK_MS           = 100,
+    SLACK_HTTP_RETRY_DEFAULT_SEC = 8,
+    SLACK_HTTP_RETRY_MAX_SEC     = 90,
+    SLACK_HTTP_API_RESP_INIT     = 4096,
+    SLACK_HTTP_API_RESP_MAX      = 16 * 1024 * 1024,
+    SLACK_HTTP_API_HDRS_INIT     = 1024,
+    SLACK_HTTP_API_HDRS_MAX      = 256 * 1024,
+    SLACK_HTTP_CURL_TIMER_MS     = 50,
+    SLACK_HTTP_TIMEOUT_FALLBACK_MS = 30000
+};
+
+static_assert(SLACK_HTTP_MAX_CONCURRENT >= 1, "need at least one concurrent slot");
+static_assert(SLACK_HTTP_MAX_TRIES >= 1, "need at least one try");
+static_assert(SLACK_HTTP_RETRY_DEFAULT_SEC >= 1, "default Retry-After must be positive");
+static_assert(SLACK_HTTP_RETRY_MAX_SEC >= SLACK_HTTP_RETRY_DEFAULT_SEC,
+              "max Retry-After must cover default");
+static_assert(SLACK_HTTP_API_RESP_MAX >= SLACK_HTTP_API_RESP_INIT,
+              "API body cap must cover initial allocation");
+static_assert(SLACK_HTTP_TIMEOUT_FALLBACK_MS >= 5000,
+              "fallback HTTP timeout should be at least 5s");
 
 static int g_inflight = 0;
 static time_t g_cooldown_until = 0;
@@ -1080,7 +1101,8 @@ slack_http_curl_ensure_multi(void)
     if (!g_curl_timer && g_curl_multi)
     {
         g_curl_timer = weechat_hook_timer(
-            50, 0, 0, &slack_http_curl_timer_cb, NULL, NULL);
+            SLACK_HTTP_CURL_TIMER_MS, 0, 0, &slack_http_curl_timer_cb,
+            NULL, NULL);
     }
 }
 
@@ -1121,10 +1143,11 @@ slack_http_api_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
         return n;
     if (x->resp_len + n + 1 > x->resp_cap)
     {
-        size_t ncap = x->resp_cap ? x->resp_cap * 2 : 4096;
+        size_t ncap = x->resp_cap ? x->resp_cap * 2
+                                  : (size_t)SLACK_HTTP_API_RESP_INIT;
         while (ncap < x->resp_len + n + 1)
             ncap *= 2;
-        if (ncap > 16 * 1024 * 1024) /* 16 MiB response cap */
+        if (ncap > (size_t)SLACK_HTTP_API_RESP_MAX)
             return 0;
         nb = realloc(x->resp_body, ncap);
         if (!nb)
@@ -1149,10 +1172,11 @@ slack_http_api_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
         return n;
     if (x->hdrs_len + n + 1 > x->hdrs_cap)
     {
-        size_t ncap = x->hdrs_cap ? x->hdrs_cap * 2 : 1024;
+        size_t ncap = x->hdrs_cap ? x->hdrs_cap * 2
+                                  : (size_t)SLACK_HTTP_API_HDRS_INIT;
         while (ncap < x->hdrs_len + n + 1)
             ncap *= 2;
-        if (ncap > 256 * 1024)
+        if (ncap > (size_t)SLACK_HTTP_API_HDRS_MAX)
             return n; /* drop extra headers */
         nb = realloc(x->resp_hdrs, ncap);
         if (!nb)
@@ -1196,10 +1220,10 @@ slack_http_api_curl_start(struct t_slack_http_request *request)
 
     timeout_ms = weechat_config_integer(weeslack_config.slack_timeout);
     if (timeout_ms < 5000)
-        timeout_ms = 30000;
+        timeout_ms = SLACK_HTTP_TIMEOUT_FALLBACK_MS;
 
     curl_easy_setopt(x->easy, CURLOPT_URL, x->url);
-    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/0.2.0");
+    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/" WEESLACK_VERSION);
     curl_easy_setopt(x->easy, CURLOPT_ERRORBUFFER, x->errbuf);
     curl_easy_setopt(x->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(x->easy, CURLOPT_NOSIGNAL, 1L);
@@ -1323,7 +1347,7 @@ slack_http_curl_put_file(const char *url, const char *file_path,
 
     timeout_ms = weechat_config_integer(weeslack_config.slack_timeout);
     if (timeout_ms < 5000)
-        timeout_ms = 60000;
+        timeout_ms = 60000; /* uploads: allow longer than default API fallback */
 
     curl_easy_setopt(x->easy, CURLOPT_URL, x->url);
     /* Slack getUploadURLExternal: HTTP POST raw body (was curl -X POST -T). */
@@ -1335,7 +1359,7 @@ slack_http_curl_put_file(const char *url, const char *file_path,
     curl_easy_setopt(x->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(x->easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(x->easy, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
-    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/0.2.0");
+    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/" WEESLACK_VERSION);
     if (x->content_type)
     {
         struct curl_slist *hdr = NULL;
@@ -1422,7 +1446,7 @@ slack_http_curl_get_file(const char *url, const char *path,
 
     timeout_ms = weechat_config_integer(weeslack_config.slack_timeout);
     if (timeout_ms < 5000)
-        timeout_ms = 30000;
+        timeout_ms = SLACK_HTTP_TIMEOUT_FALLBACK_MS;
 
     curl_easy_setopt(x->easy, CURLOPT_URL, x->url);
     curl_easy_setopt(x->easy, CURLOPT_WRITEDATA, x->fp);
@@ -1431,7 +1455,7 @@ slack_http_curl_get_file(const char *url, const char *path,
     curl_easy_setopt(x->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(x->easy, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(x->easy, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
-    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/0.2.0");
+    curl_easy_setopt(x->easy, CURLOPT_USERAGENT, "weeslack/" WEESLACK_VERSION);
 
     if (x->authorization)
     {

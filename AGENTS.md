@@ -190,6 +190,10 @@ These rules are **mandatory**.
 - `-Wall -Wextra -Werror -pedantic`
 - `static` for file-local symbols; `(void)param` for unused.
 - One module per `.c`/`.h` pair; header guards.
+- Prefer **C11-friendly constants**: `enum { … = N }` for integer constant
+  expressions (array sizes, caps), not sprawling magic numbers.
+- Use **`static_assert` / `_Static_assert`** for invariants between those
+  constants (include `<assert.h>`). Do not require C23 `constexpr`.
 
 ### Git commits
 

@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <assert.h>
 
 #include "weeslack.h"
 #include "slack_event.h"
@@ -110,7 +111,9 @@ struct t_slack_weemoji
     struct t_slack_weemoji *next;
 };
 
-#define SLACK_WEEMOJI_BUCKETS 512
+enum { SLACK_WEEMOJI_BUCKETS = 512 };
+static_assert((SLACK_WEEMOJI_BUCKETS & (SLACK_WEEMOJI_BUCKETS - 1)) == 0,
+              "weemoji bucket count must be a power of two");
 static struct t_slack_weemoji *slack_weemoji_buckets[SLACK_WEEMOJI_BUCKETS];
 static int slack_weemoji_count = 0;
 
@@ -4025,10 +4028,27 @@ slack_event_schedule_background_history(struct t_weeslack_workspace *workspace)
 
 /* History: multi-page on the slow queue. Page size from history_fetch_count;
  * max pages from look.history_max_pages (default 5, hard max 20). */
-#define SLACK_HISTORY_PAGE_SIZE  100
-#define SLACK_HISTORY_MAX_PAGES_DEFAULT 5
-#define SLACK_MEMBERS_PAGE_SIZE  200
-#define SLACK_MEMBERS_MAX_PAGES_DEFAULT 3
+enum
+{
+    SLACK_HISTORY_PAGE_SIZE         = 100,
+    SLACK_HISTORY_MAX_PAGES_DEFAULT = 5,
+    SLACK_HISTORY_MAX_PAGES_SOFT    = 20,
+    SLACK_MEMBERS_PAGE_SIZE         = 200,
+    SLACK_MEMBERS_MAX_PAGES_DEFAULT = 3,
+    SLACK_MEMBERS_MAX_PAGES_SOFT    = 500,
+    SLACK_MEMBERS_UNLIMITED_PAGES   = 1000000,
+    SLACK_MEMBERS_MAX_USERINFO      = 40,
+    SLACK_USERS_MAX_PAGES           = 10
+};
+
+static_assert(SLACK_HISTORY_PAGE_SIZE > 0, "history page size");
+static_assert(SLACK_MEMBERS_PAGE_SIZE > 0, "members page size");
+static_assert(SLACK_HISTORY_MAX_PAGES_SOFT >= SLACK_HISTORY_MAX_PAGES_DEFAULT,
+              "history soft max covers default");
+static_assert(SLACK_MEMBERS_MAX_PAGES_SOFT >= SLACK_MEMBERS_MAX_PAGES_DEFAULT,
+              "members soft max covers default");
+static_assert(SLACK_MEMBERS_UNLIMITED_PAGES > SLACK_MEMBERS_MAX_PAGES_SOFT,
+              "unlimited sentinel must exceed soft max");
 
 static int
 slack_event_members_max_pages(void)
@@ -4037,12 +4057,11 @@ slack_event_members_max_pages(void)
 
     /* 0 = unlimited (paginate until Slack returns no cursor; still slow queue). */
     if (n == 0)
-        return 1000000;
+        return SLACK_MEMBERS_UNLIMITED_PAGES;
     if (n < 0)
         return SLACK_MEMBERS_MAX_PAGES_DEFAULT;
-    /* Soft ceiling for wild config values. */
-    if (n > 500)
-        return 500;
+    if (n > SLACK_MEMBERS_MAX_PAGES_SOFT)
+        return SLACK_MEMBERS_MAX_PAGES_SOFT;
     return n;
 }
 
@@ -4052,8 +4071,8 @@ slack_event_history_max_pages(void)
     int n = weechat_config_integer(weeslack_config.history_max_pages);
     if (n < 1)
         return SLACK_HISTORY_MAX_PAGES_DEFAULT;
-    if (n > 20)
-        return 20;
+    if (n > SLACK_HISTORY_MAX_PAGES_SOFT)
+        return SLACK_HISTORY_MAX_PAGES_SOFT;
     return n;
 }
 
@@ -4583,7 +4602,7 @@ slack_event_users_cb(struct t_weeslack_workspace *workspace,
     }
 
     /* paginate (capped) so large workspaces do not stampede */
-#define SLACK_USERS_MAX_PAGES 10
+
     {
         const char *next_cursor = NULL;
         struct json_object *meta, *cursor_obj;
@@ -5098,7 +5117,7 @@ struct t_slack_members_ctx
 };
 
 /* Cap users.info for unknown member ids (wee-slack style, rate-limit safe). */
-#define SLACK_MEMBERS_MAX_USERINFO  40
+
 
 struct t_slack_userinfo_ctx
 {

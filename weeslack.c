@@ -15,8 +15,6 @@
 
 /* declared in slack_http.h — ensure queue lives with plugin */
 
-#define WEESLACK_VERSION "0.2.0"
-
 WEECHAT_PLUGIN_NAME("weeslack")
 WEECHAT_PLUGIN_DESCRIPTION("Slack protocol support for WeeChat (migrates from wee-slack)")
 WEECHAT_PLUGIN_VERSION(WEESLACK_VERSION)

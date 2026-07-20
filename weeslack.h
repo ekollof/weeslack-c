@@ -3,6 +3,9 @@
 
 #include <weechat/weechat-plugin.h>
 
+/* Keep in sync with WEECHAT_PLUGIN_VERSION in weeslack.c */
+#define WEESLACK_VERSION "0.2.0"
+
 #define SLACK_WS_PRINTF(_ws, _fmt, ...) \
     weechat_printf((_ws && (_ws)->server_buffer) ? (_ws)->server_buffer : NULL, \
                     _fmt, ##__VA_ARGS__)
