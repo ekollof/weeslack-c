@@ -100,6 +100,11 @@ extern void slack_event_send_me_message(struct t_weeslack_workspace *workspace,
                                          const char *channel_id,
                                          const char *text,
                                          const char *thread_ts);
+/* chat.command — /cslack slash /cmd args */
+extern void slack_event_slash_command(struct t_weeslack_workspace *workspace,
+                                       const char *channel_id,
+                                       const char *command,
+                                       const char *text);
 /* chat.update / chat.delete — used by s/old/new/ input edits */
 extern void slack_event_update_message(struct t_weeslack_workspace *workspace,
                                         const char *channel_id,

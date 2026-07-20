@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-20 — $hash message ids, thread default, rehistory,
-send_typing_notice, away bar items; hdata line rewrite
+**Last update:** 2026-07-20 — reaction nicks, distracting, slash, cursor
+$hash keys, use_full_names / external suffix, thread $hash suffix
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -57,7 +57,10 @@ send_typing_notice, away bar items; hdata line rewrite
 
 - [x] Live + history; tags include `slack_ts_<ts>`; `localvar_slack_timestamp` + `last_message_ts`  
 - [x] Reactions + react/unreact commands (+ model update)  
-- [x] Reaction **suffixes** on history/live print (`[:name:count]`, own = lightgreen)  
+- [x] Reaction **suffixes** on history/live print (`[:name:count]`, own colored)  
+- [x] **`show_reaction_nicks`** + reaction color options  
+- [x] Thread suffix shows **`$hash` + reply count** (wee-slack style)  
+- [x] **`use_full_names`**, **`external_user_suffix`**  
 - [x] Typing (title indicator), mentions (`<@U>`, `<!here>`, `<!subteam^…>`), mute tags, read markers  
 - [x] Emoji shortcodes + custom map + `emoji_render_mode`  
 - [x] **weemoji.json** from WeeChat data/sharedir (standard unicode map + completion)  
@@ -94,6 +97,8 @@ send_typing_notice, away bar items; hdata line rewrite
 - [x] **`rehistory`** alias for loadhistory; reply/react/thread accept `$hash`  
 - [x] **`status`** profile emoji/text (`users.profile.set`) + `-delete`; legacy dnd/away/active  
 - [x] **`create`** (`conversations.create` [-private]), **`invite`**, **`showmuted`**  
+- [x] **`distracting`** / **`nodistractions`**; **`slash`** → `chat.command`  
+- [x] Cursor/mouse **`$hash` actions** (M/D/L/R/T + right-click)  
 - [x] Stars / search list polish  
 - [~] subscribe = local thread notify only  
 
@@ -171,10 +176,10 @@ rtm.connect
 4. Auto-open every thread on live reply (rejected — rate-limit / buffer storm)  
 5. Unlimited history/members pagination (hard caps keep the queue healthy)  
 6. Binary upload via `hook_url` (raw PUT still needs curl/process)  
-7. Cursor mouse bindings / line events for $hash insert (wee-slack line_event_cb)  
-8. distracting / nodistractions channel lists  
-9. Real `chat.command` slash protocol  
-10. `use_full_names` / `external_user_suffix` / `show_reaction_nicks` polish  
+7. Multi-workspace UI beyond one `default` id (also listed above)  
+8. Background load all history / auto_open_threads (rate-limit sensitive)  
+9. `unhide_buffers_with_activity`, `muted_channels_activity` polish  
+10. Full `record_events` debug mode  
 
 ---
 
@@ -207,3 +212,8 @@ rtm.connect
 | thread required raw ts | optional; default last thread parent; $hash/N |
 | No away bar item | `away` / `slack_away` bar items |
 | Typing only via /cslack typing | optional auto on input_text_changed |
+| No reaction nicks / colors | show_reaction_nicks + color options |
+| No distracting channel lists | distracting / nodistractions |
+| No chat.command slash | /cslack slash /cmd args |
+| No cursor $hash actions | mouse+cursor hsignals on weeslack buffers |
+| Thread suffix without hash | `[ Thread: $hash Replies: N ]` |

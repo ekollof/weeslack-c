@@ -870,6 +870,158 @@ weeslack_command_cslack(const void *pointer, void *data,
             weechat_printf(buffer, "%sweeslack: muted channels: %s",
                             weechat_prefix("network"), list);
     }
+    else if (weechat_strcasecmp(argv[1], "distracting") == 0)
+    {
+        /* Toggle current buffer full_name in look.distracting_channels */
+        struct t_gui_buffer *buf = weeslack_cmd_buffer(buffer);
+        const char *full = weechat_buffer_get_string(buf, "full_name");
+        const char *cur;
+        char new_list[2048];
+        int found = 0;
+
+        if (!full || !full[0])
+        {
+            weechat_printf(buffer, "%sweeslack: no buffer",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        cur = weechat_config_string(weeslack_config.distracting_channels);
+        new_list[0] = '\0';
+        if (cur && cur[0])
+        {
+            char *copy = strdup(cur);
+            char *tok, *save = NULL;
+            size_t pos = 0;
+
+            if (copy)
+            {
+                for (tok = strtok_r(copy, ",", &save); tok;
+                     tok = strtok_r(NULL, ",", &save))
+                {
+                    while (*tok == ' ')
+                        tok++;
+                    if (!*tok)
+                        continue;
+                    if (strcmp(tok, full) == 0)
+                    {
+                        found = 1;
+                        continue;
+                    }
+                    if (pos && pos + 1 < sizeof(new_list))
+                        new_list[pos++] = ',';
+                    {
+                        int n = snprintf(new_list + pos,
+                                         sizeof(new_list) - pos, "%s", tok);
+                        if (n > 0 && (size_t)n < sizeof(new_list) - pos)
+                            pos += (size_t)n;
+                    }
+                }
+                free(copy);
+            }
+        }
+        if (!found)
+        {
+            size_t len = strlen(new_list);
+            if (len && len + 1 < sizeof(new_list))
+            {
+                new_list[len++] = ',';
+                new_list[len] = '\0';
+            }
+            snprintf(new_list + strlen(new_list),
+                     sizeof(new_list) - strlen(new_list), "%s", full);
+            weechat_printf(buffer, "%sweeslack: marked distracting: %s",
+                            weechat_prefix("network"), full);
+        }
+        else
+            weechat_printf(buffer, "%sweeslack: unmarked distracting: %s",
+                            weechat_prefix("network"), full);
+        weechat_config_option_set(weeslack_config.distracting_channels,
+                                   new_list, 1);
+    }
+    else if (weechat_strcasecmp(argv[1], "nodistractions") == 0)
+    {
+        static int hide_distractions = 0;
+        const char *cur;
+        char *copy, *tok, *save = NULL;
+        int n = 0;
+
+        hide_distractions = !hide_distractions;
+        cur = weechat_config_string(weeslack_config.distracting_channels);
+        if (!cur || !cur[0])
+        {
+            weechat_printf(buffer, "%sweeslack: no distracting channels set "
+                            "(use /cslack distracting)",
+                            weechat_prefix("network"));
+            return WEECHAT_RC_OK;
+        }
+        copy = strdup(cur);
+        if (!copy)
+            return WEECHAT_RC_OK;
+        for (tok = strtok_r(copy, ",", &save); tok;
+             tok = strtok_r(NULL, ",", &save))
+        {
+            struct t_hdata *hbuf;
+            void *ptr;
+
+            while (*tok == ' ')
+                tok++;
+            if (!*tok)
+                continue;
+            hbuf = weechat_hdata_get("buffer");
+            ptr = hbuf ? weechat_hdata_get_list(hbuf, "gui_buffers") : NULL;
+            while (ptr)
+            {
+                const char *fn = weechat_hdata_string(hbuf, ptr, "full_name");
+                if (fn && strcmp(fn, tok) == 0)
+                {
+                    weechat_buffer_set(ptr, "hidden",
+                                       hide_distractions ? "1" : "0");
+                    n++;
+                    break;
+                }
+                ptr = weechat_hdata_move(hbuf, ptr, 1);
+            }
+        }
+        free(copy);
+        weechat_printf(buffer, "%sweeslack: %s %d distracting buffer(s)",
+                        weechat_prefix("network"),
+                        hide_distractions ? "hid" : "showed", n);
+    }
+    else if (weechat_strcasecmp(argv[1], "slash") == 0)
+    {
+        struct t_weeslack_workspace *ws;
+        const char *channel_id;
+        const char *cmd;
+        const char *text = "";
+
+        ws = weeslack_workspace_search("default");
+        if (!ws || !ws->connected)
+        {
+            weechat_printf(buffer, "%sweeslack: not connected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        if (argc < 3)
+        {
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack slash /command [args]",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        channel_id = weeslack_cmd_channel_id(buffer);
+        if (!channel_id)
+        {
+            weechat_printf(buffer, "%sweeslack: no channel selected",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        cmd = argv[2];
+        if (argc >= 4)
+            text = argv_eol[3];
+        slack_event_slash_command(ws, channel_id, cmd, text);
+        weechat_printf(buffer, "%sweeslack: running %s…",
+                        weechat_prefix("network"), cmd);
+    }
     else if (weechat_strcasecmp(argv[1], "away") == 0)
     {
         struct t_weeslack_workspace *ws;
@@ -1455,6 +1607,12 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sshowmuted%s    List muted channels",
                         weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %sdistracting%s  Toggle distracting mark",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %snodistractions%s Hide/show distracting",
+                        weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "  %sslash%s /cmd   Slack slash command",
+                        weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %saway%s         Mark as away",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sback%s         Mark as active",
@@ -1655,6 +1813,42 @@ weeslack_config_init(void)
         NULL, NULL, NULL,
         NULL, NULL, NULL);
 
+    weeslack_config.use_full_names = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "use_full_names", "boolean",
+        "Prefer real names over display names in the nick column",
+        NULL, 0, 0, "off", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.external_user_suffix = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "external_user_suffix", "string",
+        "Suffix for external/shared-channel users (e.g. *)",
+        NULL, 0, 0, "*", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.show_reaction_nicks = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "show_reaction_nicks", "boolean",
+        "Show nick list in reaction suffix instead of count",
+        NULL, 0, 0, "off", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.distracting_channels = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "distracting_channels", "string",
+        "Comma-separated buffer full_names marked distracting (for /cslack nodistractions)",
+        NULL, 0, 0, "", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
     /* color section */
     weeslack_config.section_color = weechat_config_new_section(
         weeslack_config.file, "color",
@@ -1700,6 +1894,24 @@ weeslack_config_init(void)
         "thread_suffix", "string",
         "Color for thread suffix: 'multiple' (nick color) or fixed color name",
         NULL, 0, 0, "cyan", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.color_reaction_suffix = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_color,
+        "reaction_suffix", "color",
+        "Color for reaction suffix brackets",
+        NULL, 0, 0, "darkgray", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.color_reaction_suffix_added_by_you = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_color,
+        "reaction_suffix_added_by_you", "color",
+        "Color for reactions that include you",
+        NULL, 0, 0, "lightgreen", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);
@@ -2375,6 +2587,113 @@ weeslack_away_bar_cb(const void *pointer, void *data,
     return out;
 }
 
+/*
+ * Cursor/mouse line hsignals (wee-slack): insert $hash, delete, reply, thread.
+ * Bound on plugin init for @chat(weeslack.*).
+ */
+static int
+weeslack_line_event_cb(const void *pointer, void *data,
+                        const char *signal, struct t_hashtable *hashtable)
+{
+    const char *action = data;
+    const char *tags, *buf_ptr_str;
+    struct t_gui_buffer *buf;
+    char *tags_copy = NULL, *tok, *save = NULL;
+    const char *ts_str = NULL;
+    struct t_slack_channel *ch;
+    struct t_slack_message *msg = NULL;
+    char cmd[256];
+    char hash_ref[40];
+
+    (void)pointer;
+    (void)signal;
+
+    if (!action || !hashtable)
+        return WEECHAT_RC_OK;
+
+    tags = weechat_hashtable_get(hashtable, "_chat_line_tags");
+    buf_ptr_str = weechat_hashtable_get(hashtable, "_buffer");
+    if (!tags || !buf_ptr_str)
+        return WEECHAT_RC_OK;
+
+    /* buffer pointer is hex string of address in some WeeChat versions */
+    buf = (struct t_gui_buffer *)strtoull(buf_ptr_str, NULL, 16);
+    if (!buf)
+        buf = weechat_current_buffer();
+
+    tags_copy = strdup(tags);
+    if (!tags_copy)
+        return WEECHAT_RC_OK;
+    for (tok = strtok_r(tags_copy, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save))
+    {
+        if (strncmp(tok, "slack_ts_", 9) == 0)
+        {
+            ts_str = tok + 9;
+            break;
+        }
+    }
+    free(tags_copy);
+    if (!ts_str)
+        return WEECHAT_RC_OK;
+
+    {
+        const char *cid = weechat_buffer_get_string(buf,
+                                                    "localvar_slack_channel_id");
+        if (!cid)
+            return WEECHAT_RC_OK;
+        ch = slack_channel_search(cid);
+        if (!ch)
+            return WEECHAT_RC_OK;
+        msg = slack_message_search(ch->messages, slack_ts_new(ts_str));
+    }
+    if (!msg)
+        return WEECHAT_RC_OK;
+
+    if (msg->hash && msg->hash[0])
+        snprintf(hash_ref, sizeof(hash_ref), "$%s", msg->hash);
+    else
+    {
+        char *s = slack_ts_to_string(msg->ts);
+        snprintf(hash_ref, sizeof(hash_ref), "%s", s ? s : "");
+        free(s);
+    }
+    if (!hash_ref[0])
+        return WEECHAT_RC_OK;
+
+    if (strcmp(action, "auto") == 0 || strcmp(action, "message") == 0)
+    {
+        weechat_command(buf, "/cursor stop");
+        snprintf(cmd, sizeof(cmd), "/input insert %s", hash_ref);
+        weechat_command(buf, cmd);
+    }
+    else if (strcmp(action, "delete") == 0)
+    {
+        snprintf(cmd, sizeof(cmd), "/input send %ss///", hash_ref);
+        weechat_command(buf, cmd);
+    }
+    else if (strcmp(action, "linkarchive") == 0)
+    {
+        weechat_command(buf, "/cursor stop");
+        snprintf(cmd, sizeof(cmd), "/cslack linkarchive %s", hash_ref);
+        weechat_command(buf, cmd);
+    }
+    else if (strcmp(action, "reply") == 0)
+    {
+        weechat_command(buf, "/cursor stop");
+        snprintf(cmd, sizeof(cmd), "/input insert /cslack reply %s ", hash_ref);
+        weechat_command(buf, cmd);
+    }
+    else if (strcmp(action, "thread") == 0)
+    {
+        weechat_command(buf, "/cursor stop");
+        snprintf(cmd, sizeof(cmd), "/cslack thread %s", hash_ref);
+        weechat_command(buf, cmd);
+    }
+
+    return WEECHAT_RC_OK;
+}
+
 /* Send typing notices while composing (throttled lightly by WeeChat signals). */
 static int
 weeslack_input_text_changed_cb(const void *pointer, void *data,
@@ -2420,7 +2739,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_command(
         "cslack",
         "Slack protocol commands",
-        "connect || disconnect || migrate || list || channels || loadhistory || rehistory || typing || upload || reply || topic || talk || mute || unmute || status || create || invite || showmuted || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
+        "connect || disconnect || migrate || list || channels || loadhistory || rehistory || typing || upload || reply || topic || talk || mute || unmute || status || create || invite || showmuted || distracting || nodistractions || slash || away || back || hide || show || label || thread || react || unreact || users || usergroups || teams || linkarchive || subscribe || unsubscribe || pin || unpin || search || download || stars || star || unstar || whois || join || leave || part || refresh || names || help",
         "connect:      Connect to Slack using configured token\n"
         "disconnect:   Disconnect from Slack\n"
         "migrate:      Import token from wee-slack (python) config\n"
@@ -2441,6 +2760,9 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "create:       Create channel ([-private] name)\n"
         "invite:       Invite user to current channel\n"
         "showmuted:    List muted channels\n"
+        "distracting:  Toggle current buffer as distracting\n"
+        "nodistractions: Hide/show all distracting buffers\n"
+        "slash:        Run Slack slash command (/cmd args)\n"
         "away:         Mark as away\n"
         "back:         Mark as active (clear away/DnD)\n"
         "hide:         Hide current channel\n"
@@ -2466,7 +2788,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "refresh:      Re-fetch users.list + emoji.list (no re-bootstrap)\n"
         "names:        Refresh nicklist for the current channel\n"
         "help:         Show help",
-        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|rehistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status -delete|%(slack_emoji)|dnd|away|active|create -private|invite %(slack_nicks)|showmuted|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
+        "connect|disconnect|migrate|list|channels|users|usergroups|loadhistory|rehistory|typing|upload|reply|topic|talk %(slack_nicks)|mute|unmute|status -delete|%(slack_emoji)|dnd|away|active|create -private|invite %(slack_nicks)|showmuted|distracting|nodistractions|slash|away|back|hide|show|label|thread %(slack_threads)|react|unreact|teams|linkarchive|subscribe|unsubscribe|pin|unpin|search|download|stars|star|unstar|whois %(slack_nicks)|join %(slack_channels)|leave|part|refresh|names|help",
         &weeslack_command_cslack,
         NULL,
         NULL);
@@ -2489,6 +2811,51 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
 
     weechat_bar_item_new("away", &weeslack_away_bar_cb, NULL, NULL);
     weechat_bar_item_new("slack_away", &weeslack_away_bar_cb, NULL, NULL);
+
+    /* Cursor / mouse line actions (wee-slack parity) */
+    {
+        struct t_hashtable *keys;
+
+        weechat_hook_hsignal("weeslack_mouse",
+                              &weeslack_line_event_cb, NULL, "auto");
+        weechat_hook_hsignal("weeslack_cursor_delete",
+                              &weeslack_line_event_cb, NULL, "delete");
+        weechat_hook_hsignal("weeslack_cursor_linkarchive",
+                              &weeslack_line_event_cb, NULL, "linkarchive");
+        weechat_hook_hsignal("weeslack_cursor_message",
+                              &weeslack_line_event_cb, NULL, "message");
+        weechat_hook_hsignal("weeslack_cursor_reply",
+                              &weeslack_line_event_cb, NULL, "reply");
+        weechat_hook_hsignal("weeslack_cursor_thread",
+                              &weeslack_line_event_cb, NULL, "thread");
+
+        keys = weechat_hashtable_new(8, WEECHAT_HASHTABLE_STRING,
+                                      WEECHAT_HASHTABLE_STRING, NULL, NULL);
+        if (keys)
+        {
+            weechat_hashtable_set(keys, "@chat(weeslack.*):button2",
+                                   "hsignal:weeslack_mouse");
+            weechat_key_bind("mouse", keys);
+            weechat_hashtable_free(keys);
+        }
+        keys = weechat_hashtable_new(16, WEECHAT_HASHTABLE_STRING,
+                                      WEECHAT_HASHTABLE_STRING, NULL, NULL);
+        if (keys)
+        {
+            weechat_hashtable_set(keys, "@chat(weeslack.*):D",
+                                   "hsignal:weeslack_cursor_delete");
+            weechat_hashtable_set(keys, "@chat(weeslack.*):L",
+                                   "hsignal:weeslack_cursor_linkarchive");
+            weechat_hashtable_set(keys, "@chat(weeslack.*):M",
+                                   "hsignal:weeslack_cursor_message");
+            weechat_hashtable_set(keys, "@chat(weeslack.*):R",
+                                   "hsignal:weeslack_cursor_reply");
+            weechat_hashtable_set(keys, "@chat(weeslack.*):T",
+                                   "hsignal:weeslack_cursor_thread");
+            weechat_key_bind("cursor", keys);
+            weechat_hashtable_free(keys);
+        }
+    }
 
     weechat_hook_hdata("cslack_channel", "Slack channels",
                         &weeslack_hdata_channel_cb, NULL, NULL);

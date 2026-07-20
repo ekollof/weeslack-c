@@ -60,12 +60,18 @@ struct t_weeslack_config
     struct t_config_option *download_path;
     struct t_config_option *never_away;
     struct t_config_option *send_typing_notice;
+    struct t_config_option *use_full_names;
+    struct t_config_option *external_user_suffix;
+    struct t_config_option *show_reaction_nicks;
+    struct t_config_option *distracting_channels;
 
     /* color */
     struct t_config_option *color_typing_notice;
     struct t_config_option *color_deleted;
     struct t_config_option *color_edited_suffix;
     struct t_config_option *color_thread_suffix;
+    struct t_config_option *color_reaction_suffix;
+    struct t_config_option *color_reaction_suffix_added_by_you;
     struct t_config_option *colorize_private_chats;
     struct t_config_option *color_buflist_muted_channels;
 };

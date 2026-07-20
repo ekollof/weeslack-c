@@ -571,10 +571,12 @@ slack_event_format_user(struct t_slack_user *user, const char *fallback_id,
 {
     const char *name = "unknown";
     const char *color = "default";
+    const char *ext = "";
     char hex_color[16];
     struct t_slack_bot *bot = NULL;
     int is_private = 0;
     int colorize = 1;
+    int use_full;
 
     if (channel &&
         (channel->type == SLACK_CHANNEL_TYPE_DM ||
@@ -585,14 +587,24 @@ slack_event_format_user(struct t_slack_user *user, const char *fallback_id,
         !weechat_config_boolean(weeslack_config.colorize_private_chats))
         colorize = 0;
 
+    use_full = weechat_config_boolean(weeslack_config.use_full_names);
+
     if (user)
     {
-        if (user->display_name && user->display_name[0])
+        if (use_full && user->real_name && user->real_name[0])
+            name = user->real_name;
+        else if (user->display_name && user->display_name[0])
             name = user->display_name;
         else if (user->real_name && user->real_name[0])
             name = user->real_name;
         else if (user->name && user->name[0])
             name = user->name;
+        if (user->is_external)
+        {
+            ext = weechat_config_string(weeslack_config.external_user_suffix);
+            if (!ext)
+                ext = "";
+        }
         if (colorize)
         {
             color = slack_user_get_color(user);
@@ -614,10 +626,11 @@ slack_event_format_user(struct t_slack_user *user, const char *fallback_id,
             name = fallback_id;
     }
 
-    char buf[256];
-    snprintf(buf, sizeof(buf), "%s%s%s",
+    char buf[320];
+    snprintf(buf, sizeof(buf), "%s%s%s%s",
              weechat_color(color),
              name,
+             ext,
              weechat_color("reset"));
     return strdup(buf);
 }
@@ -759,20 +772,55 @@ slack_event_unescape_html(const char *text)
     return out;
 }
 
+static void
+slack_reaction_build_piece(char *piece, size_t piece_sz,
+                           const char *rname, int rcount,
+                           char **users, int users_count)
+{
+    int show_nicks = weechat_config_boolean(weeslack_config.show_reaction_nicks);
+
+    if (show_nicks && users && users_count > 0)
+    {
+        char nicks[384];
+        size_t np = 0;
+        int j;
+
+        nicks[0] = '\0';
+        for (j = 0; j < users_count && np + 48 < sizeof(nicks); j++)
+        {
+            struct t_slack_user *u = users[j] ? slack_user_search(users[j])
+                                              : NULL;
+            const char *nn = u ? slack_user_best_name(u)
+                : (users[j] ? users[j] : "?");
+            int n = snprintf(nicks + np, sizeof(nicks) - np, "%s%s",
+                             np ? ", " : "", nn);
+            if (n > 0)
+                np += (size_t)n < sizeof(nicks) - np ? (size_t)n : 0;
+        }
+        if (users_count < rcount && np + 16 < sizeof(nicks))
+            snprintf(nicks + np, sizeof(nicks) - np, "%s%s",
+                     np ? ", " : "", "and others");
+        snprintf(piece, piece_sz, ":%s:(%s)", rname, nicks);
+    }
+    else
+        snprintf(piece, piece_sz, ":%s:%d", rname, rcount);
+}
+
 /*
- * Format message reactions like wee-slack: " [:thumbsup:2 :heart:1]"
- * Own reactions use a brighter color. Caller frees.
+ * Format reactions: " [:name:2 :heart:1]" or with nicks when configured.
+ * Own reactions use color_reaction_suffix_added_by_you. Caller frees.
  */
 static char *
 slack_event_format_reactions(struct t_weeslack_workspace *workspace,
                              struct json_object *msg_json)
 {
     struct json_object *reactions_obj;
-    size_t cap = 512;
+    size_t cap = 768;
     char *out;
     size_t pos = 0;
     int i, count, any = 0;
     const char *my_id;
+    const char *base_col, *mine_col;
 
     if (!msg_json ||
         !json_object_object_get_ex(msg_json, "reactions", &reactions_obj) ||
@@ -789,18 +837,26 @@ slack_event_format_reactions(struct t_weeslack_workspace *workspace,
     out[0] = '\0';
 
     my_id = (workspace && workspace->my_user_id) ? workspace->my_user_id : NULL;
+    base_col = weechat_config_string(weeslack_config.color_reaction_suffix);
+    if (!base_col || !base_col[0])
+        base_col = "darkgray";
+    mine_col = weechat_config_string(
+        weeslack_config.color_reaction_suffix_added_by_you);
+    if (!mine_col || !mine_col[0])
+        mine_col = "lightgreen";
 
     pos += (size_t)snprintf(out + pos, cap - pos, " %s[",
-                            weechat_color("darkgray"));
+                            weechat_color(base_col));
 
     for (i = 0; i < count; i++)
     {
         struct json_object *r = json_object_array_get_idx(reactions_obj, i);
         struct json_object *name_obj, *count_obj, *users_obj;
         const char *rname = NULL;
-        int rcount = 0;
-        int mine = 0;
-        int written;
+        int rcount = 0, mine = 0, un = 0, j, written;
+        char *uids_stack[32];
+        char **uids = NULL;
+        char piece[512];
 
         if (!r)
             continue;
@@ -811,23 +867,27 @@ slack_event_format_reactions(struct t_weeslack_workspace *workspace,
         if (!rname || rcount <= 0)
             continue;
 
-        if (my_id && json_object_object_get_ex(r, "users", &users_obj) &&
+        if (json_object_object_get_ex(r, "users", &users_obj) &&
             json_object_is_type(users_obj, json_type_array))
         {
-            int j, un = json_object_array_length(users_obj);
+            un = json_object_array_length(users_obj);
+            if (un > 32)
+                un = 32;
+            uids = uids_stack;
             for (j = 0; j < un; j++)
             {
                 struct json_object *u = json_object_array_get_idx(users_obj, j);
                 const char *uid = json_object_get_string(u);
-                if (uid && strcmp(uid, my_id) == 0)
-                {
+                uids[j] = (char *)uid;
+                if (my_id && uid && strcmp(uid, my_id) == 0)
                     mine = 1;
-                    break;
-                }
             }
         }
 
-        if (pos + 64 >= cap)
+        slack_reaction_build_piece(piece, sizeof(piece), rname, rcount,
+                                   uids, un);
+
+        if (pos + strlen(piece) + 48 >= cap)
         {
             char *n = realloc(out, cap * 2);
             if (!n)
@@ -837,14 +897,13 @@ slack_event_format_reactions(struct t_weeslack_workspace *workspace,
         }
 
         if (mine)
-            written = snprintf(out + pos, cap - pos, "%s%s:%s:%d%s",
+            written = snprintf(out + pos, cap - pos, "%s%s%s%s",
                                any ? " " : "",
-                               weechat_color("lightgreen"),
-                               rname, rcount,
-                               weechat_color("darkgray"));
+                               weechat_color(mine_col), piece,
+                               weechat_color(base_col));
         else
-            written = snprintf(out + pos, cap - pos, "%s:%s:%d",
-                               any ? " " : "", rname, rcount);
+            written = snprintf(out + pos, cap - pos, "%s%s",
+                               any ? " " : "", piece);
         if (written > 0)
             pos += (size_t)written < cap - pos ? (size_t)written : 0;
         any = 1;
@@ -855,7 +914,6 @@ slack_event_format_reactions(struct t_weeslack_workspace *workspace,
         free(out);
         return NULL;
     }
-
     if (pos + 8 < cap)
         snprintf(out + pos, cap - pos, "]%s", weechat_color("reset"));
     return out;
@@ -867,11 +925,12 @@ slack_event_format_reactions_msg(struct t_weeslack_workspace *workspace,
                                   struct t_slack_message *msg)
 {
     SlackReaction *r;
-    size_t cap = 512;
+    size_t cap = 768;
     char *out;
     size_t pos = 0;
     int any = 0;
     const char *my_id;
+    const char *base_col, *mine_col;
 
     if (!msg || !msg->reactions)
         return NULL;
@@ -881,13 +940,21 @@ slack_event_format_reactions_msg(struct t_weeslack_workspace *workspace,
         return NULL;
     out[0] = '\0';
     my_id = (workspace && workspace->my_user_id) ? workspace->my_user_id : NULL;
+    base_col = weechat_config_string(weeslack_config.color_reaction_suffix);
+    if (!base_col || !base_col[0])
+        base_col = "darkgray";
+    mine_col = weechat_config_string(
+        weeslack_config.color_reaction_suffix_added_by_you);
+    if (!mine_col || !mine_col[0])
+        mine_col = "lightgreen";
 
     pos += (size_t)snprintf(out + pos, cap - pos, " %s[",
-                            weechat_color("darkgray"));
+                            weechat_color(base_col));
 
     for (r = msg->reactions; r; r = r->next)
     {
         int mine = 0, j, written;
+        char piece[512];
 
         if (!r->name || r->users_count <= 0)
             continue;
@@ -902,7 +969,10 @@ slack_event_format_reactions_msg(struct t_weeslack_workspace *workspace,
                 }
             }
         }
-        if (pos + 64 >= cap)
+        slack_reaction_build_piece(piece, sizeof(piece), r->name,
+                                   r->users_count, r->users, r->users_count);
+
+        if (pos + strlen(piece) + 48 >= cap)
         {
             char *n = realloc(out, cap * 2);
             if (!n)
@@ -911,14 +981,13 @@ slack_event_format_reactions_msg(struct t_weeslack_workspace *workspace,
             cap *= 2;
         }
         if (mine)
-            written = snprintf(out + pos, cap - pos, "%s%s:%s:%d%s",
+            written = snprintf(out + pos, cap - pos, "%s%s%s%s",
                                any ? " " : "",
-                               weechat_color("lightgreen"),
-                               r->name, r->users_count,
-                               weechat_color("darkgray"));
+                               weechat_color(mine_col), piece,
+                               weechat_color(base_col));
         else
-            written = snprintf(out + pos, cap - pos, "%s:%s:%d",
-                               any ? " " : "", r->name, r->users_count);
+            written = snprintf(out + pos, cap - pos, "%s%s",
+                               any ? " " : "", piece);
         if (written > 0)
             pos += (size_t)written < cap - pos ? (size_t)written : 0;
         any = 1;
@@ -1456,17 +1525,38 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
                      slack_event_notify_tags(workspace, channel, text, history),
                      ts_tag ? ts_tag : "0");
 
-            weechat_printf_date_tags(
-                channel->buffer,
-                ts.sec,
-                tags,
-                "%s\t%s%s  %s[%d replies]%s",
-                nick_str,
-                formatted ? formatted : "",
-                reactions ? reactions : "",
-                weechat_color(suffix_color),
-                rc,
-                weechat_color("reset"));
+            /* wee-slack style: [ Thread: $hash Replies: N ] */
+            {
+                const char *h = msg->hash;
+                if (h && h[0])
+                {
+                    weechat_printf_date_tags(
+                        channel->buffer,
+                        ts.sec,
+                        tags,
+                        "%s\t%s%s  %s[ Thread: $%s Replies: %d ]%s",
+                        nick_str,
+                        formatted ? formatted : "",
+                        reactions ? reactions : "",
+                        weechat_color(suffix_color),
+                        h, rc,
+                        weechat_color("reset"));
+                }
+                else
+                {
+                    weechat_printf_date_tags(
+                        channel->buffer,
+                        ts.sec,
+                        tags,
+                        "%s\t%s%s  %s[%d replies]%s",
+                        nick_str,
+                        formatted ? formatted : "",
+                        reactions ? reactions : "",
+                        weechat_color(suffix_color),
+                        rc,
+                        weechat_color("reset"));
+                }
+            }
 
             if (ts_tag)
             {
@@ -5436,6 +5526,40 @@ slack_event_delete_message(struct t_weeslack_workspace *workspace,
                            json_object_new_string(timestamp));
     slack_http_request_new(workspace, "chat.delete", params,
                            slack_event_simple_api_cb, (void *)"chat.delete");
+    json_object_put(params);
+}
+
+void
+slack_event_slash_command(struct t_weeslack_workspace *workspace,
+                           const char *channel_id,
+                           const char *command,
+                           const char *text)
+{
+    struct json_object *params;
+    char cmd_buf[128];
+    const char *cmd;
+
+    if (!workspace || !channel_id || !command || !command[0])
+        return;
+
+    if (command[0] == '/')
+        cmd = command;
+    else
+    {
+        snprintf(cmd_buf, sizeof(cmd_buf), "/%s", command);
+        cmd = cmd_buf;
+    }
+
+    params = json_object_new_object();
+    if (!params)
+        return;
+    json_object_object_add(params, "command", json_object_new_string(cmd));
+    json_object_object_add(params, "channel",
+                           json_object_new_string(channel_id));
+    json_object_object_add(params, "text",
+                           json_object_new_string(text ? text : ""));
+    slack_http_request_new(workspace, "chat.command", params,
+                           slack_event_simple_api_cb, (void *)"chat.command");
     json_object_put(params);
 }
 
