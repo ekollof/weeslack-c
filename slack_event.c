@@ -1970,7 +1970,6 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                     if (is_manual)
                         workspace->my_manual_away =
                             (strcmp(presence, "away") == 0);
-                    weechat_bar_item_update("away");
                     weechat_bar_item_update("slack_away");
                 }
             }
@@ -1996,7 +1995,6 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                 if (is_manual)
                     workspace->my_manual_away =
                         (strcmp(presence, "away") == 0);
-                weechat_bar_item_update("away");
                 weechat_bar_item_update("slack_away");
             }
         }

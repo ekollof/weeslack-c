@@ -1037,7 +1037,6 @@ weeslack_command_cslack(const void *pointer, void *data,
         ws->my_manual_away = 1;
         free(ws->my_presence);
         ws->my_presence = strdup("away");
-        weechat_bar_item_update("away");
         weechat_bar_item_update("slack_away");
         weechat_printf(buffer, "%sweeslack: marked as away",
                         weechat_prefix("network"));
@@ -1058,7 +1057,6 @@ weeslack_command_cslack(const void *pointer, void *data,
         ws->my_manual_away = 0;
         free(ws->my_presence);
         ws->my_presence = strdup("active");
-        weechat_bar_item_update("away");
         weechat_bar_item_update("slack_away");
         weechat_printf(buffer, "%sweeslack: marked as active",
                         weechat_prefix("network"));
@@ -2651,9 +2649,16 @@ weeslack_away_bar_cb(const void *pointer, void *data,
     if (!away)
         return NULL;
 
-    color = weechat_config_string(weechat_config_get("weechat.color.item_away"));
-    if (!color || !color[0])
-        color = "cyan";
+    color = "cyan";
+    {
+        struct t_config_option *opt = weechat_config_get("weechat.color.item_away");
+        if (opt)
+        {
+            const char *c = weechat_config_string(opt);
+            if (c && c[0])
+                color = c;
+        }
+    }
     out = malloc(64);
     if (!out)
         return NULL;
@@ -2672,9 +2677,9 @@ static int
 weeslack_line_event_cb(const void *pointer, void *data,
                         const char *signal, struct t_hashtable *hashtable)
 {
-    const char *action = data;
-    const char *tags, *buf_ptr_str;
-    struct t_gui_buffer *buf;
+    const char *action = "message";
+    const char *tags;
+    struct t_gui_buffer *buf = NULL;
     char *tags_copy = NULL, *tok, *save = NULL;
     const char *ts_str = NULL;
     struct t_slack_channel *ch;
@@ -2683,20 +2688,51 @@ weeslack_line_event_cb(const void *pointer, void *data,
     char hash_ref[40];
 
     (void)pointer;
-    (void)signal;
+    (void)data;
 
-    if (!action || !hashtable)
+    if (!hashtable)
         return WEECHAT_RC_OK;
+
+    if (signal)
+    {
+        if (strstr(signal, "delete"))
+            action = "delete";
+        else if (strstr(signal, "linkarchive"))
+            action = "linkarchive";
+        else if (strstr(signal, "reply"))
+            action = "reply";
+        else if (strstr(signal, "thread"))
+            action = "thread";
+        else if (strstr(signal, "mouse"))
+            action = "auto";
+    }
 
     tags = weechat_hashtable_get(hashtable, "_chat_line_tags");
-    buf_ptr_str = weechat_hashtable_get(hashtable, "_buffer");
-    if (!tags || !buf_ptr_str)
+    if (!tags)
         return WEECHAT_RC_OK;
 
-    /* buffer pointer is hex string of address in some WeeChat versions */
-    buf = (struct t_gui_buffer *)strtoull(buf_ptr_str, NULL, 16);
+    {
+        const char *full = weechat_hashtable_get(hashtable, "_buffer_full_name");
+        if (full && full[0])
+        {
+            struct t_hdata *hbuf = weechat_hdata_get("buffer");
+            void *ptr = hbuf ? weechat_hdata_get_list(hbuf, "gui_buffers") : NULL;
+            while (ptr)
+            {
+                const char *fn = weechat_hdata_string(hbuf, ptr, "full_name");
+                if (fn && strcmp(fn, full) == 0)
+                {
+                    buf = ptr;
+                    break;
+                }
+                ptr = weechat_hdata_move(hbuf, ptr, 1);
+            }
+        }
+    }
     if (!buf)
         buf = weechat_current_buffer();
+    if (!buf)
+        return WEECHAT_RC_OK;
 
     tags_copy = strdup(tags);
     if (!tags_copy)
@@ -2886,51 +2922,55 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_signal("input_text_changed",
                          &weeslack_input_text_changed_cb, NULL, NULL);
 
-    weechat_bar_item_new("away", &weeslack_away_bar_cb, NULL, NULL);
     weechat_bar_item_new("slack_away", &weeslack_away_bar_cb, NULL, NULL);
 
     /* Cursor / mouse line actions (wee-slack parity) */
     {
-        struct t_hashtable *keys;
-
         weechat_hook_hsignal("weeslack_mouse",
-                              &weeslack_line_event_cb, NULL, "auto");
+                              &weeslack_line_event_cb, NULL, NULL);
         weechat_hook_hsignal("weeslack_cursor_delete",
-                              &weeslack_line_event_cb, NULL, "delete");
+                              &weeslack_line_event_cb, NULL, NULL);
         weechat_hook_hsignal("weeslack_cursor_linkarchive",
-                              &weeslack_line_event_cb, NULL, "linkarchive");
+                              &weeslack_line_event_cb, NULL, NULL);
         weechat_hook_hsignal("weeslack_cursor_message",
-                              &weeslack_line_event_cb, NULL, "message");
+                              &weeslack_line_event_cb, NULL, NULL);
         weechat_hook_hsignal("weeslack_cursor_reply",
-                              &weeslack_line_event_cb, NULL, "reply");
+                              &weeslack_line_event_cb, NULL, NULL);
         weechat_hook_hsignal("weeslack_cursor_thread",
-                              &weeslack_line_event_cb, NULL, "thread");
+                              &weeslack_line_event_cb, NULL, NULL);
 
-        keys = weechat_hashtable_new(8, WEECHAT_HASHTABLE_STRING,
-                                      WEECHAT_HASHTABLE_STRING, NULL, NULL);
-        if (keys)
+        /* Separate hashtables per context; __quiet avoids core spam. */
         {
-            weechat_hashtable_set(keys, "@chat(weeslack.*):button2",
-                                   "hsignal:weeslack_mouse");
-            weechat_key_bind("mouse", keys);
-            weechat_hashtable_free(keys);
-        }
-        keys = weechat_hashtable_new(16, WEECHAT_HASHTABLE_STRING,
-                                      WEECHAT_HASHTABLE_STRING, NULL, NULL);
-        if (keys)
-        {
-            weechat_hashtable_set(keys, "@chat(weeslack.*):D",
-                                   "hsignal:weeslack_cursor_delete");
-            weechat_hashtable_set(keys, "@chat(weeslack.*):L",
-                                   "hsignal:weeslack_cursor_linkarchive");
-            weechat_hashtable_set(keys, "@chat(weeslack.*):M",
-                                   "hsignal:weeslack_cursor_message");
-            weechat_hashtable_set(keys, "@chat(weeslack.*):R",
-                                   "hsignal:weeslack_cursor_reply");
-            weechat_hashtable_set(keys, "@chat(weeslack.*):T",
-                                   "hsignal:weeslack_cursor_thread");
-            weechat_key_bind("cursor", keys);
-            weechat_hashtable_free(keys);
+            struct t_hashtable *keys;
+
+            keys = weechat_hashtable_new(8, WEECHAT_HASHTABLE_STRING,
+                                          WEECHAT_HASHTABLE_STRING, NULL, NULL);
+            if (keys)
+            {
+                weechat_hashtable_set(keys, "__quiet", "1");
+                weechat_hashtable_set(keys, "@chat(weeslack.*):button2",
+                                       "hsignal:weeslack_mouse");
+                weechat_key_bind("mouse", keys);
+                weechat_hashtable_free(keys);
+            }
+            keys = weechat_hashtable_new(16, WEECHAT_HASHTABLE_STRING,
+                                          WEECHAT_HASHTABLE_STRING, NULL, NULL);
+            if (keys)
+            {
+                weechat_hashtable_set(keys, "__quiet", "1");
+                weechat_hashtable_set(keys, "@chat(weeslack.*):D",
+                                       "hsignal:weeslack_cursor_delete");
+                weechat_hashtable_set(keys, "@chat(weeslack.*):L",
+                                       "hsignal:weeslack_cursor_linkarchive");
+                weechat_hashtable_set(keys, "@chat(weeslack.*):M",
+                                       "hsignal:weeslack_cursor_message");
+                weechat_hashtable_set(keys, "@chat(weeslack.*):R",
+                                       "hsignal:weeslack_cursor_reply");
+                weechat_hashtable_set(keys, "@chat(weeslack.*):T",
+                                       "hsignal:weeslack_cursor_thread");
+                weechat_key_bind("cursor", keys);
+                weechat_hashtable_free(keys);
+            }
         }
     }
 
