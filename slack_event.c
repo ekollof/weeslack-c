@@ -4034,11 +4034,15 @@ static int
 slack_event_members_max_pages(void)
 {
     int n = weechat_config_integer(weeslack_config.members_max_pages);
-    if (n < 1)
+
+    /* 0 = unlimited (paginate until Slack returns no cursor; still slow queue). */
+    if (n == 0)
+        return 1000000;
+    if (n < 0)
         return SLACK_MEMBERS_MAX_PAGES_DEFAULT;
-    /* Hard cap 50 pages (10k members) — still rate-limit sensitive. */
-    if (n > 50)
-        return 50;
+    /* Soft ceiling for wild config values. */
+    if (n > 500)
+        return 500;
     return n;
 }
 

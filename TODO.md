@@ -1,7 +1,7 @@
 # TODO: wee-slack Feature Parity
 
-**Last update:** 2026-07-21 — v0.2.0: reconnect, join/show reopen closed
-buffers, live-only auto-reopen, history reset on close
+**Last update:** 2026-07-21 — members_max_pages 0=unlimited; Web API via
+libcurl multi (no hook_url)
 
 **Markers:** `[x]` done · `[~]` partial · `[ ]` missing
 
@@ -12,16 +12,16 @@ buffers, live-only auto-reopen, history reset on close
 - [x] WebSocket RTM — TLS+SNI, masking, ping/pong, reconnect backoff  
 - [x] Reconnect re-issues **`rtm.connect`** (fresh URL; stale WS URLs expire)  
 - [x] RTM `goodbye` / `error` → reconnect path  
-- [x] HTTP — `hook_url`, Bearer + cookie, `ipresolve=v4`, POST form bodies  
+- [x] HTTP — **libcurl multi** for Web API form POST/GET (Bearer + cookie,
+      IPv4, proxy); no `hook_url`  
 - [x] **Request queue (wee-slack model)**  
   - Fast queue + **slow queue** (history/members; ≤1 promote/sec)  
   - Max **2** concurrent in-flight  
   - On 429: **global cooldown** from `Retry-After`, re-queue job (no stampede)  
   - Soft failures: quadratic backoff re-queue  
   - `conversations.mark` is **droppable** under cooldown  
-- [x] Proxy via WeeChat globals — WS, `hook_url`, **and** libcurl multi  
-- [x] Binary **PUT** (upload) + authenticated **GET** (download) via **libcurl
-      multi** (async; Bearer + cookie; no curl CLI / `hook_process`)  
+- [x] Proxy via WeeChat globals — WS + all libcurl multi transfers  
+- [x] Binary **PUT** (upload) + authenticated **GET** (download) via same multi
 
 ---
 
@@ -44,7 +44,8 @@ buffers, live-only auto-reopen, history reset on close
 - [x] Server + child hierarchy, localvars  
 - [x] Lazy history + serial queue; members on focus  
 - [x] History pagination — multi-page slow queue (`history_fetch_count`, page cap)  
-- [x] Members pagination — configurable pages (default 3, hard max **50** ×200)  
+- [x] Members pagination — configurable pages (default 3; **0 = unlimited**;
+      soft max 500 ×200; still slow queue)  
 - [x] Unknown members → **`users.info`** (slow, capped); no stub nicks  
 - [x] Nicklist **Here / Away** groups + **`presence_sub`** (RTM); bots purged  
 - [x] Thread buffers + replies — **open on demand** (`/cslack thread` / subscribe)  
@@ -150,16 +151,16 @@ Prefer process restart over unload/load when hunting crashes.
 
 ---
 
-## Intentionally out of scope / platform limits
+## Intentionally remaining
 
-1. **Unlimited** members with no page cap — hard max **50** pages (~10k);
-   higher risks API storms (use `look.members_max_pages`)  
-2. Replacing WeeChat’s `hook_url` Web API with pure libcurl for form POSTs
-   (queue + `hook_url` already work; multi is for binary bodies)  
+None for feature parity. Optional future polish only (e.g. packaging,
+CHANGELOG, live soak tests).
 
-**Custom emoji graphics:** not “out of scope” — use **`look.icat_enabled`**
-when `/icat` is registered (same path as file image previews). Text lines
-keep `:shortcode:`; image follows as a Kitty tile.
+**Custom emoji graphics:** `look.icat_enabled` + registered `/icat` (Kitty
+tiles under the message). Chat lines stay text.
+
+**Members:** `look.members_max_pages` **0** = paginate until Slack has no
+cursor (still slow queue). Non-zero caps pages (soft max 500).
 
 ---
 
@@ -178,6 +179,8 @@ keep `:shortcode:`; image follows as a Kitty tile.
 | Closed buffer stayed gone | live reopen; join/show local reopen; history_state reset |
 | No reconnect command | `/cslack reconnect [all]` |
 | Version | **0.2.0** |
+| members hard cap | **0 = unlimited**; soft max 500 |
+| Web API used hook_url | libcurl multi form POST/GET |
 
 Earlier gap-fix history lives in git; the checklist above is the source of
 truth for parity status.

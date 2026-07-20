@@ -21,7 +21,7 @@ Dependencies: WeeChat headers, json-c, OpenSSL, libcurl.
 
 ```
 weeslack.c       Plugin entry, config, /cslack, completions, upgrade, workspace
-slack_http.c     Web API: queue + POST form bodies + rate-limit cooldown
+slack_http.c     Web API queue + libcurl multi (form + binary) + rate-limit
 slack_ws.c       RTM WebSocket (hook_connect + OpenSSL TLS + RFC6455 masking)
 slack_event.c    Events, history, members, upload, stars, download, API helpers
 slack_buffer.c   Buffer create/layout, nicklist, typing title, localvars
@@ -36,7 +36,7 @@ All `slack_http_request_new*` calls **enqueue**; nothing stampedes the API.
 |-----------|----------|
 | Fast queue | Normal API calls |
 | Slow queue (`SLACK_HTTP_SLOW`) | History + members; ≤1 promote/sec into fast |
-| Max concurrent | 2 in-flight `hook_url`s |
+| Max concurrent | 2 in-flight libcurl transfers |
 | 429 / `ratelimited` | Global cooldown from `Retry-After` (else ~8s); re-queue job |
 | Soft failure | Quadratic backoff re-queue (max 3 tries) |
 | `SLACK_HTTP_MARK` | `conversations.mark` — dropped under cooldown |
@@ -180,7 +180,8 @@ These rules are **mandatory**.
 ### Concurrency / Reentrancy
 
 - WeeChat callbacks are main-thread; do not block.
-- HTTP is async (`hook_url`); binary upload/download use libcurl multi + timer.
+- HTTP is async via **libcurl multi** + timer (API form bodies and binary
+  upload/download share the multi).
 - Queue pump is timer-driven (`slack_http_queue_init`).
 
 ### Code Style

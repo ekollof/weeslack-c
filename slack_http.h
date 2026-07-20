@@ -73,13 +73,13 @@ extern void slack_http_queue_shutdown(void);
 /* Fill buf with queue/cooldown summary (for /cslack queue). Returns buf. */
 extern char *slack_http_queue_status(char *buf, size_t buflen);
 
-/* Proxy URL from WeeChat globals (caller frees). Used by hook_url + libcurl multi. */
+/* Proxy URL from WeeChat globals (caller frees). Used by libcurl multi. */
 extern char *slack_http_get_proxy_url(void);
 
 /*
  * libcurl multi (async, non-blocking via WeeChat timer):
- * binary PUT for upload, GET for emoji/image cache.
- * callback: ok=1 on HTTP 2xx, else 0. http_code may be 0 on transport error.
+ * Web API form POST/GET, binary PUT (upload), GET (download/emoji).
+ * File helpers: callback ok=1 on HTTP 2xx; http_code may be 0 on transport error.
  */
 typedef void (*t_slack_curl_done_cb)(void *user_data, int ok, long http_code);
 

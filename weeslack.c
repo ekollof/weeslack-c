@@ -3322,9 +3322,10 @@ weeslack_config_init(void)
     weeslack_config.members_max_pages = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "members_max_pages", "integer",
-        "Max conversations.members pages per channel (200 members/page; "
-        "hard max 50 ≈ 10k members; higher values risk rate limits)",
-        NULL, 1, 50, "3", NULL, 0,
+        "Max conversations.members pages per channel (200 members/page). "
+        "0 = unlimited (until no cursor; still slow queue — can be heavy). "
+        "Soft max 500. Default 3",
+        NULL, 0, 500, "3", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);
@@ -3332,7 +3333,7 @@ weeslack_config_init(void)
     weeslack_config.slack_timeout = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "slack_timeout", "integer",
-        "Timeout in milliseconds for Slack HTTP (hook_url) and libcurl "
+        "Timeout in milliseconds for Slack HTTP (libcurl multi) and "
         "binary upload/download (min effective 5000)",
         NULL, 5000, 600000, "30000", NULL, 0,
         NULL, NULL, NULL,

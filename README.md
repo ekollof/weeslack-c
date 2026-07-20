@@ -20,11 +20,11 @@ Plugin binary: `weeslack.so` · Command: `/cslack` · Config: `weeslack.conf`
 
 - Slack RTM WebSocket (TLS + SNI, RFC6455 masking, ping/pong, reconnect)
 - Fresh `rtm.connect` URL after drops / `goodbye` (no stale WS reuse)
-- Web API via WeeChat `hook_url` with a **paced request queue** (wee-slack model)
+- Web API via **libcurl multi** with a **paced request queue** (wee-slack model)
 - Rate-limit handling: max 2 concurrent, slow queue for history/members,
   global cooldown on 429 / `Retry-After`
-- Proxy via WeeChat globals for HTTP, WebSocket, and libcurl upload/download
-- Binary upload + authenticated download via **libcurl multi** (async)
+- Proxy via WeeChat globals for WebSocket and all libcurl traffic
+- Binary upload + authenticated download on the same multi (async)
 - Auto-connect on load when a valid token is set (respects WeeChat `-a`)
 - Multi-team: comma-separated tokens; staggered connect; workspace-scoped
   users/bots/emoji; ids `default`, `ws1`, …
@@ -215,7 +215,7 @@ File: `weeslack.conf` (WeeChat options under `weeslack.*`).
 | `look.background_history_max` | Cap channels for background history (default 40) |
 | `look.history_fetch_count` | Messages per history page |
 | `look.history_max_pages` | Max history pages per channel load (default 5) |
-| `look.members_max_pages` | Max members pages (default 3, hard max 50) |
+| `look.members_max_pages` | Members pages (default 3; **0 = unlimited**; soft max 500) |
 | `look.slack_timeout` | HTTP/libcurl timeout ms (default 30000) |
 | `look.debug_level` | With `debug_mode`: 1–5 (RTM lines at level 3) |
 | `look.emoji_render_mode` | emoji / shortcodes / text |
