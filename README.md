@@ -39,8 +39,10 @@ Plugin binary: `weeslack.so` · Command: `/cslack` · Config: `weeslack.conf`
 - Threads: open on demand, subscribe API; `auto_open_threads` =
   `off` / `subscribed` / `all`
 - Input: `s/old/new/`, `+emoji` / `-emoji`, `/me`, Slack slash `/cmd`, `//` escape
-- IRC-style commands on weeslack buffers: `/me` `/join` `/query` `/msg`
-  `/part` `/topic` `/invite` `/away` `/whois`
+- Short aliases on Slack buffers: `/upload` `/reply` `/thread` `/talk` …
+  (see [Short aliases](#short-aliases-slack-buffers-only) below)
+- IRC-style on Slack buffers only: `/me` `/join` `/query` `/msg` `/part`
+  `/leave` `/topic` `/invite` `/away` `/whois` (IRC unchanged elsewhere)
 - Auth file download (Xepher-style path) + optional auto-download + Kitty
   `/icat` previews when `icat.py` is loaded
 
@@ -157,7 +159,7 @@ This disconnects RTM, closes that team’s buffers, and drops its entry from
 | `/cslack pin` / `unpin` | Pins |
 | `/cslack search` / `linkarchive` | Search; permalink for message |
 | `/cslack download <url>` | Authenticated private file download |
-| `/cslack upload <file>` | Upload to current channel |
+| `/cslack upload <file>` | Upload to current channel (`~` expanded; status on channel buffer) |
 | `/cslack slash /cmd [args]` | Slack `chat.command` |
 | `/cslack whois` | User info + live presence |
 | `/cslack hide` / `show` / `label` | Buffer hide / title |
@@ -172,6 +174,60 @@ This disconnects RTM, closes that team’s buffers, and drops its entry from
 When `/cslack` is run from `core.weechat` (e.g. debug socket), buffer-local
 ops use the focused window buffer.
 
+### Short aliases (Slack buffers only)
+
+These are registered WeeChat commands that **forward to** `/cslack <name> …`.
+They only run on `weeslack` buffers; elsewhere they print a short error.
+Args and completions match the corresponding `/cslack` subcommand.
+
+| Alias | Same as | Notes |
+|-------|---------|--------|
+| `/upload <file>` | `/cslack upload` | `~` / `~/` expanded; spaces in path OK |
+| `/reply [ts\|$hash\|N] <msg>` | `/cslack reply` | Default parent = last message |
+| `/thread <ts\|$hash\|N>` | `/cslack thread` | Open thread buffer |
+| `/rehistory` | `/cslack rehistory` | Force history reload |
+| `/loadhistory` | `/cslack loadhistory` | Same family as rehistory |
+| `/hide` | `/cslack hide` | Hide current buffer |
+| `/label <text>` | `/cslack label` | Local buffer title |
+| `/talk <user>[,user2…]` | `/cslack talk` | DM or MPDM |
+| `/react [ts] <emoji>` | `/cslack react` | Add reaction |
+| `/unreact [ts] <emoji>` | `/cslack unreact` | Remove reaction |
+| `/star [ts]` | `/cslack star` | Star message |
+| `/unstar [ts]` | `/cslack unstar` | Unstar message |
+| `/stars` | `/cslack stars` | List stars |
+| `/mute` / `/unmute` | `/cslack mute` / `unmute` | Channel mute prefs |
+| `/download <url>` | `/cslack download` | Auth private file download |
+| `/pin [ts]` / `/unpin [ts]` | `/cslack pin` / `unpin` | Pins |
+| `/subscribe` / `/unsubscribe` | `/cslack subscribe` / `unsubscribe` | Thread/channel |
+| `/search <query>` | `/cslack search` | Message search |
+| `/status …` | `/cslack status` | Profile / DnD / away / active |
+
+Example (on a channel or self-DM buffer):
+
+```
+/upload ~/Pictures/shot.png
+/reply thanks!
+/react thumbsup
+/talk alice,bob
+```
+
+### IRC-style commands (Slack buffers only)
+
+Handled via `hook_command_run` only when the buffer’s plugin is `weeslack`.
+On IRC (or other) buffers these fall through to the normal plugin (e.g. irc).
+
+| Command | Effect on Slack |
+|---------|-----------------|
+| `/me <action>` | `chat.meMessage` |
+| `/join <#channel\|id>` | Join / open channel |
+| `/query` / `/msg <nick>[,nick2…] [text]` | Open DM/MPDM; `/msg` may send text |
+| `/part` / `/leave [channel]` | Leave channel |
+| `/topic [#channel] [text\|-delete]` | Show or set topic |
+| `/invite <nick>` | Invite to current channel |
+| `/away` / `/away -` | Away; `-` clears (back) |
+| `/whois <nick>` | User info + presence |
+| `/upload <file>` | Same as short alias / `/cslack upload` |
+
 ### Input shortcuts (on channel buffers)
 
 | Input | Effect |
@@ -179,14 +235,9 @@ ops use the focused window buffer.
 | `s/old/new/[gi]` | Edit last (or `$hash`/N) message via `chat.update` |
 | `s///` | Delete message via `chat.delete` |
 | `+emoji` / `-emoji` | Add/remove reaction on last message |
-| `/me text` | `chat.meMessage` |
+| `/me text` | `chat.meMessage` (also IRC-style command above) |
 | `/cmd args` | Unknown WeeChat commands → Slack slash (`chat.command`) |
 | `//text` or leading space | Post literal text starting with `/` |
-
-### IRC-style commands (weeslack buffers only)
-
-`/me` `/join` `/query` `/msg` `/part` `/leave` `/topic` `/invite` `/away`
-`/whois` are handled for Slack and do not affect IRC buffers.
 
 ## Configuration highlights
 

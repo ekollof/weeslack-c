@@ -508,6 +508,8 @@ weeslack_maybe_autoconnect(void)
     weechat_hook_timer(500, 0, 1, &weeslack_autoconnect_cb, NULL, NULL);
 }
 
+static int weeslack_buffer_is_ours(struct t_gui_buffer *buffer);
+
 /* Prefer the focused window buffer when /cslack is run from core
  * (debug socket, /command -buffer core, scripts). */
 static struct t_gui_buffer *
@@ -534,6 +536,250 @@ weeslack_cmd_channel_id(struct t_gui_buffer *buffer)
 {
     struct t_gui_buffer *buf = weeslack_cmd_buffer(buffer);
     return weechat_buffer_get_string(buf, "localvar_slack_channel_id");
+}
+
+/*
+ * Top-level short commands (/reply, /upload, …) → /cslack <sub> …
+ * pointer is a stable string: the cslack subcommand name.
+ * Only runs on weeslack buffers (same idea as wee-slack hide/reply/thread).
+ */
+static int
+weeslack_top_alias_cb(const void *pointer, void *data,
+                      struct t_gui_buffer *buffer,
+                      int argc, char **argv, char **argv_eol)
+{
+    const char *sub = (const char *)pointer;
+    struct t_gui_buffer *buf;
+    char *cmd;
+    size_t need;
+
+    (void)data;
+    (void)argv;
+
+    if (!sub || !sub[0])
+        return WEECHAT_RC_ERROR;
+
+    buf = weeslack_cmd_buffer(buffer);
+    if (!weeslack_buffer_is_ours(buf))
+    {
+        weechat_printf(buffer,
+                       "%sweeslack: /%s only works on a Slack buffer "
+                       "(use /cslack %s …)",
+                       weechat_prefix("error"), sub, sub);
+        return WEECHAT_RC_OK;
+    }
+
+    if (argc >= 2 && argv_eol[1] && argv_eol[1][0])
+    {
+        need = strlen(sub) + strlen(argv_eol[1]) + 16;
+        cmd = malloc(need);
+        if (!cmd)
+            return WEECHAT_RC_ERROR;
+        snprintf(cmd, need, "/cslack %s %s", sub, argv_eol[1]);
+    }
+    else
+    {
+        need = strlen(sub) + 16;
+        cmd = malloc(need);
+        if (!cmd)
+            return WEECHAT_RC_ERROR;
+        snprintf(cmd, need, "/cslack %s", sub);
+    }
+
+    weechat_command(buf, cmd);
+    free(cmd);
+    return WEECHAT_RC_OK;
+}
+
+/* Register short /cmd aliases that forward to /cslack. */
+static void
+weeslack_register_top_aliases(void)
+{
+    /*
+     * name, cslack_sub, description, args, args_description, completion
+     * Completions reuse existing weeslack / WeeChat templates.
+     */
+    static const struct
+    {
+        const char *name;
+        const char *sub;
+        const char *desc;
+        const char *args;
+        const char *args_desc;
+        const char *completion;
+    } aliases[] = {
+        {
+            "upload", "upload",
+            "Upload a file to the current Slack channel",
+            "<file_path>",
+            "file_path: local path (~ and ~/ expanded; spaces allowed)\n"
+            "Same as /cslack upload. Slack buffers only.",
+            "%(filename)"
+        },
+        {
+            "reply", "reply",
+            "Reply in a Slack thread (current channel)",
+            "[thread_ts|$hash|N] <message>",
+            "Default parent is the last message in the buffer.\n"
+            "Same as /cslack reply.",
+            "%(slack_threads)"
+        },
+        {
+            "thread", "thread",
+            "Open a Slack thread by parent message ts",
+            "<thread_ts|$hash|N>",
+            "Same as /cslack thread.",
+            "%(slack_threads)"
+        },
+        {
+            "rehistory", "rehistory",
+            "Reload Slack history for the current channel",
+            "",
+            "Same as /cslack rehistory / loadhistory.",
+            ""
+        },
+        {
+            "loadhistory", "loadhistory",
+            "Load Slack history for the current channel",
+            "",
+            "Same as /cslack loadhistory.",
+            ""
+        },
+        {
+            "hide", "hide",
+            "Hide the current Slack channel buffer",
+            "",
+            "Same as /cslack hide.",
+            ""
+        },
+        {
+            "label", "label",
+            "Set a local title on the current Slack buffer",
+            "<text>",
+            "Same as /cslack label.",
+            ""
+        },
+        {
+            "talk", "talk",
+            "Open a Slack DM (or MPDM with comma-separated nicks)",
+            "<user|id>[,user2…]",
+            "Same as /cslack talk / open.",
+            "%(slack_nicks)"
+        },
+        {
+            "react", "react",
+            "Add a reaction to a Slack message",
+            "[ts|$hash|N] <emoji>",
+            "Same as /cslack react.",
+            "%(slack_threads) %(slack_emoji)"
+        },
+        {
+            "unreact", "unreact",
+            "Remove a reaction from a Slack message",
+            "[ts|$hash|N] <emoji>",
+            "Same as /cslack unreact.",
+            "%(slack_threads) %(slack_emoji)"
+        },
+        {
+            "star", "star",
+            "Star a Slack message",
+            "[ts|$hash|N]",
+            "Same as /cslack star.",
+            "%(slack_threads)"
+        },
+        {
+            "unstar", "unstar",
+            "Unstar a Slack message",
+            "[ts|$hash|N]",
+            "Same as /cslack unstar.",
+            "%(slack_threads)"
+        },
+        {
+            "stars", "stars",
+            "List starred Slack items",
+            "",
+            "Same as /cslack stars.",
+            ""
+        },
+        {
+            "mute", "mute",
+            "Mute the current Slack channel",
+            "",
+            "Same as /cslack mute.",
+            ""
+        },
+        {
+            "unmute", "unmute",
+            "Unmute the current Slack channel",
+            "",
+            "Same as /cslack unmute.",
+            ""
+        },
+        {
+            "download", "download",
+            "Download a Slack private file URL",
+            "<url>",
+            "Same as /cslack download.",
+            ""
+        },
+        {
+            "pin", "pin",
+            "Pin a Slack message",
+            "[ts|$hash|N]",
+            "Same as /cslack pin.",
+            "%(slack_threads)"
+        },
+        {
+            "unpin", "unpin",
+            "Unpin a Slack message",
+            "[ts|$hash|N]",
+            "Same as /cslack unpin.",
+            "%(slack_threads)"
+        },
+        {
+            "subscribe", "subscribe",
+            "Subscribe to the current Slack thread/channel",
+            "",
+            "Same as /cslack subscribe.",
+            ""
+        },
+        {
+            "unsubscribe", "unsubscribe",
+            "Unsubscribe from the current Slack thread/channel",
+            "",
+            "Same as /cslack unsubscribe.",
+            ""
+        },
+        {
+            "search", "search",
+            "Search Slack messages",
+            "<query>",
+            "Same as /cslack search.",
+            ""
+        },
+        {
+            "status", "status",
+            "Set Slack profile status / presence / DnD",
+            "[emoji [text]|-delete|dnd|away|active]",
+            "Same as /cslack status.",
+            "%(slack_emoji)"
+        },
+        { NULL, NULL, NULL, NULL, NULL, NULL }
+    };
+    int i;
+
+    for (i = 0; aliases[i].name; i++)
+    {
+        weechat_hook_command(
+            aliases[i].name,
+            aliases[i].desc,
+            aliases[i].args,
+            aliases[i].args_desc,
+            aliases[i].completion,
+            &weeslack_top_alias_cb,
+            aliases[i].sub,
+            NULL);
+    }
 }
 
 /* Resolve a message ts: explicit arg (ts / $hash / index), else buffer, else last. */
@@ -1351,32 +1597,33 @@ weeslack_command_cslack(const void *pointer, void *data,
     else if (weechat_strcasecmp(argv[1], "upload") == 0)
     {
         struct t_weeslack_workspace *ws;
-        ws = weeslack_workspace_from_buffer(buffer);
+        const char *channel_id;
+        const char *path;
+
+        ws = weeslack_workspace_from_buffer(weeslack_cmd_buffer(buffer));
         if (!ws || !ws->connected)
         {
             weechat_printf(buffer, "%sweeslack: not connected",
                             weechat_prefix("error"));
             return WEECHAT_RC_OK;
         }
-
-        if (argc < 3)
-        {
-            weechat_printf(buffer, "%sweeslack: usage: /cslack upload <file_path>",
-                            weechat_prefix("error"));
-            return WEECHAT_RC_OK;
-        }
-
-        const char *channel_id = weeslack_cmd_channel_id(buffer);
-        if (!channel_id)
+        channel_id = weeslack_cmd_channel_id(buffer);
+        if (!channel_id || !channel_id[0])
         {
             weechat_printf(buffer, "%sweeslack: no channel selected",
                             weechat_prefix("error"));
             return WEECHAT_RC_OK;
         }
-
-        slack_event_upload_file(ws, channel_id, argv[2], NULL);
-        weechat_printf(buffer, "%sweeslack: uploading %s...",
-                        weechat_prefix("network"), argv[2]);
+        path = (argc >= 3) ? argv_eol[2] : NULL;
+        if (!path || !path[0])
+        {
+            weechat_printf(buffer,
+                            "%sweeslack: usage: /cslack upload <file_path>",
+                            weechat_prefix("error"));
+            return WEECHAT_RC_OK;
+        }
+        /* ~ expansion + channel feedback inside slack_event_upload_file. */
+        slack_event_upload_file(ws, channel_id, path, NULL);
     }
     else if (weechat_strcasecmp(argv[1], "reply") == 0)
     {
@@ -2776,13 +3023,13 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %styping%s       Send typing notification",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %supload%s <file> Upload a file",
+        weechat_printf(buffer, "  %supload%s <file> Upload a file  → also /upload",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %sreply%s [ts] <msg> Reply in thread (default: last)",
+        weechat_printf(buffer, "  %sreply%s [ts] <msg> Thread reply  → also /reply",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %stopic%s <text>    Set channel topic",
+        weechat_printf(buffer, "  %stopic%s <text>    Set channel topic  → also /topic",
                         weechat_color("cyan"), weechat_color("reset"));
-        weechat_printf(buffer, "  %stalk%s <user>  Open DM with user (alias: open)",
+        weechat_printf(buffer, "  %stalk%s <user>  Open DM  → also /talk (open=talk)",
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %sopen%s <user>  Alias for talk (DM/MPDM)",
                         weechat_color("cyan"), weechat_color("reset"));
@@ -2858,6 +3105,23 @@ weeslack_command_cslack(const void *pointer, void *data,
                         weechat_color("cyan"), weechat_color("reset"));
         weechat_printf(buffer, "  %shelp%s         Show this help",
                         weechat_color("cyan"), weechat_color("reset"));
+        weechat_printf(buffer, "%sShort aliases (Slack buffers only):%s",
+                        weechat_color("bold"), weechat_color("reset"));
+        weechat_printf(buffer,
+                        "  /upload /reply /thread /rehistory /loadhistory "
+                        "/hide /label /talk");
+        weechat_printf(buffer,
+                        "  /react /unreact /star /unstar /stars /mute /unmute "
+                        "/download");
+        weechat_printf(buffer,
+                        "  /pin /unpin /subscribe /unsubscribe /search /status");
+        weechat_printf(buffer, "%sIRC-style (Slack buffers only):%s",
+                        weechat_color("bold"), weechat_color("reset"));
+        weechat_printf(buffer,
+                        "  /me /join /query /msg /part /leave /topic "
+                        "/invite /away /whois");
+        weechat_printf(buffer,
+                        "See README.md for full alias tables.");
     }
     else
     {
@@ -4536,6 +4800,19 @@ weeslack_command_run_cb(const void *pointer, void *data,
         return WEECHAT_RC_OK_EAT;
     }
 
+    if (weechat_strncasecmp(command, "/upload", 7) == 0 &&
+        (command[7] == ' ' || command[7] == '\0'))
+    {
+        char cmd[4096];
+
+        if (args[0])
+            snprintf(cmd, sizeof(cmd), "/cslack upload %s", args);
+        else
+            snprintf(cmd, sizeof(cmd), "/cslack upload");
+        weechat_command(buffer, cmd);
+        return WEECHAT_RC_OK_EAT;
+    }
+
     return WEECHAT_RC_OK;
 }
 
@@ -4871,7 +5148,16 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         "loadhistory:  Load message history for current channel\n"
         "rehistory:    Alias for loadhistory\n"
         "typing:       Send typing notification for current channel\n"
-        "upload:       Upload a file to current channel\n"
+        "upload:       Upload a file to current channel (alias: /upload)\n"
+        "\n"
+        "Short aliases (Slack buffers only; same as /cslack <name> …):\n"
+        "  /upload /reply /thread /rehistory /loadhistory /hide /label\n"
+        "  /talk /react /unreact /star /unstar /stars /mute /unmute\n"
+        "  /download /pin /unpin /subscribe /unsubscribe /search /status\n"
+        "\n"
+        "IRC-style (Slack buffers only; IRC unchanged elsewhere):\n"
+        "  /me /join /query /msg /part /leave /topic /invite /away /whois\n"
+        "\n"
         "reply:        Reply in thread ([ts] msg; default last msg as parent)\n"
         "topic:        Set channel topic\n"
         "talk:         Open DM with user id or name (comma-list = MPDM)\n"
@@ -4942,11 +5228,11 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weechat_hook_signal("input_text_changed",
                          &weeslack_input_text_changed_cb, NULL, NULL);
 
-    /* IRC-style commands on weeslack buffers (wee-slack parity). */
+    /* IRC-style / short commands on weeslack buffers (wee-slack parity). */
     {
         const char *cmds[] = {
             "/me", "/join", "/query", "/msg", "/part", "/leave",
-            "/topic", "/invite", "/away", "/whois", NULL
+            "/topic", "/invite", "/away", "/whois", "/upload", NULL
         };
         int i;
         for (i = 0; cmds[i]; i++)
@@ -4955,6 +5241,9 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
                                       NULL, NULL);
         }
     }
+
+    /* Short /reply /upload /thread … → /cslack (Slack buffers only). */
+    weeslack_register_top_aliases();
 
     /* Mark-read when WeeChat clears hotlist (wee-slack set_unread hooks). */
     weechat_hook_command_run("/input set_unread",

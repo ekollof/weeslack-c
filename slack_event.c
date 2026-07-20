@@ -5895,6 +5895,33 @@ struct t_slack_upload_ctx
     long length;
 };
 
+/* Expand leading ~/ or bare ~ using $HOME. ~user is left unchanged. */
+static char *
+slack_event_expand_path(const char *path)
+{
+    const char *home;
+    size_t home_len, rest_len;
+    char *out;
+
+    if (!path || !path[0])
+        return NULL;
+    if (path[0] != '~' || (path[1] != '\0' && path[1] != '/'))
+        return strdup(path);
+
+    home = getenv("HOME");
+    if (!home || !home[0])
+        return strdup(path);
+
+    home_len = strlen(home);
+    rest_len = strlen(path + 1); /* "" or "/..." */
+    out = malloc(home_len + rest_len + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, home, home_len);
+    memcpy(out + home_len, path + 1, rest_len + 1);
+    return out;
+}
+
 static void
 slack_event_upload_ctx_free(struct t_slack_upload_ctx *ctx)
 {
@@ -5909,33 +5936,123 @@ slack_event_upload_ctx_free(struct t_slack_upload_ctx *ctx)
     free(ctx);
 }
 
+/* Prefer the channel buffer so the user sees status where they typed /upload. */
+static struct t_gui_buffer *
+slack_event_upload_buffer(const struct t_slack_upload_ctx *ctx)
+{
+    struct t_slack_channel *ch;
+
+    if (ctx && ctx->channel_id && ctx->channel_id[0])
+    {
+        ch = slack_channel_search(ctx->channel_id);
+        if (ch && ch->buffer)
+            return ch->buffer;
+    }
+    if (ctx && ctx->workspace && ctx->workspace->server_buffer)
+        return ctx->workspace->server_buffer;
+    return NULL;
+}
+
+static void
+slack_event_upload_printf(const struct t_slack_upload_ctx *ctx,
+                          int is_error, const char *fmt, ...)
+{
+    struct t_gui_buffer *buf;
+    va_list ap;
+    char msg[1024];
+    int n;
+
+    if (!fmt)
+        return;
+
+    va_start(ap, fmt);
+    n = vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+
+    buf = slack_event_upload_buffer(ctx);
+    weechat_printf(buf, "%sweeslack: %s",
+                   is_error ? weechat_prefix("error")
+                            : weechat_prefix("network"),
+                   msg);
+}
+
 static void
 slack_event_upload_complete_cb(struct t_weeslack_workspace *workspace,
                                 int return_code, const char *output,
                                 void *user_data)
 {
     struct t_slack_upload_ctx *ctx = user_data;
+    struct json_object *json;
+    const char *name;
+    char size_buf[32];
+
+    (void) workspace;
+
+    if (!ctx)
+        return;
+
+    name = (ctx->filename && ctx->filename[0]) ? ctx->filename : "file";
 
     if (return_code != 0 || !output)
     {
-        SLACK_WS_PRINTF(workspace, "%sweeslack: file complete failed (rc=%d)",
-                        weechat_prefix("error"), return_code);
+        slack_event_upload_printf(ctx, 1,
+                                  "upload failed (complete HTTP rc=%d)",
+                                  return_code);
         slack_event_upload_ctx_free(ctx);
         return;
     }
 
-    struct json_object *json = slack_json_decode(output);
-    if (json)
+    json = slack_json_decode(output);
+    if (!json)
     {
-        if (!slack_api_check_error(workspace, json, "files.completeUploadExternal"))
-        {
-            SLACK_WS_PRINTF(workspace, "%sweeslack: uploaded %s",
-                            weechat_prefix("network"),
-                            ctx && ctx->filename ? ctx->filename : "file");
-        }
-        json_object_put(json);
+        slack_event_upload_printf(ctx, 1,
+                                  "upload failed (invalid complete response)");
+        slack_event_upload_ctx_free(ctx);
+        return;
     }
 
+    if (slack_api_check_error(workspace, json, "files.completeUploadExternal"))
+    {
+        /* check_error already logged API error on server; mirror on channel */
+        struct json_object *error_obj;
+        const char *err = "unknown";
+
+        if (json_object_object_get_ex(json, "error", &error_obj))
+            err = json_object_get_string(error_obj);
+        slack_event_upload_printf(ctx, 1, "upload of %s failed: %s",
+                                  name, err ? err : "unknown");
+        json_object_put(json);
+        slack_event_upload_ctx_free(ctx);
+        return;
+    }
+
+    slack_format_bytes(size_buf, sizeof(size_buf), ctx->length);
+
+    /* Immediate local feedback (self-DM may not echo a message event). */
+    {
+        struct json_object *files_obj, *f0, *url_obj;
+        const char *permalink = NULL;
+
+        if (json_object_object_get_ex(json, "files", &files_obj) &&
+            json_object_is_type(files_obj, json_type_array) &&
+            json_object_array_length(files_obj) > 0)
+        {
+            f0 = json_object_array_get_idx(files_obj, 0);
+            if (f0 && json_object_object_get_ex(f0, "permalink", &url_obj))
+                permalink = json_object_get_string(url_obj);
+        }
+
+        if (permalink && permalink[0])
+            slack_event_upload_printf(ctx, 0, "uploaded %s (%s) — %s",
+                                      name, size_buf, permalink);
+        else
+            slack_event_upload_printf(ctx, 0, "uploaded %s (%s)",
+                                      name, size_buf);
+    }
+
+    json_object_put(json);
     slack_event_upload_ctx_free(ctx);
 }
 
@@ -5943,29 +6060,55 @@ static void
 slack_event_upload_put_done(void *user_data, int ok, long http_code)
 {
     struct t_slack_upload_ctx *ctx = user_data;
-    char files_json[512];
-    struct json_object *params;
+    struct json_object *params, *files_arr, *file_obj;
+    const char *files_str;
 
     if (!ctx)
         return;
 
     if (!ok)
     {
-        SLACK_WS_PRINTF(ctx->workspace,
-                        "%sweeslack: file PUT failed (HTTP %ld)",
-                        weechat_prefix("error"), http_code);
+        slack_event_upload_printf(ctx, 1, "upload PUT failed (HTTP %ld)",
+                                  http_code);
         slack_event_upload_ctx_free(ctx);
         return;
     }
 
+    /* Build files= JSON safely (filename may contain quotes). */
+    files_arr = json_object_new_array();
+    file_obj = json_object_new_object();
+    if (!files_arr || !file_obj)
+    {
+        if (files_arr)
+            json_object_put(files_arr);
+        if (file_obj)
+            json_object_put(file_obj);
+        slack_event_upload_printf(ctx, 1, "upload complete: out of memory");
+        slack_event_upload_ctx_free(ctx);
+        return;
+    }
+    json_object_object_add(file_obj, "id",
+                           json_object_new_string(
+                               ctx->file_id ? ctx->file_id : ""));
+    json_object_object_add(file_obj, "title",
+                           json_object_new_string(
+                               ctx->filename ? ctx->filename : "file"));
+    json_object_array_add(files_arr, file_obj);
+    files_str = json_object_to_json_string(files_arr);
+
     params = json_object_new_object();
-    snprintf(files_json, sizeof(files_json),
-             "[{\"id\":\"%s\",\"title\":\"%s\"}]",
-             ctx->file_id ? ctx->file_id : "",
-             ctx->filename ? ctx->filename : "file");
+    if (!params || !files_str)
+    {
+        json_object_put(files_arr);
+        if (params)
+            json_object_put(params);
+        slack_event_upload_printf(ctx, 1, "upload complete: out of memory");
+        slack_event_upload_ctx_free(ctx);
+        return;
+    }
 
     json_object_object_add(params, "files",
-                           json_object_new_string(files_json));
+                           json_object_new_string(files_str));
     json_object_object_add(params, "channel_id",
                            json_object_new_string(ctx->channel_id));
     if (ctx->thread_ts && ctx->thread_ts[0])
@@ -5973,6 +6116,7 @@ slack_event_upload_put_done(void *user_data, int ok, long http_code)
         json_object_object_add(params, "thread_ts",
                                json_object_new_string(ctx->thread_ts));
     }
+    json_object_put(files_arr);
 
     slack_http_request_new(ctx->workspace, "files.completeUploadExternal",
                            params, slack_event_upload_complete_cb, ctx);
@@ -5985,23 +6129,39 @@ slack_event_upload_url_cb(struct t_weeslack_workspace *workspace,
                            void *user_data)
 {
     struct t_slack_upload_ctx *ctx = user_data;
+    struct json_object *json;
+
+    (void) workspace;
 
     if (!ctx)
         return;
 
     if (return_code != 0 || !output)
     {
-        SLACK_WS_PRINTF(workspace, "%sweeslack: getUploadURL failed (rc=%d)",
-                        weechat_prefix("error"), return_code);
+        slack_event_upload_printf(ctx, 1,
+                                  "getUploadURL failed (rc=%d)", return_code);
         slack_event_upload_ctx_free(ctx);
         return;
     }
 
-    struct json_object *json = slack_json_decode(output);
-    if (!json || slack_api_check_error(workspace, json, "files.getUploadURLExternal"))
+    json = slack_json_decode(output);
+    if (!json)
     {
-        if (json)
-            json_object_put(json);
+        slack_event_upload_printf(ctx, 1, "getUploadURL: invalid response");
+        slack_event_upload_ctx_free(ctx);
+        return;
+    }
+
+    if (slack_api_check_error(workspace, json, "files.getUploadURLExternal"))
+    {
+        struct json_object *error_obj;
+        const char *err = "unknown";
+
+        if (json_object_object_get_ex(json, "error", &error_obj))
+            err = json_object_get_string(error_obj);
+        slack_event_upload_printf(ctx, 1, "getUploadURL failed: %s",
+                                  err ? err : "unknown");
+        json_object_put(json);
         slack_event_upload_ctx_free(ctx);
         return;
     }
@@ -6017,8 +6177,7 @@ slack_event_upload_url_cb(struct t_weeslack_workspace *workspace,
 
     if (!ctx->upload_url || !ctx->file_id)
     {
-        SLACK_WS_PRINTF(workspace, "%sweeslack: upload URL missing fields",
-                        weechat_prefix("error"));
+        slack_event_upload_printf(ctx, 1, "upload URL missing fields");
         slack_event_upload_ctx_free(ctx);
         return;
     }
@@ -6027,8 +6186,7 @@ slack_event_upload_url_cb(struct t_weeslack_workspace *workspace,
     if (!slack_http_curl_put_file(ctx->upload_url, ctx->file_path, NULL,
                                   slack_event_upload_put_done, ctx))
     {
-        SLACK_WS_PRINTF(workspace, "%sweeslack: could not start file PUT",
-                        weechat_prefix("error"));
+        slack_event_upload_printf(ctx, 1, "could not start file PUT");
         slack_event_upload_ctx_free(ctx);
     }
 }
@@ -6041,37 +6199,59 @@ slack_event_upload_file(struct t_weeslack_workspace *workspace,
 {
     struct t_slack_upload_ctx *ctx;
     struct stat st;
+    char *expanded = NULL;
+    const char *path;
     const char *base;
+    struct t_slack_channel *ch;
+    struct t_gui_buffer *buf = NULL;
 
     if (!workspace || !channel_id || !file_path || !file_path[0])
         return;
 
-    if (stat(file_path, &st) != 0 || !S_ISREG(st.st_mode))
+    ch = slack_channel_search(channel_id);
+    if (ch && ch->buffer)
+        buf = ch->buffer;
+    else if (workspace->server_buffer)
+        buf = workspace->server_buffer;
+
+    expanded = slack_event_expand_path(file_path);
+    path = expanded ? expanded : file_path;
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
     {
-        SLACK_WS_PRINTF(workspace, "%sweeslack: cannot read file %s",
-                        weechat_prefix("error"), file_path);
+        weechat_printf(buf, "%sweeslack: cannot read file %s",
+                       weechat_prefix("error"), path);
+        free(expanded);
         return;
     }
 
-    base = strrchr(file_path, '/');
-    base = base ? base + 1 : file_path;
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
 
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
+    {
+        free(expanded);
         return;
+    }
 
     ctx->workspace = workspace;
     ctx->channel_id = strdup(channel_id);
-    ctx->file_path = strdup(file_path);
+    ctx->file_path = expanded ? expanded : strdup(path);
+    expanded = NULL; /* owned by ctx or freed */
     ctx->thread_ts = thread_ts ? strdup(thread_ts) : NULL;
     ctx->filename = strdup(base);
     ctx->length = (long)st.st_size;
 
     if (!ctx->channel_id || !ctx->file_path || !ctx->filename)
     {
+        free(expanded);
         slack_event_upload_ctx_free(ctx);
         return;
     }
+
+    slack_event_upload_printf(ctx, 0, "uploading %s (%ld bytes)...",
+                              ctx->filename, ctx->length);
 
     {
         struct json_object *params = json_object_new_object();

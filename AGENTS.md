@@ -92,12 +92,39 @@ History tags include `slack_ts_<ts>` for tooling.
 | `/cslack loadhistory` / `rehistory` / `names` | History + nicklist (focused buffer if core) |
 | `/cslack talk` / `open` | DM or MPDM (`a,b`); open = talk alias |
 | `/cslack join` / `show [#ch]` | Join API, or reopen closed member buffer |
-| `/cslack download` / `upload` | Auth file I/O via libcurl multi |
+| `/cslack download` / `upload` | Auth file I/O via libcurl multi (`~` expanded) |
 | `/cslack stars` / `star` / `unstar` / `react` / `unreact` | Stars + reactions |
 | `/cslack info` / `queue` / `debug` / `version` | Status, HTTP queue, debug buffer |
 
 When `/cslack` is run from `core.weechat` (debug socket), buffer-local ops use
 `weechat_current_buffer()`.
+
+### Short aliases (Slack buffers only)
+
+Registered top-level commands that **forward to** `/cslack <name> …`. Only
+active when the buffer plugin is `weeslack` (error elsewhere). Full tables in
+`README.md`.
+
+| Alias | → `/cslack` |
+|-------|-------------|
+| `/upload` | `upload` (path may use `~`; spaces OK) |
+| `/reply` `/thread` | threads |
+| `/rehistory` `/loadhistory` | history |
+| `/hide` `/label` | buffer hide / local title |
+| `/talk` | DM/MPDM |
+| `/react` `/unreact` | reactions |
+| `/star` `/unstar` `/stars` | stars |
+| `/mute` `/unmute` | mute prefs |
+| `/download` | private file GET |
+| `/pin` `/unpin` | pins |
+| `/subscribe` `/unsubscribe` | thread/channel |
+| `/search` | message search |
+| `/status` | profile / presence / DnD |
+
+### IRC-style (`command_run`, Slack buffers only)
+
+`/me` `/join` `/query` `/msg` `/part` `/leave` `/topic` `/invite` `/away`
+`/whois` `/upload` — eaten only on weeslack buffers; IRC keeps them elsewhere.
 
 ### Config highlights (`weeslack.conf`)
 
@@ -115,9 +142,9 @@ When `/cslack` is run from `core.weechat` (debug socket), buffer-local ops use
 - `look.unfurl_auto_link_display` (`both`/`text`/`url`), `unfurl_ignore_alt_text`  
 - `look.notify_usergroup_handle_updated`  
 - `look.emoji_render_mode`, typing indicator, thread_messages_in_channel  
-- IRC cmds on weeslack buffers: `/me` `/join` `/query` `/msg` `/part` `/topic` `/invite` `/away` `/whois`  
+- Short aliases + IRC-style cmds: see **Short aliases** / **IRC-style** above  
 - Input `/cmd args` → Slack slash (`chat.command`); `//text` posts literally  
-- `/cslack talk a,b` / `/query a,b` → MPDM  
+- `/cslack talk a,b` / `/query a,b` / `/talk a,b` → MPDM  
 - `/cslack info` — version, queue, options, workspaces  
 
 - `look.download_path` — root; files go to `<root>/weeslack/<origin>/<YYYY-MM-DD>/<file>`  
