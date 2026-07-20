@@ -23,6 +23,7 @@ static char *slack_event_format_user(struct t_slack_user *user,
 static void slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
                                  int return_code, const char *output,
                                  void *user_data);
+static void slack_event_presence_subscribe(struct t_weeslack_workspace *workspace);
 /* defined later in bootstrap chain */
 void slack_event_fetch_emoji(struct t_weeslack_workspace *workspace);
 
@@ -1104,6 +1105,8 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                         weechat_prefix("network"),
                         workspace->name,
                         workspace->my_user_id ? workspace->my_user_id : "?");
+        /* Subscribe to presence so Here/Away nicklist can update (wee-slack). */
+        slack_event_presence_subscribe(workspace);
         return;
     }
 
@@ -1201,22 +1204,119 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
     if (strcmp(type, "presence_change") == 0 ||
         strcmp(type, "manual_presence_change") == 0)
     {
-        struct json_object *user_obj;
+        struct json_object *presence_obj, *user_obj, *users_obj;
+        const char *presence = NULL;
+
+        if (json_object_object_get_ex(json, "presence", &presence_obj))
+            presence = json_object_get_string(presence_obj);
+        if (!presence || !presence[0])
+            return;
+
+        /* Batch form: { "users": ["U1","U2"], "presence": "active" } */
+        if (json_object_object_get_ex(json, "users", &users_obj) &&
+            json_object_is_type(users_obj, json_type_array))
+        {
+            int n = json_object_array_length(users_obj);
+            int i;
+            for (i = 0; i < n; i++)
+            {
+                struct json_object *u = json_object_array_get_idx(users_obj, i);
+                const char *user_id = json_object_get_string(u);
+                struct t_slack_user *user = user_id ? slack_user_search(user_id)
+                    : NULL;
+                if (!user)
+                    continue;
+                free(user->presence);
+                user->presence = strdup(presence);
+                slack_buffer_update_user_presence(user);
+            }
+        }
+
+        /* Single form: { "user": "U1", "presence": "away" } */
         if (json_object_object_get_ex(json, "user", &user_obj))
         {
             const char *user_id = json_object_get_string(user_obj);
-            struct t_slack_user *user = slack_user_search(user_id);
+            struct t_slack_user *user = user_id ? slack_user_search(user_id)
+                : NULL;
             if (user)
             {
-                struct json_object *presence_obj;
-                if (json_object_object_get_ex(json, "presence", &presence_obj))
+                free(user->presence);
+                user->presence = strdup(presence);
+                slack_buffer_update_user_presence(user);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(type, "pref_change") == 0)
+    {
+        struct json_object *name_obj, *value_obj;
+        const char *pref = NULL;
+        const char *value = NULL;
+
+        if (json_object_object_get_ex(json, "name", &name_obj))
+            pref = json_object_get_string(name_obj);
+        if (json_object_object_get_ex(json, "value", &value_obj))
+            value = json_object_get_string(value_obj);
+
+        if (pref && value && strcmp(pref, "muted_channels") == 0)
+        {
+            /* Reset all, then apply list (value is comma-separated ids). */
+            struct t_slack_channel *ch;
+            char *copy, *tok, *save = NULL;
+            int muted_n = 0;
+
+            for (ch = slack_channel_list_global(); ch; ch = ch->next)
+            {
+                if (ch->is_muted)
                 {
-                    free(user->presence);
-                    user->presence = strdup(
-                        json_object_get_string(presence_obj));
-                    slack_buffer_update_user_presence(user);
+                    struct t_slack_buffer *sbuf =
+                        slack_buffer_search_by_channel(ch->id);
+                    ch->is_muted = 0;
+                    if (sbuf)
+                        slack_buffer_set_muted(sbuf, 0);
                 }
             }
+
+            copy = strdup(value);
+            if (copy)
+            {
+                for (tok = strtok_r(copy, ",", &save); tok;
+                     tok = strtok_r(NULL, ",", &save))
+                {
+                    struct t_slack_buffer *sbuf;
+                    while (*tok == ' ')
+                        tok++;
+                    if (!tok[0])
+                        continue;
+                    ch = slack_channel_search(tok);
+                    if (!ch)
+                        continue;
+                    ch->is_muted = 1;
+                    sbuf = slack_buffer_search_by_channel(ch->id);
+                    if (sbuf)
+                        slack_buffer_set_muted(sbuf, 1);
+                    muted_n++;
+                }
+                free(copy);
+            }
+            SLACK_WS_PRINTF(workspace,
+                            "%sweeslack: mute prefs updated (%d channel%s)",
+                            weechat_prefix("network"), muted_n,
+                            muted_n == 1 ? "" : "s");
+        }
+        else if (pref && value && strcmp(pref, "highlight_words") == 0)
+        {
+            /* Apply highlight words to all channel buffers. */
+            struct t_slack_channel *ch;
+            for (ch = slack_channel_list_global(); ch; ch = ch->next)
+            {
+                if (ch->buffer)
+                    weechat_buffer_set(ch->buffer, "highlight_words", value);
+            }
+            SLACK_WS_PRINTF(workspace,
+                            "%sweeslack: highlight words updated",
+                            weechat_prefix("network"));
         }
         return;
     }
@@ -3005,6 +3105,10 @@ slack_event_users_cb(struct t_weeslack_workspace *workspace,
     /* Drop bots/apps/slackbot that may already be on nicklists */
     slack_buffer_purge_hidden_nicks();
 
+    /* Presence subscription once we know the user directory */
+    if (workspace->connected)
+        slack_event_presence_subscribe(workspace);
+
     slack_event_fetch_bots(workspace);
 }
 
@@ -4521,13 +4625,88 @@ slack_event_mute_prefs_get_cb(struct t_weeslack_workspace *workspace,
     }
 }
 
+/*
+ * Subscribe to presence for Here/Away nicklist (RTM presence_sub).
+ * Cap at 750 ids like wee-slack (API JSON size limit).
+ */
+static void
+slack_event_presence_subscribe(struct t_weeslack_workspace *workspace)
+{
+    struct json_object *msg, *ids;
+    struct t_slack_user *u;
+    int n = 0;
+    const int max_ids = 750;
+
+    if (!workspace || !workspace->ws || !workspace->ws->connected ||
+        !workspace->ws->handshake_done)
+        return;
+
+    msg = json_object_new_object();
+    ids = json_object_new_array();
+    if (!msg || !ids)
+    {
+        if (msg)
+            json_object_put(msg);
+        if (ids)
+            json_object_put(ids);
+        return;
+    }
+
+    json_object_object_add(msg, "type", json_object_new_string("presence_sub"));
+
+    for (u = slack_user_list_global(); u && n < max_ids; u = u->next)
+    {
+        if (!u->id || !u->id[0])
+            continue;
+        if (slack_user_hide_from_nicklist(u))
+            continue;
+        json_object_array_add(ids, json_object_new_string(u->id));
+        n++;
+    }
+
+    /* Always include self */
+    if (workspace->my_user_id && workspace->my_user_id[0])
+    {
+        int has_self = 0;
+        int i;
+        for (i = 0; i < n; i++)
+        {
+            struct json_object *e = json_object_array_get_idx(ids, i);
+            const char *id = json_object_get_string(e);
+            if (id && strcmp(id, workspace->my_user_id) == 0)
+            {
+                has_self = 1;
+                break;
+            }
+        }
+        if (!has_self)
+            json_object_array_add(ids,
+                                  json_object_new_string(workspace->my_user_id));
+    }
+
+    json_object_object_add(msg, "ids", ids);
+
+    if (n > 0 || (workspace->my_user_id && workspace->my_user_id[0]))
+    {
+        if (slack_ws_send(workspace->ws, msg) == 0)
+        {
+            SLACK_WS_PRINTF(workspace,
+                            "%sweeslack: subscribed presence for %d user%s",
+                            weechat_prefix("network"), n,
+                            n == 1 ? "" : "s");
+        }
+    }
+
+    json_object_put(msg);
+}
+
 /* Apply muted_channels from users.prefs.get after connect (no set). */
 static void
 slack_event_connect_prefs_cb(struct t_weeslack_workspace *workspace,
                              int return_code, const char *output,
                              void *user_data)
 {
-    struct json_object *json, *prefs, *mc;
+    struct json_object *json, *prefs, *mc, *hw;
     const char *s;
     int muted_n = 0;
 
@@ -4545,37 +4724,53 @@ slack_event_connect_prefs_cb(struct t_weeslack_workspace *workspace,
         return;
     }
 
-    if (json_object_object_get_ex(json, "prefs", &prefs) &&
-        json_object_object_get_ex(prefs, "muted_channels", &mc))
+    if (json_object_object_get_ex(json, "prefs", &prefs))
     {
-        s = json_object_get_string(mc);
-        if (s && s[0])
+        if (json_object_object_get_ex(prefs, "muted_channels", &mc))
         {
-            char *copy = strdup(s);
-            char *tok, *save = NULL;
-
-            if (copy)
+            s = json_object_get_string(mc);
+            if (s && s[0])
             {
-                for (tok = strtok_r(copy, ",", &save); tok;
-                     tok = strtok_r(NULL, ",", &save))
-                {
-                    struct t_slack_channel *ch;
-                    struct t_slack_buffer *sbuf;
+                char *copy = strdup(s);
+                char *tok, *save = NULL;
 
-                    while (*tok == ' ')
-                        tok++;
-                    if (!tok[0])
-                        continue;
-                    ch = slack_channel_search(tok);
-                    if (!ch)
-                        continue;
-                    ch->is_muted = 1;
-                    sbuf = slack_buffer_search_by_channel(ch->id);
-                    if (sbuf)
-                        slack_buffer_set_muted(sbuf, 1);
-                    muted_n++;
+                if (copy)
+                {
+                    for (tok = strtok_r(copy, ",", &save); tok;
+                         tok = strtok_r(NULL, ",", &save))
+                    {
+                        struct t_slack_channel *ch;
+                        struct t_slack_buffer *sbuf;
+
+                        while (*tok == ' ')
+                            tok++;
+                        if (!tok[0])
+                            continue;
+                        ch = slack_channel_search(tok);
+                        if (!ch)
+                            continue;
+                        ch->is_muted = 1;
+                        sbuf = slack_buffer_search_by_channel(ch->id);
+                        if (sbuf)
+                            slack_buffer_set_muted(sbuf, 1);
+                        muted_n++;
+                    }
+                    free(copy);
                 }
-                free(copy);
+            }
+        }
+
+        if (json_object_object_get_ex(prefs, "highlight_words", &hw))
+        {
+            s = json_object_get_string(hw);
+            if (s && s[0])
+            {
+                struct t_slack_channel *ch;
+                for (ch = slack_channel_list_global(); ch; ch = ch->next)
+                {
+                    if (ch->buffer)
+                        weechat_buffer_set(ch->buffer, "highlight_words", s);
+                }
             }
         }
     }
@@ -4589,6 +4784,10 @@ slack_event_connect_prefs_cb(struct t_weeslack_workspace *workspace,
     }
 
     json_object_put(json);
+
+    /* Presence sub needs users loaded; re-send after full directory is up. */
+    if (workspace->connected)
+        slack_event_presence_subscribe(workspace);
 }
 
 void
