@@ -94,6 +94,7 @@ weeslack_rtm_connect_cb(struct t_weeslack_workspace *workspace,
 
     if (return_code != 0 || !output)
     {
+        workspace->connecting = 0;
         SLACK_WS_PRINTF(workspace, "%sweeslack: rtm.connect failed for %s (rc=%d)",
                         weechat_prefix("error"), workspace->name, return_code);
         return;
@@ -102,6 +103,7 @@ weeslack_rtm_connect_cb(struct t_weeslack_workspace *workspace,
     struct json_object *json = slack_json_decode(output);
     if (!json)
     {
+        workspace->connecting = 0;
         SLACK_WS_PRINTF(workspace, "%sweeslack: failed to parse rtm.connect response",
                         weechat_prefix("error"));
         return;
@@ -109,6 +111,7 @@ weeslack_rtm_connect_cb(struct t_weeslack_workspace *workspace,
 
     if (slack_api_check_error(workspace, json, "rtm.connect"))
     {
+        workspace->connecting = 0;
         json_object_put(json);
         return;
     }
@@ -319,19 +322,43 @@ weeslack_connect_one_token(const char *token_raw, const char *ws_id,
     if (!ws)
         return 0;
 
-    if (ws->connected)
+    if (ws->connected || ws->connecting)
     {
         if (buffer)
         {
-            weechat_printf(buffer, "%sweeslack: already connected to %s",
+            weechat_printf(buffer, "%sweeslack: already %s to %s",
                             weechat_prefix("network"),
+                            ws->connected ? "connected" : "connecting",
                             ws->name ? ws->name : ws_id);
         }
         return 0;
     }
 
+    ws->connecting = 1;
+    ws->bg_history_scheduled = 0;
+    ws->bg_history_done = 0;
+    ws->bg_history_remaining = 0;
+    if (ws->bg_history_hook)
+    {
+        weechat_unhook(ws->bg_history_hook);
+        ws->bg_history_hook = NULL;
+    }
+
     weeslack_connect_workspace(ws, buffer);
     return 1;
+}
+
+static void
+weeslack_workspace_stop_bg_history(struct t_weeslack_workspace *ws)
+{
+    if (!ws)
+        return;
+    if (ws->bg_history_hook)
+    {
+        weechat_unhook(ws->bg_history_hook);
+        ws->bg_history_hook = NULL;
+    }
+    ws->bg_history_scheduled = 0;
 }
 
 struct t_weeslack_delayed_connect
@@ -978,6 +1005,13 @@ weeslack_workspace_unregister(struct t_weeslack_workspace *ws,
         ws->ws = NULL;
     }
     ws->connected = 0;
+    ws->connecting = 0;
+    if (ws->bg_history_hook)
+    {
+        weechat_unhook(ws->bg_history_hook);
+        ws->bg_history_hook = NULL;
+    }
+    ws->bg_history_scheduled = 0;
 
     weeslack_workspace_close_buffers(ws);
 
@@ -1397,6 +1431,8 @@ weeslack_command_cslack(const void *pointer, void *data,
             {
                 slack_ws_disconnect(ws->ws);
                 ws->connected = 0;
+                ws->connecting = 0;
+                weeslack_workspace_stop_bg_history(ws);
                 weechat_printf(buffer, "%sweeslack: disconnected from %s",
                                 weechat_prefix("network"),
                                 ws->name ? ws->name : ws->id);
@@ -1408,10 +1444,12 @@ weeslack_command_cslack(const void *pointer, void *data,
         {
             for (ws = weeslack_workspaces; ws; ws = ws->next_workspace)
             {
-                if (ws->ws && ws->connected)
+                if (ws->ws && (ws->connected || ws->connecting))
                 {
                     slack_ws_disconnect(ws->ws);
                     ws->connected = 0;
+                    ws->connecting = 0;
+                    weeslack_workspace_stop_bg_history(ws);
                     weechat_printf(buffer, "%sweeslack: disconnected from %s",
                                     weechat_prefix("network"),
                                     ws->name ? ws->name : ws->id);
@@ -3369,8 +3407,9 @@ weeslack_config_init(void)
     weeslack_config.history_fetch_count = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "history_fetch_count", "integer",
-        "Messages per history page (1–1000; still capped to a few pages)",
-        NULL, 1, 1000, "100", NULL, 0,
+        "Messages per history page (1–1000). wee-slack default is 200 with "
+        "one page per channel; raising history_max_pages multiplies API load",
+        NULL, 1, 1000, "200", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);
@@ -3530,9 +3569,9 @@ weeslack_config_init(void)
     weeslack_config.background_load_all_history = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "background_load_all_history", "boolean",
-        "After connect quiet period, queue history for open member channels "
-        "on the slow queue (default off — rate-limit sensitive; prefer "
-        "lazy load on focus)",
+        "After connect quiet period, queue one history page per open member "
+        "channel on the slow queue (~1 req/s, like wee-slack). Default off — "
+        "prefer lazy load on focus if you still hit rate limits",
         NULL, 0, 0, "off", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
@@ -3551,9 +3590,10 @@ weeslack_config_init(void)
     weeslack_config.history_max_pages = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "history_max_pages", "integer",
-        "Max conversations.history pages per channel load (each page uses "
-        "history_fetch_count messages; hard max 20)",
-        NULL, 1, 20, "5", NULL, 0,
+        "Max conversations.history pages on focus / loadhistory (each page = "
+        "history_fetch_count messages). Default 1 matches wee-slack. "
+        "Background history always uses 1 page. Higher values rate-limit easily",
+        NULL, 1, 20, "1", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);
@@ -5512,6 +5552,8 @@ weeslack_workspace_free(struct t_weeslack_workspace *workspace)
 {
     if (!workspace)
         return WEECHAT_RC_ERROR;
+
+    weeslack_workspace_stop_bg_history(workspace);
 
     if (workspace->prev_workspace)
         workspace->prev_workspace->next_workspace = workspace->next_workspace;

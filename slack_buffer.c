@@ -813,6 +813,18 @@ slack_buffer_new(struct t_weeslack_workspace *workspace,
 
     if (channel->is_muted)
         slack_buffer_set_muted(sbuf, 1);
+    else
+    {
+        /*
+         * DM / MPDM: private (all messages). Channels: highlight only —
+         * line tags use notify_highlight solely on @mention.
+         */
+        if (channel->type == SLACK_CHANNEL_TYPE_DM ||
+            channel->type == SLACK_CHANNEL_TYPE_MPDM)
+            weechat_buffer_set(sbuf->buffer, "notify", "private");
+        else
+            weechat_buffer_set(sbuf->buffer, "notify", "highlight");
+    }
 
     /* Buflist badges from Slack unread_count_display (conversations.list). */
     slack_buffer_apply_unread_hotlist(channel);
@@ -1226,6 +1238,10 @@ slack_buffer_set_muted(struct t_slack_buffer *sbuf, int muted)
             notify = "highlight";
         weechat_buffer_set(sbuf->buffer, "notify", notify);
     }
+    else if (sbuf->channel &&
+             (sbuf->channel->type == SLACK_CHANNEL_TYPE_DM ||
+              sbuf->channel->type == SLACK_CHANNEL_TYPE_MPDM))
+        weechat_buffer_set(sbuf->buffer, "notify", "private");
     else
         weechat_buffer_set(sbuf->buffer, "notify", "highlight");
 

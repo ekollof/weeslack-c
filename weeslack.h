@@ -27,8 +27,15 @@ struct t_weeslack_workspace
     char *my_presence;
     int my_manual_away;
     int connected;
+    /* 1 while rtm.connect / bootstrap in flight (blocks duplicate connect). */
+    int connecting;
     int reconnect_delay;
     int max_reconnect_delay;
+    /* Background history: one-shot schedule + paced pump hook. */
+    int bg_history_scheduled;
+    struct t_hook *bg_history_hook;
+    int bg_history_done;
+    int bg_history_remaining;
     struct t_slack_ws *ws;
     struct t_gui_buffer *server_buffer;
     struct t_weeslack_workspace *next_workspace;

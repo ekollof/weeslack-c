@@ -28,9 +28,12 @@ struct t_slack_http_request *slack_http_requests = NULL;
 enum
 {
     SLACK_HTTP_MAX_TRIES         = 3,
-    /* 2 felt too slow once API + binary shared the multi budget; 4 is a
-     * better default. Still far below unlimited stampede. */
-    SLACK_HTTP_MAX_CONCURRENT    = 4,
+    /*
+     * Cap concurrent Web API calls. Bootstrap + history at 4 was still
+     * enough to earn Retry-After 60s on conversations.history. Binary
+     * transfers share the multi but do not count as g_inflight API.
+     */
+    SLACK_HTTP_MAX_CONCURRENT    = 2,
     SLACK_HTTP_TICK_MS           = 100,
     SLACK_HTTP_RETRY_DEFAULT_SEC = 8,
     SLACK_HTTP_RETRY_MAX_SEC     = 90,
@@ -64,6 +67,7 @@ static time_t g_slow_last_promote = 0;
 static struct t_hook *g_queue_timer = NULL;
 
 static void slack_http_queue_pump(void);
+static int slack_http_q_count(struct t_slack_http_request *head);
 
 /* ---- encoding ---- */
 
@@ -423,33 +427,57 @@ slack_http_queue_pump(void)
     if (now < g_cooldown_until)
         return;
 
-    /* slow lane: promote at most one ready job per second */
-    if (g_slow_head && now > g_slow_last_promote)
+    /*
+     * Slow lane (history/members): promote at most one ready job per interval.
+     * wee-slack uses ~1/s. When the backlog is deep (background history), slow
+     * further so we stay under conversations.history Tier-3 (~50+/min) with
+     * headroom for focus/members and other clients.
+     */
     {
-        req = slack_http_q_pop_ready(&g_slow_head, &g_slow_tail);
-        if (req)
+        int slow_depth = slack_http_q_count(g_slow_head);
+        int promote_every = (slow_depth >= 8) ? 2 : 1;
+
+        if (g_slow_head &&
+            (g_slow_last_promote == 0 ||
+             now >= g_slow_last_promote + promote_every))
         {
-            slack_http_q_append(&g_fast_head, &g_fast_tail, req);
-            g_slow_last_promote = now;
+            req = slack_http_q_pop_ready(&g_slow_head, &g_slow_tail);
+            if (req)
+            {
+                slack_http_q_append(&g_fast_head, &g_fast_tail, req);
+                g_slow_last_promote = now;
+            }
         }
     }
 
-    while (g_inflight < SLACK_HTTP_MAX_CONCURRENT &&
-           slack_http_multi_xfer_count() < SLACK_HTTP_MAX_CONCURRENT)
+    /*
+     * Drain fast queue. Cap concurrent API work lower when the slow lane is
+     * backed up so history/members are not competing with a full multi budget.
+     */
     {
-        req = slack_http_q_pop_ready(&g_fast_head, &g_fast_tail);
-        if (!req)
-            break;
+        int max_conc = SLACK_HTTP_MAX_CONCURRENT;
+        int slow_depth = slack_http_q_count(g_slow_head);
 
-        if ((req->flags & SLACK_HTTP_MARK) && now < g_cooldown_until)
+        if (slow_depth >= 8 && max_conc > 2)
+            max_conc = 2;
+
+        while (g_inflight < max_conc &&
+               slack_http_multi_xfer_count() < SLACK_HTTP_MAX_CONCURRENT)
         {
-            if (req->callback)
-                req->callback(req->workspace, -1, NULL, req->user_data);
-            slack_http_request_free(req);
-            continue;
-        }
+            req = slack_http_q_pop_ready(&g_fast_head, &g_fast_tail);
+            if (!req)
+                break;
 
-        slack_http_start_request(req);
+            if ((req->flags & SLACK_HTTP_MARK) && now < g_cooldown_until)
+            {
+                if (req->callback)
+                    req->callback(req->workspace, -1, NULL, req->user_data);
+                slack_http_request_free(req);
+                continue;
+            }
+
+            slack_http_start_request(req);
+        }
     }
 }
 
@@ -607,6 +635,35 @@ slack_http_requeue(struct t_slack_http_request *request, int delay_sec)
     request->in_flight = 0;
     request->hook = NULL;
     request->retry_not_before = time(NULL) + (delay_sec > 0 ? delay_sec : 1);
+
+    if (request->flags & SLACK_HTTP_SLOW)
+        slack_http_q_append(&g_slow_head, &g_slow_tail, request);
+    else
+        slack_http_q_append(&g_fast_head, &g_fast_tail, request);
+
+    return 1;
+}
+
+/* Rate-limit requeue: do not burn max_tries (Slack often needs many waits). */
+static int
+slack_http_requeue_ratelimited(struct t_slack_http_request *request,
+                                int delay_sec)
+{
+    if (!request)
+        return 0;
+
+    /* Undo the try consumed by the 429 response so cooldowns can settle. */
+    if (request->tries > 0)
+        request->tries--;
+
+    request->in_flight = 0;
+    request->hook = NULL;
+    if (delay_sec < 5)
+        delay_sec = 5;
+    /* Add a little jitter headroom beyond Retry-After. */
+    if (delay_sec < 90)
+        delay_sec += 2;
+    request->retry_not_before = time(NULL) + delay_sec;
 
     if (request->flags & SLACK_HTTP_SLOW)
         slack_http_q_append(&g_slow_head, &g_slow_tail, request);
@@ -1013,14 +1070,15 @@ slack_http_curl_check_done(void)
                     slack_http_curl_xfer_free(found);
                     continue;
                 }
-                if (slack_http_requeue(req, delay_sec))
+                /* Keep re-trying after Retry-After; do not spend max_tries. */
+                if (slack_http_requeue_ratelimited(req, delay_sec))
                 {
                     SLACK_WS_PRINTF(req->workspace,
                                     "%sweeslack: rate limited on %s — "
-                                    "cooldown %ds (try %d/%d)",
+                                    "cooldown %ds (will retry)",
                                     weechat_prefix("network"),
                                     req->method ? req->method : "?",
-                                    delay_sec, req->tries, req->max_tries);
+                                    delay_sec);
                     free(body);
                     free(hdrs);
                     slack_http_curl_unlink(found);

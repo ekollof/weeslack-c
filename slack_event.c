@@ -1230,16 +1230,60 @@ slack_event_text_keyword_highlight(struct t_weeslack_workspace *workspace,
     return hit;
 }
 
-/* notify_* tags: highlight when message mentions this workspace user. */
+/* 1 = DM / MPDM (always highlight). Threads inherit the parent kind. */
+static int
+slack_event_channel_is_private_chat(struct t_slack_channel *channel)
+{
+    struct t_slack_channel *parent;
+    char parent_id[64];
+    const char *rest, *us;
+    size_t n;
+
+    if (!channel)
+        return 0;
+    if (channel->type == SLACK_CHANNEL_TYPE_DM ||
+        channel->type == SLACK_CHANNEL_TYPE_MPDM)
+        return 1;
+    if (channel->type != SLACK_CHANNEL_TYPE_THREAD || !channel->id)
+        return 0;
+    /* thread_<parentId>_<thread_ts> */
+    if (strncmp(channel->id, "thread_", 7) != 0)
+        return 0;
+    rest = channel->id + 7;
+    us = strchr(rest, '_');
+    if (!us || us == rest)
+        return 0;
+    n = (size_t)(us - rest);
+    if (n == 0 || n >= sizeof(parent_id))
+        return 0;
+    memcpy(parent_id, rest, n);
+    parent_id[n] = '\0';
+    parent = slack_channel_search(parent_id);
+    if (!parent)
+        return 0;
+    return (parent->type == SLACK_CHANNEL_TYPE_DM ||
+            parent->type == SLACK_CHANNEL_TYPE_MPDM);
+}
+
+/*
+ * notify_* tags:
+ *   - history: never highlight / never hotlist
+ *   - DM + MPDM (group DM): always highlight
+ *   - channels / private channels: highlight only on @mention / keyword /
+ *     @channel|@here|@everyone / usergroup
+ */
 static const char *
 slack_event_notify_tags(struct t_weeslack_workspace *workspace,
                         struct t_slack_channel *channel,
                         const char *text,
                         int history,
-                        SlackTS msg_ts)
+                        SlackTS msg_ts,
+                        const char *user_id)
 {
-    int personal, broad, keyword;
+    int personal, broad, keyword, mention;
     int muted_mode;
+    int is_priv;
+    int self_msg = 0;
 
     if (history)
     {
@@ -1255,10 +1299,21 @@ slack_event_notify_tags(struct t_weeslack_workspace *workspace,
         return "no_highlight,notify_none,log1,slack_history_unread";
     }
 
+    if (workspace && workspace->my_user_id && user_id && user_id[0] &&
+        strcmp(user_id, workspace->my_user_id) == 0)
+        self_msg = 1;
+
+    is_priv = slack_event_channel_is_private_chat(channel);
+
     personal = slack_event_text_mentions_me(workspace, text) ||
                slack_event_text_subteam_highlight_me(workspace, text);
     broad = slack_event_text_channel_highlight(text);
     keyword = slack_event_text_keyword_highlight(workspace, text);
+    mention = personal || broad || keyword;
+
+    /* Own outbound messages never highlight. */
+    if (self_msg)
+        return "no_highlight,notify_none,log1,self_msg";
 
     if (channel && channel->is_muted)
     {
@@ -1269,9 +1324,11 @@ slack_event_notify_tags(struct t_weeslack_workspace *workspace,
             return "no_highlight,notify_none,log1";
         if (muted_mode == 3)
         {
-            if (personal || broad || keyword)
+            if (is_priv)
+                return "notify_highlight,notify_private,log1";
+            if (mention)
                 return "notify_highlight,log1,slack_mention";
-            return "notify_message,log1";
+            return "no_highlight,notify_message,log1";
         }
         if (muted_mode == 1)
         {
@@ -1280,14 +1337,19 @@ slack_event_notify_tags(struct t_weeslack_workspace *workspace,
             return "no_highlight,notify_none,log1";
         }
         /* all_highlights */
-        if (personal || broad || keyword)
+        if (mention)
             return "notify_highlight,log1,slack_mention";
         return "no_highlight,notify_none,log1";
     }
 
-    if (personal || broad || keyword)
+    /* PM / group DM: every live message is a highlight. */
+    if (is_priv)
+        return "notify_highlight,notify_private,log1";
+
+    /* Channels: mention only (no_highlight blocks buffer highlight_words). */
+    if (mention)
         return "notify_highlight,log1,slack_mention";
-    return "notify_message,log1";
+    return "no_highlight,notify_message,log1";
 }
 
 /*
@@ -1841,7 +1903,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             snprintf(tags, sizeof(tags),
                      "%s,slack_ts_%s",
                      slack_event_notify_tags(workspace, channel, text, history,
-                                             ts),
+                                             ts, user_id),
                      ts_tag ? ts_tag : "0");
 
             /* wee-slack style: [ Thread: $hash Replies: N ] */
@@ -1892,6 +1954,10 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             free(formatted);
             free(reactions);
         }
+        /* Thread parents can still carry file shares — save/preview live. */
+        if (!history && channel->buffer)
+            slack_event_auto_download_message_files(workspace, channel,
+                                                     msg_json, channel->buffer);
         free(text_owned);
         return;
     }
@@ -1948,7 +2014,7 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         snprintf(tags, sizeof(tags),
                  "%s,slack_ts_%s%s",
                  slack_event_notify_tags(workspace, display_channel, text,
-                                         history, ts),
+                                         history, ts, user_id),
                  ts_tag ? ts_tag : "0",
                  is_me ? ",slack_me" : "");
 
@@ -2023,8 +2089,12 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         }
         free(ts_tag);
 
-        /* Live only — history would storm the download queue. */
-        if (!history && files && files[0])
+        /*
+         * Live only — history would storm the download queue.
+         * Run off the message JSON (files[] / file{}), not the formatted
+         * string, so shares still save when formatting is empty.
+         */
+        if (!history)
             slack_event_auto_download_message_files(workspace, channel,
                                                      msg_json,
                                                      display_channel->buffer);
@@ -2114,6 +2184,7 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
     if (strcmp(type, "hello") == 0)
     {
         workspace->connected = 1;
+        workspace->connecting = 0;
         if (workspace->ws)
             workspace->ws->reconnect_delay = 1;
         SLACK_WS_PRINTF(workspace, "%sweeslack: connected to %s as %s",
@@ -3955,6 +4026,11 @@ slack_event_format_mentions(struct t_weeslack_workspace *workspace,
 /* After mass buffer create, ignore buffer_switch history storms. */
 static time_t g_bootstrap_quiet_until = 0;
 
+/* Defined with fetch_history; used by background timer below. */
+static void slack_event_fetch_history_background(
+    struct t_weeslack_workspace *workspace,
+    struct t_slack_channel *channel);
+
 void
 slack_event_bootstrap_quiet(int seconds)
 {
@@ -3969,99 +4045,186 @@ slack_event_in_bootstrap_quiet(void)
     return time(NULL) < g_bootstrap_quiet_until;
 }
 
-struct t_slack_bg_hist_ctx
+/*
+ * Background history: ONE channel at a time after a short settle delay.
+ * (Dumping every channel into the slow queue right after bootstrap was what
+ * earned Retry-After 60s — pacing is the fix, not a long UX wait.)
+ */
+enum
 {
-    struct t_weeslack_workspace *workspace;
+    SLACK_BG_HIST_INITIAL_MS = 10000, /* after channels.list + quiet */
+    SLACK_BG_HIST_TICK_MS    = 3000   /* between channels */
 };
 
+static int slack_event_background_history_tick(const void *pointer, void *data,
+                                                int remaining_calls);
+
+/* One-shot: arm the recurring pace timer after INITIAL_MS. */
 static int
-slack_event_background_history_cb(const void *pointer, void *data,
-                                   int remaining_calls)
+slack_event_background_history_arm(const void *pointer, void *data,
+                                    int remaining_calls)
 {
-    struct t_slack_bg_hist_ctx *ctx = (struct t_slack_bg_hist_ctx *)pointer;
-    struct t_weeslack_workspace *ws;
-    struct t_slack_channel *ch;
-    int queued = 0;
+    struct t_weeslack_workspace *ws = (struct t_weeslack_workspace *)pointer;
 
     (void)data;
     (void)remaining_calls;
 
-    if (!ctx)
-        return WEECHAT_RC_OK;
-    ws = ctx->workspace;
-    free(ctx);
+    if (!ws)
+        return WEECHAT_RC_ERROR;
 
-    if (!ws || !ws->connected)
-        return WEECHAT_RC_OK;
-    if (!weechat_config_boolean(weeslack_config.background_load_all_history))
-        return WEECHAT_RC_OK;
+    ws->bg_history_hook = NULL;
 
-    /*
-     * Slow-queue history for open member channels. Cap per run so huge
-     * workspaces do not enqueue hundreds of jobs at once.
-     */
+    if (!ws->connected ||
+        !weechat_config_boolean(weeslack_config.background_load_all_history))
+        return WEECHAT_RC_ERROR;
+
+    if (slack_http_on_cooldown())
     {
-        int max_ch = weechat_config_integer(
-            weeslack_config.background_history_max);
-        if (max_ch <= 0)
-            max_ch = 200; /* 0 = soft unlimited */
-        if (max_ch > 200)
-            max_ch = 200;
-
-        for (ch = slack_channel_list_global(); ch; ch = ch->next)
-        {
-            if (!ch->buffer || !ch->is_member)
-                continue;
-            if (ch->workspace && ch->workspace != ws)
-                continue;
-            if (ch->type == SLACK_CHANNEL_TYPE_THREAD)
-                continue;
-            if (ch->history_state != 0)
-                continue;
-            slack_event_fetch_history(ws, ch);
-            queued++;
-            if (queued >= max_ch)
-                break;
-        }
+        /* Try again after a bit — do not start a storm mid-cooldown. */
+        ws->bg_history_hook = weechat_hook_timer(
+            15000, 0, 1, &slack_event_background_history_arm, ws, NULL);
+        return WEECHAT_RC_ERROR;
     }
 
-    if (queued > 0)
+    /* Immediate first channel, then pace. */
+    slack_event_background_history_tick(ws, NULL, 0);
+
+    if (ws->bg_history_done)
+        return WEECHAT_RC_ERROR;
+
+    ws->bg_history_hook = weechat_hook_timer(
+        SLACK_BG_HIST_TICK_MS, 0, 0,
+        &slack_event_background_history_tick, ws, NULL);
+    return WEECHAT_RC_ERROR;
+}
+
+static int
+slack_event_background_history_tick(const void *pointer, void *data,
+                                     int remaining_calls)
+{
+    struct t_weeslack_workspace *ws = (struct t_weeslack_workspace *)pointer;
+    struct t_slack_channel *ch;
+    int max_ch, started = 0;
+    int in_flight = 0;
+
+    (void)data;
+    (void)remaining_calls;
+
+    if (!ws)
+        return WEECHAT_RC_ERROR;
+
+    if (!ws->connected ||
+        !weechat_config_boolean(weeslack_config.background_load_all_history))
+    {
+        ws->bg_history_hook = NULL;
+        return WEECHAT_RC_ERROR;
+    }
+
+    if (slack_http_on_cooldown())
+        return WEECHAT_RC_OK;
+
+    max_ch = weechat_config_integer(weeslack_config.background_history_max);
+    if (max_ch <= 0)
+        max_ch = 200;
+    if (max_ch > 200)
+        max_ch = 200;
+
+    for (ch = slack_channel_list_global(); ch; ch = ch->next)
+    {
+        if (!ch->buffer || !ch->is_member)
+            continue;
+        if (ch->workspace && ch->workspace != ws)
+            continue;
+        if (ch->type == SLACK_CHANNEL_TYPE_THREAD)
+            continue;
+        if (ch->history_state != 0)
+            started++;
+        if (ch->history_state == 2)
+            in_flight++;
+    }
+
+    if (started >= max_ch)
+    {
+        if (!ws->bg_history_done)
+        {
+            SLACK_WS_PRINTF(ws,
+                            "%sweeslack: background history finished "
+                            "(%d channel%s)",
+                            weechat_prefix("network"), started,
+                            started == 1 ? "" : "s");
+            ws->bg_history_done = 1;
+        }
+        ws->bg_history_hook = NULL;
+        return WEECHAT_RC_ERROR;
+    }
+
+    /* Wait until the previous channel's request settles. */
+    if (in_flight > 0)
+        return WEECHAT_RC_OK;
+
+    for (ch = slack_channel_list_global(); ch; ch = ch->next)
+    {
+        if (!ch->buffer || !ch->is_member)
+            continue;
+        if (ch->workspace && ch->workspace != ws)
+            continue;
+        if (ch->type == SLACK_CHANNEL_TYPE_THREAD)
+            continue;
+        if (ch->history_state != 0)
+            continue;
+
+        slack_event_fetch_history_background(ws, ch);
+        return WEECHAT_RC_OK;
+    }
+
+    if (!ws->bg_history_done)
     {
         SLACK_WS_PRINTF(ws,
-                        "%sweeslack: background history queued for %d "
-                        "channel%s (slow queue)",
-                        weechat_prefix("network"), queued,
-                        queued == 1 ? "" : "s");
+                        "%sweeslack: background history finished "
+                        "(%d channel%s)",
+                        weechat_prefix("network"), started,
+                        started == 1 ? "" : "s");
+        ws->bg_history_done = 1;
     }
-    return WEECHAT_RC_OK;
+    ws->bg_history_hook = NULL;
+    return WEECHAT_RC_ERROR;
 }
 
 void
 slack_event_schedule_background_history(struct t_weeslack_workspace *workspace)
 {
-    struct t_slack_bg_hist_ctx *ctx;
-
     if (!workspace)
         return;
     if (!weechat_config_boolean(weeslack_config.background_load_all_history))
         return;
-
-    ctx = calloc(1, sizeof(*ctx));
-    if (!ctx)
+    /* One schedule per connect (conversations.list / double-connect safe). */
+    if (workspace->bg_history_scheduled)
         return;
-    ctx->workspace = workspace;
 
-    /* After bootstrap quiet (~8s) plus cushion. */
-    weechat_hook_timer(9000, 0, 1, &slack_event_background_history_cb,
-                        ctx, NULL);
+    workspace->bg_history_scheduled = 1;
+    workspace->bg_history_done = 0;
+    workspace->bg_history_remaining = 0;
+
+    if (workspace->bg_history_hook)
+    {
+        weechat_unhook(workspace->bg_history_hook);
+        workspace->bg_history_hook = NULL;
+    }
+
+    /* Keep buffer_switch from also stampeding history during the wait. */
+    slack_event_bootstrap_quiet(SLACK_BG_HIST_INITIAL_MS / 1000);
+
+    workspace->bg_history_hook = weechat_hook_timer(
+        SLACK_BG_HIST_INITIAL_MS, 0, 1,
+        &slack_event_background_history_arm, workspace, NULL);
 }
 
 /* History: multi-page on the slow queue. Page size from history_fetch_count;
- * max pages from look.history_max_pages (default 5, hard max 20). */
+ * max pages from look.history_max_pages (default 1 = wee-slack; hard max 20). */
 enum
 {
-    SLACK_HISTORY_PAGE_SIZE         = 100,
-    SLACK_HISTORY_MAX_PAGES_DEFAULT = 5,
+    SLACK_HISTORY_PAGE_SIZE         = 200,
+    SLACK_HISTORY_MAX_PAGES_DEFAULT = 1,
     SLACK_HISTORY_MAX_PAGES_SOFT    = 20,
     SLACK_MEMBERS_PAGE_SIZE         = 200,
     SLACK_MEMBERS_MAX_PAGES_DEFAULT = 3,
@@ -4111,6 +4274,7 @@ struct t_slack_history_ctx
     struct t_slack_channel *channel;
     int is_replies;
     int page;
+    int max_pages; /* 1 for background (wee-slack); config for focus/force */
     int truncated;
     /* retained message objects (json_object_get) until flush */
     struct json_object **msgs;
@@ -4336,8 +4500,12 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
             slack_event_history_flush(workspace, ctx);
         else
         {
+            /*
+             * Mark done so background pacing does not spin forever on the
+             * same channel after hard failures / exhausted retries.
+             */
             if (channel)
-                channel->history_state = 0;
+                channel->history_state = 3;
             slack_event_history_ctx_free(ctx);
         }
         return;
@@ -4351,7 +4519,7 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
         else
         {
             if (channel)
-                channel->history_state = 0;
+                channel->history_state = 3;
             slack_event_history_ctx_free(ctx);
         }
         return;
@@ -4364,7 +4532,7 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
         else
         {
             if (channel)
-                channel->history_state = 0;
+                channel->history_state = 3;
             slack_event_history_ctx_free(ctx);
         }
         json_object_put(json);
@@ -4432,42 +4600,51 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
             }
         }
 
-        if ((page_cursor || page_latest) &&
-            ctx->page < slack_event_history_max_pages())
         {
-            char *cursor_copy = page_cursor ? strdup(page_cursor) : NULL;
-            char *latest_copy = page_latest ? strdup(page_latest) : NULL;
+            int max_pages = ctx->max_pages > 0 ? ctx->max_pages
+                                              : slack_event_history_max_pages();
 
-            json_object_put(json);
-            if (slack_event_history_request(workspace, ctx,
-                                            cursor_copy, latest_copy))
+            if ((page_cursor || page_latest) && ctx->page < max_pages)
             {
+                char *cursor_copy = page_cursor ? strdup(page_cursor) : NULL;
+                char *latest_copy = page_latest ? strdup(page_latest) : NULL;
+
+                json_object_put(json);
+                if (slack_event_history_request(workspace, ctx,
+                                                cursor_copy, latest_copy))
+                {
+                    free(cursor_copy);
+                    free(latest_copy);
+                    return;
+                }
                 free(cursor_copy);
                 free(latest_copy);
+                ctx->truncated = 1;
+                slack_event_history_flush(workspace, ctx);
                 return;
             }
-            free(cursor_copy);
-            free(latest_copy);
-            ctx->truncated = 1;
-            slack_event_history_flush(workspace, ctx);
-            return;
+
+            if ((has_more || next_cursor) && ctx->page >= max_pages)
+                ctx->truncated = 1;
+            else if (has_more || next_cursor)
+                ctx->truncated = 1;
         }
     }
-
-    if ((has_more || next_cursor) &&
-        ctx->page >= slack_event_history_max_pages())
-        ctx->truncated = 1;
-    else if (has_more || next_cursor)
-        ctx->truncated = 1;
 
     json_object_put(json);
     slack_event_history_flush(workspace, ctx);
 }
 
+/*
+ * max_pages:
+ *   0  → use look.history_max_pages
+ *   >0 → hard cap for this fetch (background uses 1, like wee-slack)
+ */
 static void
 slack_event_history_start(struct t_weeslack_workspace *workspace,
                            struct t_slack_channel *channel,
-                           int is_replies)
+                           int is_replies,
+                           int max_pages)
 {
     struct t_slack_history_ctx *ctx;
 
@@ -4483,6 +4660,8 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
     ctx->channel = channel;
     ctx->is_replies = is_replies;
     ctx->page = 0;
+    ctx->max_pages = max_pages > 0 ? max_pages
+                                    : slack_event_history_max_pages();
     channel->history_state = 2;
 
     if (is_replies)
@@ -4531,10 +4710,25 @@ slack_event_fetch_history(struct t_weeslack_workspace *workspace,
     if (channel->history_state == 2)
         return;
 
+    /* Focus / lazy load: honor look.history_max_pages (default 1). */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1);
+        slack_event_history_start(workspace, channel, 1, 0);
     else
-        slack_event_history_start(workspace, channel, 0);
+        slack_event_history_start(workspace, channel, 0, 0);
+}
+
+/* Background history: exactly one page per channel (Python wee-slack). */
+static void
+slack_event_fetch_history_background(struct t_weeslack_workspace *workspace,
+                                      struct t_slack_channel *channel)
+{
+    if (!workspace || !channel)
+        return;
+    if (channel->history_state == 3 || channel->history_state == 2)
+        return;
+    if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
+        return;
+    slack_event_history_start(workspace, channel, 0, 1);
 }
 
 void
@@ -4545,6 +4739,7 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
         return;
     channel->history_state = 0;
     channel->history_retries = 0;
+    /* Force still uses config pages so /loadhistory can dig deeper. */
     slack_event_fetch_history(workspace, channel);
 }
 
@@ -4556,7 +4751,7 @@ slack_event_fetch_replies(struct t_weeslack_workspace *workspace,
         return;
     if (thread->history_state == 3 || thread->history_state == 2)
         return;
-    slack_event_history_start(workspace, thread, 1);
+    slack_event_history_start(workspace, thread, 1, 0);
 }
 
 /* ============================================================
@@ -5885,16 +6080,75 @@ slack_event_send_message(struct t_weeslack_workspace *workspace,
 {
     struct json_object *params;
     char *mapped;
+    /* Monotonic RTM transaction id (connection-local; single-threaded). */
+    static int ws_msg_id = 0;
 
     if (!workspace || !channel_id || !text || !text[0])
         return;
 
     mapped = slack_event_map_outgoing_format(text);
+
+    /*
+     * Prefer RTM WebSocket send (same as Python wee-slack). Messages go out
+     * as the authenticated user. chat.postMessage with the classic wee-slack
+     * app/token often shows as "wee-slack APP" in Slack clients.
+     */
+    if (workspace->ws && workspace->ws->connected &&
+        workspace->ws->handshake_done)
+    {
+        struct json_object *msg = json_object_new_object();
+
+        if (!msg)
+        {
+            free(mapped);
+            return;
+        }
+
+        if (ws_msg_id >= 0x7ffffffe)
+            ws_msg_id = 0;
+        ws_msg_id++;
+
+        json_object_object_add(msg, "id", json_object_new_int(ws_msg_id));
+        json_object_object_add(msg, "type", json_object_new_string("message"));
+        json_object_object_add(msg, "channel",
+                               json_object_new_string(channel_id));
+        json_object_object_add(msg, "text",
+                               json_object_new_string(mapped ? mapped : text));
+        if (workspace->my_user_id && workspace->my_user_id[0])
+        {
+            json_object_object_add(msg, "user",
+                                   json_object_new_string(workspace->my_user_id));
+        }
+        if (thread_ts && thread_ts[0])
+        {
+            json_object_object_add(msg, "thread_ts",
+                                   json_object_new_string(thread_ts));
+        }
+
+        if (slack_ws_send(workspace->ws, msg) != WEECHAT_RC_OK)
+        {
+            SLACK_WS_PRINTF(workspace,
+                            "%sweeslack: failed to send message over RTM",
+                            weechat_prefix("error"));
+        }
+        json_object_put(msg);
+        free(mapped);
+        return;
+    }
+
+    /* Fallback when RTM is down (reconnect race, etc.). */
     params = json_object_new_object();
+    if (!params)
+    {
+        free(mapped);
+        return;
+    }
     json_object_object_add(params, "channel",
                            json_object_new_string(channel_id));
     json_object_object_add(params, "text",
                            json_object_new_string(mapped ? mapped : text));
+    /* Classic apps: post as the authed user, not the app bot. */
+    json_object_object_add(params, "as_user", json_object_new_boolean(1));
 
     if (thread_ts && thread_ts[0])
     {
@@ -6062,7 +6316,8 @@ slack_event_upload_complete_cb(struct t_weeslack_workspace *workspace,
 
     /*
      * Status line only — RTM paints the chat [file] line.
-     * Local /icat once; mark file id so auto-download skips a second /icat.
+     * Local /icat once; mark file id so RTM auto-download still saves a copy
+     * but skips a second Kitty preview.
      */
     {
         struct json_object *files_obj = NULL, *f0 = NULL, *url_obj = NULL;
@@ -6838,6 +7093,8 @@ slack_event_send_me_message(struct t_weeslack_workspace *workspace,
                            json_object_new_string(channel_id));
     json_object_object_add(params, "text",
                            json_object_new_string(text));
+    /* Prefer authed user authorship over app bot (classic token apps). */
+    json_object_object_add(params, "as_user", json_object_new_boolean(1));
     if (thread_ts && thread_ts[0])
     {
         json_object_object_add(params, "thread_ts",
@@ -7600,13 +7857,15 @@ struct t_slack_dl_ctx
     struct t_gui_buffer *buffer;
     char *mimetype;
     int quiet; /* auto-download: less chat noise */
+    /* 1 = already previewed (e.g. local path after /upload); still save file */
+    int skip_icat;
 };
 
 /* ---- Kitty /icat previews (weechat-icat), Xepher-style ---- */
 
 /*
- * Own uploads call /icat on the local path, then the RTM message triggers
- * auto-download + /icat again → double graphic. Remember file ids briefly.
+ * Own uploads call /icat on the local path. When the RTM share arrives we still
+ * auto-download into the Xepher tree, but skip a second /icat for these ids.
  */
 #define SLACK_RECENT_SELF_UPLOAD_MAX 16
 #define SLACK_RECENT_SELF_UPLOAD_SEC 120
@@ -8186,7 +8445,8 @@ slack_event_download_done(void *user_data, int ok, long http_code)
                             ctx->path ? ctx->path : "?");
         }
         /* Kitty preview only after local file exists (Slack needs auth). */
-        slack_event_try_icat_preview(ctx->buffer, ctx->path, ctx->mimetype);
+        if (!ctx->skip_icat)
+            slack_event_try_icat_preview(ctx->buffer, ctx->path, ctx->mimetype);
     }
     else
     {
@@ -8335,7 +8595,8 @@ slack_event_download_file_ex(struct t_weeslack_workspace *workspace,
                               const char *origin,
                               const char *preferred_name,
                               const char *mimetype,
-                              int quiet)
+                              int quiet,
+                              int skip_icat)
 {
     char path[768];
     char auth[512];
@@ -8358,6 +8619,7 @@ slack_event_download_file_ex(struct t_weeslack_workspace *workspace,
     ctx->buffer = buffer;
     ctx->mimetype = (mimetype && mimetype[0]) ? strdup(mimetype) : NULL;
     ctx->quiet = quiet ? 1 : 0;
+    ctx->skip_icat = skip_icat ? 1 : 0;
     if (!ctx->path)
     {
         free(ctx->mimetype);
@@ -8403,7 +8665,7 @@ slack_event_download_file(struct t_weeslack_workspace *workspace,
                            const char *preferred_name)
 {
     slack_event_download_file_ex(workspace, url, buffer, origin,
-                                  preferred_name, NULL, 0);
+                                  preferred_name, NULL, 0, 0);
 }
 
 void
@@ -8482,6 +8744,8 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
         const char *mimetype = NULL;
         char preferred[256];
         int is_image;
+        int self_recent = 0;
+        int skip_icat = 0;
 
         if (!f)
             continue;
@@ -8490,12 +8754,22 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
             strcmp(json_object_get_string(mode_obj), "tombstone") == 0)
             continue;
 
-        /* Already previewed from local path after our /upload. */
+        /*
+         * Own /upload already /icat'd from the local path. Still save a copy
+         * under the download tree when auto_download is on; only suppress a
+         * second Kitty graphic. If only icat is wanted, skip the fetch.
+         */
         if (json_object_object_get_ex(f, "id", &obj))
         {
             const char *fid = json_object_get_string(obj);
             if (slack_event_is_recent_self_upload(fid))
+                self_recent = 1;
+        }
+        if (self_recent)
+        {
+            if (!auto_all)
                 continue;
+            skip_icat = 1;
         }
 
         if (json_object_object_get_ex(f, "url_private_download", &obj))
@@ -8503,6 +8777,25 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
         if ((!url || !url[0]) &&
             json_object_object_get_ex(f, "url_private", &obj))
             url = json_object_get_string(obj);
+        /* Image thumbs as last resort (some shares omit private download). */
+        if (!url || !url[0])
+        {
+            static const char *const thumb_keys[] = {
+                "thumb_1024", "thumb_960", "thumb_720", "thumb_480",
+                "thumb_360", "thumb_160", "thumb_80", NULL
+            };
+            int t;
+
+            for (t = 0; thumb_keys[t]; t++)
+            {
+                if (json_object_object_get_ex(f, thumb_keys[t], &obj))
+                {
+                    url = json_object_get_string(obj);
+                    if (url && url[0])
+                        break;
+                }
+            }
+        }
         if (!url || !url[0])
             continue;
 
@@ -8548,7 +8841,7 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
 
         slack_event_download_file_ex(workspace, url, buffer, origin,
                                       preferred[0] ? preferred : NULL,
-                                      mimetype, 1 /* quiet */);
+                                      mimetype, 1 /* quiet */, skip_icat);
     }
 
     if (free_wrap)
