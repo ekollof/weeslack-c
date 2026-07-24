@@ -7,47 +7,67 @@
 struct t_weeslack_workspace;
 
 /*
- * LMDB history cache (Xepher-style MDB_NOSUBDIR file per workspace).
+ * LMDB cache (Xepher-style MDB_NOSUBDIR per workspace).
  *
- * Path: <weechat_data_dir>/weeslack/<team_key>/cache.lmdb
- * Keys:  channel_id \0 ts  → compact JSON message object
+ *   <data_dir>/weeslack/<team_key>/cache.lmdb
  *
- * Write-through from history API + live RTM. Read paints seed on focus /
- * loadhistory so we avoid re-fetching full conversations.history pages.
+ * DBIs:
+ *   (default) messages:  channel_id \0 ts  → message JSON
+ *   "user"             user_id            → user JSON (from users.list)
+ *   "emoji"             name               → url or :alias: value
  */
 
-/* Open (or create) cache for workspace. Safe to call multiple times. */
 extern int slack_cache_open(struct t_weeslack_workspace *workspace);
-
-/* Close cache handle (plugin unload / workspace free). */
 extern void slack_cache_close(struct t_weeslack_workspace *workspace);
-
-/* 1 if caching enabled in config and env is open. */
 extern int slack_cache_ready(struct t_weeslack_workspace *workspace);
 
-/*
- * Store one message JSON for channel_id. Uses "ts" field as key.
- * Idempotent (same channel+ts overwrites).
- */
+/* ---- messages ---- */
+
 extern int slack_cache_put_message(struct t_weeslack_workspace *workspace,
                                     const char *channel_id,
                                     struct json_object *msg_json);
 
 /*
- * Load up to limit messages for channel, oldest-first into *out_msgs
- * (array of json objects; caller json_object_put each + free array).
- * Returns count (>=0), or -1 on error.
- * If max_ts_out non-NULL, set to newest ts string (malloc; caller frees)
- * when count > 0.
+ * Load up to limit messages, oldest-first.
+ * max_ts_out / min_ts_out: newest/oldest ts (malloc; caller frees) if count>0.
  */
 extern int slack_cache_load_channel(struct t_weeslack_workspace *workspace,
                                      const char *channel_id,
                                      int limit,
                                      struct json_object ***out_msgs,
-                                     char **max_ts_out);
+                                     char **max_ts_out,
+                                     char **min_ts_out);
 
-/* Drop all messages for a channel (optional; unused in phase 1). */
 extern void slack_cache_clear_channel(struct t_weeslack_workspace *workspace,
                                        const char *channel_id);
+
+/* ---- directory (users / custom emoji) ---- */
+
+extern int slack_cache_put_user(struct t_weeslack_workspace *workspace,
+                                 struct json_object *user_json);
+extern int slack_cache_put_emoji(struct t_weeslack_workspace *workspace,
+                                  const char *name, const char *value);
+
+/*
+ * Load all cached users; callback(user_json, data) for each.
+ * Returns count loaded.
+ */
+extern int slack_cache_foreach_user(
+    struct t_weeslack_workspace *workspace,
+    void (*cb)(struct json_object *user_json, void *data),
+    void *data);
+
+/*
+ * Load all cached emoji; callback(name, value, data) for each.
+ * Returns count loaded.
+ */
+extern int slack_cache_foreach_emoji(
+    struct t_weeslack_workspace *workspace,
+    void (*cb)(const char *name, const char *value, void *data),
+    void *data);
+
+/* Clear user/emoji DBIs (before full refresh write-through). */
+extern void slack_cache_clear_users(struct t_weeslack_workspace *workspace);
+extern void slack_cache_clear_emoji(struct t_weeslack_workspace *workspace);
 
 #endif

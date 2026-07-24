@@ -4865,19 +4865,26 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
  *   1 → auto-download + /icat while printing history (focus / loadhistory)
  *   0 → text only (background history)
  */
+/*
+ * max_pages: 0 → look.history_max_pages; dig_older: /loadhistory past cache tip.
+ * allow_downloads: 1 → auto-download + /icat while printing.
+ */
 static void
 slack_event_history_start(struct t_weeslack_workspace *workspace,
                            struct t_slack_channel *channel,
                            int is_replies,
                            int max_pages,
-                           int allow_downloads)
+                           int allow_downloads,
+                           int dig_older)
 {
     struct t_slack_history_ctx *ctx;
     struct json_object **cached = NULL;
     char *max_ts = NULL;
+    char *min_ts = NULL;
     int cached_n = 0;
     int i;
-    int catch_up_only = 0;
+    const char *req_latest = NULL;
+    const char *req_oldest = NULL;
 
     if (!workspace || !channel || !channel->id)
         return;
@@ -4924,23 +4931,21 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
     }
 
     /*
-     * LMDB seed: paint cached messages first (oldest→newest), then either
-     * catch-up with oldest=max_ts (one page of newer) or full fetch if empty.
-     * Skips threads in phase 1 (channel-keyed only).
+     * LMDB seed: paint cached messages, then:
+     *  - dig_older (/loadhistory): API with latest=min_ts (older pages)
+     *  - else if cache warm: oldest=max_ts catch-up (1 page of newer)
+     *  - else: full recent history
      */
     if (!is_replies && channel->buffer && slack_cache_ready(workspace))
     {
-        int lim = weechat_config_integer(weeslack_config.history_fetch_count);
+        int lim = weechat_config_integer(weeslack_config.history_cache_max);
+        if (lim < 50)
+            lim = weechat_config_integer(weeslack_config.history_fetch_count);
         if (lim < 1)
             lim = SLACK_HISTORY_PAGE_SIZE;
-        if (weeslack_config.history_cache_max)
-        {
-            int cap = weechat_config_integer(weeslack_config.history_cache_max);
-            if (cap > 0 && lim > cap)
-                lim = cap;
-        }
+
         cached_n = slack_cache_load_channel(workspace, channel->id, lim,
-                                            &cached, &max_ts);
+                                            &cached, &max_ts, &min_ts);
         if (cached_n > 0 && cached)
         {
             int prev_dl = g_history_auto_download;
@@ -4964,10 +4969,18 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
                                 weechat_prefix("network"), cached_n,
                                 weechat_color("reset"));
             }
-            catch_up_only = (max_ts && max_ts[0]) ? 1 : 0;
-            /* Only need API for newer messages after cache tip. */
-            if (catch_up_only)
+
+            if (dig_older && min_ts && min_ts[0])
+            {
+                /* Explicit loadhistory: page into the past from cache tip. */
+                req_latest = min_ts;
+            }
+            else if (max_ts && max_ts[0])
+            {
+                /* Lazy focus: only pull messages newer than cache. */
+                req_oldest = max_ts;
                 ctx->max_pages = 1;
+            }
         }
         else if (cached)
         {
@@ -4976,13 +4989,13 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
         }
     }
 
-    if (!slack_event_history_request(workspace, ctx, NULL, NULL,
-                                      catch_up_only ? max_ts : NULL))
+    if (!slack_event_history_request(workspace, ctx, NULL, req_latest,
+                                      req_oldest))
     {
         free(max_ts);
+        free(min_ts);
         if (cached_n > 0)
         {
-            /* Cache paint succeeded; mark done even if catch-up failed. */
             channel->history_state = 3;
             channel->history_retries = 0;
             slack_event_history_ctx_free(ctx);
@@ -4992,7 +5005,9 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
         slack_event_history_ctx_free(ctx);
         return;
     }
+
     free(max_ts);
+    free(min_ts);
 }
 
 void
@@ -5009,9 +5024,9 @@ slack_event_fetch_history(struct t_weeslack_workspace *workspace,
 
     /* Focus / lazy load: honor look.history_max_pages; download files. */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, 0, 1);
+        slack_event_history_start(workspace, channel, 1, 0, 1, 0);
     else
-        slack_event_history_start(workspace, channel, 0, 0, 1);
+        slack_event_history_start(workspace, channel, 0, 0, 1, 0);
 }
 
 /* Background history: one page, no file downloads (rate / multi budget). */
@@ -5025,7 +5040,7 @@ slack_event_fetch_history_background(struct t_weeslack_workspace *workspace,
         return;
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
         return;
-    slack_event_history_start(workspace, channel, 0, 1, 0);
+    slack_event_history_start(workspace, channel, 0, 1, 0, 0);
 }
 
 void
@@ -5041,9 +5056,8 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
     channel->history_retries = 0;
 
     /*
-     * Explicit user request: dig deeper than lazy focus (which defaults to
-     * 1 page for rate limits). Honor a higher look.history_max_pages if set;
-     * otherwise fetch at least FORCE_MIN_PAGES on the slow queue.
+     * Explicit user request: dig deeper than lazy focus. dig_older=1 pages
+     * before the cache tip (latest=min_ts) when LMDB is warm.
      */
     pages = slack_event_history_max_pages();
     if (pages < SLACK_HISTORY_FORCE_MIN_PAGES)
@@ -5052,9 +5066,9 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
         pages = SLACK_HISTORY_MAX_PAGES_SOFT;
 
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, pages, 1);
+        slack_event_history_start(workspace, channel, 1, pages, 1, 0);
     else
-        slack_event_history_start(workspace, channel, 0, pages, 1);
+        slack_event_history_start(workspace, channel, 0, pages, 1, 1);
 }
 
 void
@@ -5066,7 +5080,7 @@ slack_event_fetch_replies(struct t_weeslack_workspace *workspace,
     if (thread->history_state == 3 || thread->history_state == 2)
         return;
     /* Thread open is explicit user action — allow file previews. */
-    slack_event_history_start(workspace, thread, 1, 0, 1);
+    slack_event_history_start(workspace, thread, 1, 0, 1, 0);
 }
 
 /* ============================================================
@@ -5074,10 +5088,78 @@ slack_event_fetch_replies(struct t_weeslack_workspace *workspace,
  * ============================================================ */
 
 static void
+slack_event_cache_user_hydrate_cb(struct json_object *user_json, void *data)
+{
+    struct t_weeslack_workspace *workspace = data;
+    struct json_object *id_obj, *name_obj;
+    const char *uid = NULL, *uname = NULL;
+    struct t_slack_user *user;
+
+    if (!workspace || !user_json)
+        return;
+    if (json_object_object_get_ex(user_json, "id", &id_obj))
+        uid = json_object_get_string(id_obj);
+    if (json_object_object_get_ex(user_json, "name", &name_obj))
+        uname = json_object_get_string(name_obj);
+    if (!uid || !uid[0])
+        return;
+    if (!uname || !uname[0])
+        uname = uid;
+
+    user = slack_user_new(uid, uname, workspace);
+    if (user)
+    {
+        slack_user_update(user, user_json);
+        if (user->is_bot || user->is_app_user)
+        {
+            struct t_slack_bot *bot = slack_bot_new(uid, uname, workspace);
+            if (bot)
+                slack_bot_update(bot, user_json);
+        }
+    }
+}
+
+static void
+slack_event_cache_emoji_hydrate_cb(const char *name, const char *value,
+                                    void *data)
+{
+    struct t_weeslack_workspace *workspace = data;
+
+    if (workspace && name && value)
+        slack_custom_emoji_add(workspace, name, value);
+}
+
+/* Seed users + custom emoji from LMDB before API refresh. */
+static void
+slack_event_hydrate_directory_cache(struct t_weeslack_workspace *workspace)
+{
+    int nu, ne;
+
+    if (!workspace || !slack_cache_ready(workspace))
+        return;
+
+    nu = slack_cache_foreach_user(workspace, slack_event_cache_user_hydrate_cb,
+                                   workspace);
+    ne = slack_cache_foreach_emoji(workspace, slack_event_cache_emoji_hydrate_cb,
+                                    workspace);
+    if (nu > 0 || ne > 0)
+    {
+        SLACK_WS_PRINTF(workspace,
+                        "%sweeslack: hydrated from cache (%d users, %d emoji)",
+                        weechat_prefix("network"), nu, ne);
+    }
+}
+
+static void
 slack_event_users_cb(struct t_weeslack_workspace *workspace,
                      int return_code, const char *output,
                      void *user_data)
 {
+    int page = 0;
+
+    if (user_data)
+        page = (int)(intptr_t)user_data;
+
     if (return_code != 0 || !output)
     {
         SLACK_WS_PRINTF(workspace, "%sweeslack: users.list failed (rc=%d)",
@@ -5099,6 +5181,10 @@ slack_event_users_cb(struct t_weeslack_workspace *workspace,
         slack_event_fetch_bots(workspace);
         return;
     }
+
+    /* Full refresh: wipe user DBI on first page, then rewrite. */
+    if (page == 0 && slack_cache_ready(workspace))
+        slack_cache_clear_users(workspace);
 
     struct json_object *members_obj;
     if (json_object_object_get_ex(json, "members", &members_obj))
@@ -5138,6 +5224,7 @@ slack_event_users_cb(struct t_weeslack_workspace *workspace,
                         slack_bot_update(bot, u_obj);
                 }
             }
+            slack_cache_put_user(workspace, u_obj);
         }
     }
 
@@ -5210,6 +5297,9 @@ slack_event_fetch_users(struct t_weeslack_workspace *workspace)
 {
     if (!workspace)
         return;
+
+    /* Instant nicks/emoji from LMDB while users.list is in flight. */
+    slack_event_hydrate_directory_cache(workspace);
 
     struct json_object *params = json_object_new_object();
     json_object_object_add(params, "limit", json_object_new_int(200));
@@ -5332,6 +5422,8 @@ slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
                 int n = 0;
 
                 slack_custom_emoji_clear_workspace(workspace);
+                if (slack_cache_ready(workspace))
+                    slack_cache_clear_emoji(workspace);
                 it = json_object_iter_begin(emoji_obj);
                 end = json_object_iter_end(emoji_obj);
                 while (!json_object_iter_equal(&it, &end))
@@ -5342,6 +5434,7 @@ slack_event_emoji_cb(struct t_weeslack_workspace *workspace,
                     if (name && v)
                     {
                         slack_custom_emoji_add(workspace, name, v);
+                        slack_cache_put_emoji(workspace, name, v);
                         n++;
                     }
                     json_object_iter_next(&it);

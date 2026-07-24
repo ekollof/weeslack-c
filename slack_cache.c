@@ -1,11 +1,11 @@
 /*
- * slack_cache — LMDB-backed message history seed (rate-limit relief).
+ * slack_cache — LMDB history + directory seed (rate-limit relief).
  *
- * Layout (MDB_NOSUBDIR file):
- *   <data_dir>/weeslack/<team_key>/cache.lmdb
+ *   <data_dir>/weeslack/<team_key>/cache.lmdb   (MDB_NOSUBDIR)
  *
- * Key:   channel_id + '\0' + ts   (lexicographic → sorted by channel, then ts)
- * Value: JSON text of the Slack message object
+ * Messages (default DBI): channel_id \0 ts → JSON
+ * Users ("user"):         user_id → JSON
+ * Emoji ("emoji"):        name → url or :alias:
  */
 
 #include <stdio.h>
@@ -20,7 +20,7 @@
 
 enum
 {
-    SLACK_CACHE_MAP_MIB     = 256,  /* map size 256 MiB per workspace */
+    SLACK_CACHE_MAP_MIB     = 256,
     SLACK_CACHE_KEY_MAX     = 192,
     SLACK_CACHE_DEFAULT_LIM = 200
 };
@@ -28,9 +28,11 @@ enum
 struct t_slack_cache
 {
     MDB_env *env;
-    MDB_dbi dbi;
+    MDB_dbi dbi_msg;
+    MDB_dbi dbi_user;
+    MDB_dbi dbi_emoji;
     char *path;
-    int dbi_open;
+    int open;
 };
 
 /* ---- helpers ---- */
@@ -83,9 +85,9 @@ slack_cache_sanitize(char *s)
 }
 
 static int
-slack_cache_build_key(char *key, size_t key_size,
-                      const char *channel_id, const char *ts,
-                      size_t *out_len)
+slack_cache_build_msg_key(char *key, size_t key_size,
+                           const char *channel_id, const char *ts,
+                           size_t *out_len)
 {
     size_t clen, tlen, need;
 
@@ -99,7 +101,6 @@ slack_cache_build_key(char *key, size_t key_size,
     memcpy(key, channel_id, clen);
     key[clen] = '\0';
     memcpy(key + clen + 1, ts, tlen);
-    /* no trailing NUL required in LMDB key; length is need */
     if (out_len)
         *out_len = need;
     return 1;
@@ -152,7 +153,7 @@ slack_cache_open(struct t_weeslack_workspace *workspace)
 
     mapsize = (size_t)SLACK_CACHE_MAP_MIB * 1024ULL * 1024ULL;
     mdb_env_set_mapsize(c->env, mapsize);
-    mdb_env_set_maxdbs(c->env, 4);
+    mdb_env_set_maxdbs(c->env, 8);
 
     rc = mdb_env_open(c->env, path, MDB_NOSUBDIR, 0600);
     if (rc != 0)
@@ -173,21 +174,29 @@ slack_cache_open(struct t_weeslack_workspace *workspace)
         return 0;
     }
 
-    rc = mdb_dbi_open(txn, NULL, 0, &c->dbi);
+    /* Default DBI keeps phase-1 message keys. */
+    rc = mdb_dbi_open(txn, NULL, 0, &c->dbi_msg);
     if (rc != 0)
-    {
-        mdb_txn_abort(txn);
-        mdb_env_close(c->env);
-        free(c);
-        return 0;
-    }
+        goto fail_txn;
+    rc = mdb_dbi_open(txn, "user", MDB_CREATE, &c->dbi_user);
+    if (rc != 0)
+        goto fail_txn;
+    rc = mdb_dbi_open(txn, "emoji", MDB_CREATE, &c->dbi_emoji);
+    if (rc != 0)
+        goto fail_txn;
+
     mdb_txn_commit(txn);
-    c->dbi_open = 1;
+    c->open = 1;
     c->path = strdup(path);
     workspace->cache = c;
-
     weeslack_debug_at(3, "cache open %s", path);
     return 1;
+
+fail_txn:
+    mdb_txn_abort(txn);
+    mdb_env_close(c->env);
+    free(c);
+    return 0;
 }
 
 void
@@ -202,8 +211,12 @@ slack_cache_close(struct t_weeslack_workspace *workspace)
 
     if (c->env)
     {
-        if (c->dbi_open)
-            mdb_dbi_close(c->env, c->dbi);
+        if (c->open)
+        {
+            mdb_dbi_close(c->env, c->dbi_msg);
+            mdb_dbi_close(c->env, c->dbi_user);
+            mdb_dbi_close(c->env, c->dbi_emoji);
+        }
         mdb_env_close(c->env);
     }
     free(c->path);
@@ -222,7 +235,67 @@ slack_cache_ready(struct t_weeslack_workspace *workspace)
     return (workspace->cache != NULL);
 }
 
-/* ---- put ---- */
+/* ---- prune oldest messages in a channel ---- */
+
+static void
+slack_cache_prune_channel_txn(MDB_txn *txn, MDB_dbi dbi,
+                               const char *channel_id, int max_keep)
+{
+    MDB_cursor *cur = NULL;
+    MDB_val k, v;
+    char prefix[SLACK_CACHE_KEY_MAX];
+    size_t plen;
+    int rc, count = 0, drop;
+
+    if (!txn || !channel_id || max_keep < 1)
+        return;
+
+    plen = strlen(channel_id);
+    if (plen + 1 >= sizeof(prefix))
+        return;
+    memcpy(prefix, channel_id, plen);
+    prefix[plen] = '\0';
+
+    if (mdb_cursor_open(txn, dbi, &cur) != 0)
+        return;
+
+    k.mv_data = prefix;
+    k.mv_size = plen + 1;
+    rc = mdb_cursor_get(cur, &k, &v, MDB_SET_RANGE);
+    while (rc == 0)
+    {
+        if (k.mv_size < plen + 1 ||
+            memcmp(k.mv_data, prefix, plen + 1) != 0)
+            break;
+        count++;
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+
+    drop = count - max_keep;
+    if (drop <= 0)
+    {
+        mdb_cursor_close(cur);
+        return;
+    }
+
+    /* Delete oldest first (SET_RANGE = lowest ts). */
+    k.mv_data = prefix;
+    k.mv_size = plen + 1;
+    rc = mdb_cursor_get(cur, &k, &v, MDB_SET_RANGE);
+    while (rc == 0 && drop > 0)
+    {
+        if (k.mv_size < plen + 1 ||
+            memcmp(k.mv_data, prefix, plen + 1) != 0)
+            break;
+        if (mdb_cursor_del(cur, 0) != 0)
+            break;
+        drop--;
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
+}
+
+/* ---- put message ---- */
 
 int
 slack_cache_put_message(struct t_weeslack_workspace *workspace,
@@ -249,7 +322,7 @@ slack_cache_put_message(struct t_weeslack_workspace *workspace,
     if (!ts || !ts[0])
         return 0;
 
-    if (!slack_cache_build_key(key, sizeof(key), channel_id, ts, &klen))
+    if (!slack_cache_build_msg_key(key, sizeof(key), channel_id, ts, &klen))
         return 0;
 
     json_str = json_object_to_json_string_ext(msg_json,
@@ -266,24 +339,28 @@ slack_cache_put_message(struct t_weeslack_workspace *workspace,
     v.mv_data = (void *)json_str;
     v.mv_size = strlen(json_str);
 
-    rc = mdb_put(txn, c->dbi, &k, &v, 0);
+    rc = mdb_put(txn, c->dbi_msg, &k, &v, 0);
     if (rc != 0)
     {
         mdb_txn_abort(txn);
         return 0;
     }
+
+    slack_cache_prune_channel_txn(txn, c->dbi_msg, channel_id,
+                                   slack_cache_max_msgs());
     mdb_txn_commit(txn);
     return 1;
 }
 
-/* ---- load (oldest-first, up to limit newest messages) ---- */
+/* ---- load messages ---- */
 
 int
 slack_cache_load_channel(struct t_weeslack_workspace *workspace,
                           const char *channel_id,
                           int limit,
                           struct json_object ***out_msgs,
-                          char **max_ts_out)
+                          char **max_ts_out,
+                          char **min_ts_out)
 {
     struct t_slack_cache *c;
     MDB_txn *txn = NULL;
@@ -294,13 +371,15 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
     size_t plen;
     int rc, n = 0, cap, i;
     struct json_object **msgs = NULL;
-    struct json_object **tmp;
     char *max_ts = NULL;
+    char *min_ts = NULL;
 
     if (out_msgs)
         *out_msgs = NULL;
     if (max_ts_out)
         *max_ts_out = NULL;
+    if (min_ts_out)
+        *min_ts_out = NULL;
 
     if (!slack_cache_ready(workspace) || !channel_id || !channel_id[0] ||
         !out_msgs)
@@ -318,7 +397,6 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
     memcpy(prefix, channel_id, plen);
     prefix[plen] = '\0';
 
-    /* Seek just after this channel's keyspace: channel\0\xff... */
     if (plen + 2 >= sizeof(start_key))
         return -1;
     memcpy(start_key, channel_id, plen);
@@ -328,7 +406,7 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
     rc = mdb_txn_begin(c->env, NULL, MDB_RDONLY, &txn);
     if (rc != 0)
         return -1;
-    rc = mdb_cursor_open(txn, c->dbi, &cur);
+    rc = mdb_cursor_open(txn, c->dbi_msg, &cur);
     if (rc != 0)
     {
         mdb_txn_abort(txn);
@@ -347,13 +425,10 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
     k.mv_data = start_key;
     k.mv_size = plen + 2;
     rc = mdb_cursor_get(cur, &k, &v, MDB_SET_RANGE);
-    /* SET_RANGE may land past our prefix or on first key of next channel.
-     * Walk backward with PREV from that position (or LAST if not found). */
     if (rc == MDB_NOTFOUND)
         rc = mdb_cursor_get(cur, &k, &v, MDB_LAST);
     else if (rc == 0)
     {
-        /* If landed on or after next channel, step back once */
         if (k.mv_size < plen + 1 ||
             memcmp(k.mv_data, prefix, plen + 1) != 0)
             rc = mdb_cursor_get(cur, &k, &v, MDB_PREV);
@@ -364,23 +439,34 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
         const char *kdata = k.mv_data;
         size_t ksize = k.mv_size;
         const char *ts;
+        size_t tlen;
         char *json_buf;
         struct json_object *obj;
 
         if (ksize < plen + 1 + 1 ||
             memcmp(kdata, prefix, plen + 1) != 0)
-            break; /* left this channel's keyspace */
+            break;
 
         ts = kdata + plen + 1;
-        if (!max_ts && ts[0])
+        tlen = ksize - (plen + 1);
+
+        /* First hit is newest (walking PREV). */
+        if (!max_ts && tlen > 0)
         {
-            size_t tlen = ksize - (plen + 1);
             max_ts = malloc(tlen + 1);
             if (max_ts)
             {
                 memcpy(max_ts, ts, tlen);
                 max_ts[tlen] = '\0';
             }
+        }
+        /* Keep updating min as we go older. */
+        free(min_ts);
+        min_ts = malloc(tlen + 1);
+        if (min_ts)
+        {
+            memcpy(min_ts, ts, tlen);
+            min_ts[tlen] = '\0';
         }
 
         json_buf = malloc(v.mv_size + 1);
@@ -396,9 +482,9 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
             continue;
         }
 
-        /* Collect newest-first; reverse later for paint order. */
         if (n >= cap)
         {
+            struct json_object **tmp;
             cap *= 2;
             tmp = realloc(msgs, (size_t)cap * sizeof(*msgs));
             if (!tmp)
@@ -409,7 +495,6 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
             msgs = tmp;
         }
         msgs[n++] = obj;
-
         rc = mdb_cursor_get(cur, &k, &v, MDB_PREV);
     }
 
@@ -420,10 +505,10 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
     {
         free(msgs);
         free(max_ts);
+        free(min_ts);
         return 0;
     }
 
-    /* Reverse to oldest-first for history paint */
     for (i = 0; i < n / 2; i++)
     {
         struct json_object *swap = msgs[i];
@@ -436,6 +521,10 @@ slack_cache_load_channel(struct t_weeslack_workspace *workspace,
         *max_ts_out = max_ts;
     else
         free(max_ts);
+    if (min_ts_out)
+        *min_ts_out = min_ts;
+    else
+        free(min_ts);
     return n;
 }
 
@@ -461,11 +550,9 @@ slack_cache_clear_channel(struct t_weeslack_workspace *workspace,
     memcpy(prefix, channel_id, plen);
     prefix[plen] = '\0';
 
-    rc = mdb_txn_begin(c->env, NULL, 0, &txn);
-    if (rc != 0)
+    if (mdb_txn_begin(c->env, NULL, 0, &txn) != 0)
         return;
-    rc = mdb_cursor_open(txn, c->dbi, &cur);
-    if (rc != 0)
+    if (mdb_cursor_open(txn, c->dbi_msg, &cur) != 0)
     {
         mdb_txn_abort(txn);
         return;
@@ -479,12 +566,227 @@ slack_cache_clear_channel(struct t_weeslack_workspace *workspace,
         if (k.mv_size < plen + 1 ||
             memcmp(k.mv_data, prefix, plen + 1) != 0)
             break;
-        rc = mdb_cursor_del(cur, 0);
-        if (rc != 0)
+        if (mdb_cursor_del(cur, 0) != 0)
             break;
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
+    mdb_txn_commit(txn);
+}
+
+/* ---- users / emoji ---- */
+
+int
+slack_cache_put_user(struct t_weeslack_workspace *workspace,
+                      struct json_object *user_json)
+{
+    struct t_slack_cache *c;
+    struct json_object *id_obj;
+    const char *uid, *json_str;
+    MDB_txn *txn = NULL;
+    MDB_val k, v;
+    int rc;
+
+    if (!slack_cache_ready(workspace) || !user_json)
+        return 0;
+    c = workspace->cache;
+
+    if (!json_object_object_get_ex(user_json, "id", &id_obj))
+        return 0;
+    uid = json_object_get_string(id_obj);
+    if (!uid || !uid[0])
+        return 0;
+
+    json_str = json_object_to_json_string_ext(user_json,
+                                               JSON_C_TO_STRING_PLAIN);
+    if (!json_str)
+        return 0;
+
+    if (mdb_txn_begin(c->env, NULL, 0, &txn) != 0)
+        return 0;
+    k.mv_data = (void *)uid;
+    k.mv_size = strlen(uid);
+    v.mv_data = (void *)json_str;
+    v.mv_size = strlen(json_str);
+    rc = mdb_put(txn, c->dbi_user, &k, &v, 0);
+    if (rc != 0)
+    {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+    mdb_txn_commit(txn);
+    return 1;
+}
+
+int
+slack_cache_put_emoji(struct t_weeslack_workspace *workspace,
+                       const char *name, const char *value)
+{
+    struct t_slack_cache *c;
+    MDB_txn *txn = NULL;
+    MDB_val k, v;
+    int rc;
+
+    if (!slack_cache_ready(workspace) || !name || !name[0] || !value)
+        return 0;
+    c = workspace->cache;
+
+    if (mdb_txn_begin(c->env, NULL, 0, &txn) != 0)
+        return 0;
+    k.mv_data = (void *)name;
+    k.mv_size = strlen(name);
+    v.mv_data = (void *)value;
+    v.mv_size = strlen(value);
+    rc = mdb_put(txn, c->dbi_emoji, &k, &v, 0);
+    if (rc != 0)
+    {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+    mdb_txn_commit(txn);
+    return 1;
+}
+
+int
+slack_cache_foreach_user(struct t_weeslack_workspace *workspace,
+                          void (*cb)(struct json_object *user_json, void *data),
+                          void *data)
+{
+    struct t_slack_cache *c;
+    MDB_txn *txn = NULL;
+    MDB_cursor *cur = NULL;
+    MDB_val k, v;
+    int rc, n = 0;
+
+    if (!slack_cache_ready(workspace) || !cb)
+        return 0;
+    c = workspace->cache;
+
+    if (mdb_txn_begin(c->env, NULL, MDB_RDONLY, &txn) != 0)
+        return 0;
+    if (mdb_cursor_open(txn, c->dbi_user, &cur) != 0)
+    {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+
+    rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+    while (rc == 0)
+    {
+        char *json_buf;
+        struct json_object *obj;
+
+        json_buf = malloc(v.mv_size + 1);
+        if (!json_buf)
+            break;
+        memcpy(json_buf, v.mv_data, v.mv_size);
+        json_buf[v.mv_size] = '\0';
+        obj = json_tokener_parse(json_buf);
+        free(json_buf);
+        if (obj)
+        {
+            cb(obj, data);
+            json_object_put(obj);
+            n++;
+        }
         rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
     }
 
     mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+    return n;
+}
+
+int
+slack_cache_foreach_emoji(struct t_weeslack_workspace *workspace,
+                           void (*cb)(const char *name, const char *value,
+                                      void *data),
+                           void *data)
+{
+    struct t_slack_cache *c;
+    MDB_txn *txn = NULL;
+    MDB_cursor *cur = NULL;
+    MDB_val k, v;
+    int rc, n = 0;
+
+    if (!slack_cache_ready(workspace) || !cb)
+        return 0;
+    c = workspace->cache;
+
+    if (mdb_txn_begin(c->env, NULL, MDB_RDONLY, &txn) != 0)
+        return 0;
+    if (mdb_cursor_open(txn, c->dbi_emoji, &cur) != 0)
+    {
+        mdb_txn_abort(txn);
+        return 0;
+    }
+
+    rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+    while (rc == 0)
+    {
+        char *name, *value;
+
+        name = malloc(k.mv_size + 1);
+        value = malloc(v.mv_size + 1);
+        if (name && value)
+        {
+            memcpy(name, k.mv_data, k.mv_size);
+            name[k.mv_size] = '\0';
+            memcpy(value, v.mv_data, v.mv_size);
+            value[v.mv_size] = '\0';
+            cb(name, value, data);
+            n++;
+        }
+        free(name);
+        free(value);
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cur);
+    mdb_txn_abort(txn);
+    return n;
+}
+
+static void
+slack_cache_clear_dbi(struct t_slack_cache *c, MDB_dbi dbi)
+{
+    MDB_txn *txn = NULL;
+    MDB_cursor *cur = NULL;
+    MDB_val k, v;
+    int rc;
+
+    if (!c)
+        return;
+    if (mdb_txn_begin(c->env, NULL, 0, &txn) != 0)
+        return;
+    if (mdb_cursor_open(txn, dbi, &cur) != 0)
+    {
+        mdb_txn_abort(txn);
+        return;
+    }
+    rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+    while (rc == 0)
+    {
+        if (mdb_cursor_del(cur, 0) != 0)
+            break;
+        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+    }
+    mdb_cursor_close(cur);
     mdb_txn_commit(txn);
+}
+
+void
+slack_cache_clear_users(struct t_weeslack_workspace *workspace)
+{
+    if (!slack_cache_ready(workspace))
+        return;
+    slack_cache_clear_dbi(workspace->cache, workspace->cache->dbi_user);
+}
+
+void
+slack_cache_clear_emoji(struct t_weeslack_workspace *workspace)
+{
+    if (!slack_cache_ready(workspace))
+        return;
+    slack_cache_clear_dbi(workspace->cache, workspace->cache->dbi_emoji);
 }
