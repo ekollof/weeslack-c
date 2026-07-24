@@ -9038,6 +9038,45 @@ slack_event_sanitize_path_component(char *s)
 }
 
 /*
+ * Preferred on-disk name for a Slack file attachment.
+ *
+ * Many uploads share basenames like "image.png". Reuse-by-preferred-name
+ * must not collide — prefix with the Slack file id (unique per file).
+ * Result: F0ABC_image.png so history/live /icat maps 1:1.
+ */
+static void
+slack_event_file_preferred_name(char *out, size_t out_size,
+                                const char *file_id,
+                                const char *name,
+                                const char *title,
+                                const char *filetype)
+{
+    char base[200];
+
+    if (!out || out_size == 0)
+        return;
+    out[0] = '\0';
+    base[0] = '\0';
+
+    if (name && name[0])
+        snprintf(base, sizeof(base), "%s", name);
+    else if (title && title[0])
+    {
+        if (filetype && filetype[0] && !strstr(title, filetype))
+            snprintf(base, sizeof(base), "%s.%s", title, filetype);
+        else
+            snprintf(base, sizeof(base), "%s", title);
+    }
+
+    if (file_id && file_id[0] && base[0])
+        snprintf(out, out_size, "%s_%s", file_id, base);
+    else if (file_id && file_id[0])
+        snprintf(out, out_size, "%s", file_id);
+    else if (base[0])
+        snprintf(out, out_size, "%s", base);
+}
+
+/*
  * Layout (Xepher-style):
  *   <root>/weeslack/<origin>/<YYYY-MM-DD>/<file>
  * root = look.download_path, else $XDG_DOWNLOAD_DIR, else ~/Downloads
@@ -9525,6 +9564,7 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
         const char *name = NULL;
         const char *filetype = NULL;
         const char *mimetype = NULL;
+        const char *file_id = NULL;
         char preferred[256];
         int is_image;
         int self_recent = 0;
@@ -9544,8 +9584,8 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
          */
         if (json_object_object_get_ex(f, "id", &obj))
         {
-            const char *fid = json_object_get_string(obj);
-            if (slack_event_is_recent_self_upload(fid))
+            file_id = json_object_get_string(obj);
+            if (slack_event_is_recent_self_upload(file_id))
                 self_recent = 1;
         }
         if (self_recent)
@@ -9591,22 +9631,13 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
         if (json_object_object_get_ex(f, "mimetype", &obj))
             mimetype = json_object_get_string(obj);
 
-        preferred[0] = '\0';
-        if (name && name[0])
-            snprintf(preferred, sizeof(preferred), "%s", name);
-        else if (title && title[0])
-        {
-            if (filetype && filetype[0] &&
-                !strstr(title, filetype))
-                snprintf(preferred, sizeof(preferred), "%s.%s",
-                         title, filetype);
-            else
-                snprintf(preferred, sizeof(preferred), "%s", title);
-        }
+        slack_event_file_preferred_name(preferred, sizeof(preferred),
+                                         file_id, name, title, filetype);
 
         is_image = slack_event_is_image_mime(mimetype) ||
                    slack_event_is_image_filetype(filetype) ||
-                   slack_event_is_image_path(preferred[0] ? preferred : url);
+                   slack_event_is_image_path(preferred[0] ? preferred : url) ||
+                   slack_event_is_image_path(name ? name : "");
 
         if (!auto_all && !is_image)
             continue;
@@ -9616,10 +9647,12 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
             filetype && filetype[0] &&
             !strstr(preferred, filetype))
         {
-            char base[240];
+            char base[256];
+            size_t flen = strlen(filetype);
 
             snprintf(base, sizeof(base), "%s", preferred);
-            snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
+            if (strlen(base) + 1 + flen < sizeof(preferred))
+                snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
         }
 
         slack_event_download_file_ex(workspace, url, buffer, origin,
@@ -9704,6 +9737,7 @@ slack_event_history_prep_message_files(struct t_weeslack_workspace *workspace,
         const char *name = NULL;
         const char *filetype = NULL;
         const char *mimetype = NULL;
+        const char *file_id = NULL;
         char preferred[256];
         int is_image;
 
@@ -9713,6 +9747,9 @@ slack_event_history_prep_message_files(struct t_weeslack_workspace *workspace,
             json_object_get_string(mode_obj) &&
             strcmp(json_object_get_string(mode_obj), "tombstone") == 0)
             continue;
+
+        if (json_object_object_get_ex(f, "id", &obj))
+            file_id = json_object_get_string(obj);
 
         if (json_object_object_get_ex(f, "url_private_download", &obj))
             url = json_object_get_string(obj);
@@ -9749,30 +9786,25 @@ slack_event_history_prep_message_files(struct t_weeslack_workspace *workspace,
         if (json_object_object_get_ex(f, "mimetype", &obj))
             mimetype = json_object_get_string(obj);
 
-        preferred[0] = '\0';
-        if (name && name[0])
-            snprintf(preferred, sizeof(preferred), "%s", name);
-        else if (title && title[0])
-        {
-            if (filetype && filetype[0] && !strstr(title, filetype))
-                snprintf(preferred, sizeof(preferred), "%s.%s", title, filetype);
-            else
-                snprintf(preferred, sizeof(preferred), "%s", title);
-        }
+        slack_event_file_preferred_name(preferred, sizeof(preferred),
+                                         file_id, name, title, filetype);
 
         is_image = slack_event_is_image_mime(mimetype) ||
                    slack_event_is_image_filetype(filetype) ||
-                   slack_event_is_image_path(preferred[0] ? preferred : url);
+                   slack_event_is_image_path(preferred[0] ? preferred : url) ||
+                   slack_event_is_image_path(name ? name : "");
         if (!auto_all && !is_image)
             continue;
 
         if (is_image && preferred[0] && !slack_event_is_image_path(preferred) &&
             filetype && filetype[0] && !strstr(preferred, filetype))
         {
-            char base[240];
+            char base[256];
+            size_t flen = strlen(filetype);
 
             snprintf(base, sizeof(base), "%s", preferred);
-            snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
+            if (strlen(base) + 1 + flen < sizeof(preferred))
+                snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
         }
 
         /*
