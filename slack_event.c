@@ -1905,6 +1905,15 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
     /* if this is a parent message with reply_count, show in parent channel */
     if (is_parent)
     {
+        struct t_slack_message *existing_p =
+            slack_message_search(channel->messages, ts);
+
+        if (existing_p)
+        {
+            slack_message_free(msg);
+            free(text_owned);
+            return;
+        }
         channel->messages = slack_message_prepend(channel->messages, msg);
 
         if (channel->buffer)
@@ -2006,9 +2015,18 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
 
         if (existing)
         {
-            /* Live file-defer re-entry: already modeled, only print below. */
             slack_message_free(msg);
             msg = existing;
+            /*
+             * History already painted this ts (cache seed or prior page).
+             * Never re-print — that was the main source of doubles.
+             * Live file-defer re-entry continues to print (force_print).
+             */
+            if (history)
+            {
+                free(text_owned);
+                return;
+            }
         }
         else
             display_channel->messages =
@@ -4369,6 +4387,8 @@ struct t_slack_history_ctx
     int page;
     int max_pages; /* 1 for background (wee-slack); config for focus/force */
     int allow_downloads; /* 1 = auto-download/icat files while flushing */
+    int dig_older; /* 1 = paging before cache tip; final flush repaints sorted */
+    int seeded_from_cache; /* 1 = buffer already painted from LMDB */
     int truncated;
     /* retained message objects (json_object_get) until flush */
     struct json_object **msgs;
@@ -4535,6 +4555,77 @@ slack_event_history_phase2_print(struct t_slack_hist_gate *gate)
     free(gate);
 }
 
+/* Drop in-memory message list for a channel (after buffer clear / repaint). */
+static void
+slack_event_channel_free_messages(struct t_slack_channel *channel)
+{
+    struct t_slack_message *m, *next;
+
+    if (!channel)
+        return;
+    for (m = channel->messages; m; m = next)
+    {
+        next = m->next;
+        m->next = NULL;
+        m->prev = NULL;
+        slack_message_free(m);
+    }
+    channel->messages = NULL;
+}
+
+/*
+ * dig_older final pass: API wrote older msgs into LMDB; clear buffer and
+ * repaint full cache oldest→newest so order is correct and unique by ts.
+ */
+static void
+slack_event_history_repaint_from_cache(struct t_weeslack_workspace *workspace,
+                                        struct t_slack_channel *channel,
+                                        int allow_downloads)
+{
+    struct json_object **cached = NULL;
+    char *max_ts = NULL, *min_ts = NULL;
+    int n, i, lim, prev_dl;
+
+    if (!workspace || !channel || !channel->id || !channel->buffer)
+        return;
+    if (!slack_cache_ready(workspace))
+        return;
+
+    lim = weechat_config_integer(weeslack_config.history_cache_max);
+    if (lim < 50)
+        lim = 500;
+
+    weechat_buffer_clear(channel->buffer);
+    slack_event_channel_free_messages(channel);
+
+    n = slack_cache_load_channel(workspace, channel->id, lim, &cached,
+                                  &max_ts, &min_ts);
+    free(max_ts);
+    free(min_ts);
+    if (n <= 0 || !cached)
+    {
+        free(cached);
+        return;
+    }
+
+    prev_dl = g_history_auto_download;
+    g_history_auto_download = allow_downloads ? 1 : 0;
+    for (i = 0; i < n; i++)
+    {
+        if (cached[i])
+        {
+            slack_event_handle_message(workspace, channel, cached[i], 1);
+            json_object_put(cached[i]);
+        }
+    }
+    g_history_auto_download = prev_dl;
+    free(cached);
+
+    weechat_printf(channel->buffer,
+                    "%s--- history %d messages (sorted, deduped) ---%s",
+                    weechat_prefix("network"), n, weechat_color("reset"));
+}
+
 static void
 slack_event_history_flush(struct t_weeslack_workspace *workspace,
                           struct t_slack_history_ctx *ctx)
@@ -4550,6 +4641,33 @@ slack_event_history_flush(struct t_weeslack_workspace *workspace,
     if (ctx->msg_count > 1)
         qsort(ctx->msgs, (size_t)ctx->msg_count, sizeof(ctx->msgs[0]),
               slack_event_history_msg_ts_cmp);
+
+    /*
+     * Dig-older after a cache seed: new rows are already in LMDB. Do not
+     * append them under newer lines — clear and repaint the full cache.
+     */
+    if (ctx->dig_older && ctx->seeded_from_cache && channel && channel->buffer)
+    {
+        /* Still write-through any msgs not yet put (safety). */
+        for (i = 0; i < ctx->msg_count; i++)
+        {
+            if (ctx->msgs[i] && channel->id)
+                slack_cache_put_message(workspace, channel->id, ctx->msgs[i]);
+        }
+        slack_event_history_repaint_from_cache(workspace, channel,
+                                                ctx->allow_downloads);
+        if (ctx->truncated && channel->buffer)
+        {
+            weechat_printf(channel->buffer,
+                            "%s--- more history available on Slack ---%s",
+                            weechat_prefix("network"),
+                            weechat_color("reset"));
+        }
+        channel->history_state = 3;
+        channel->history_retries = 0;
+        slack_event_history_ctx_free(ctx);
+        return;
+    }
 
     /*
      * Without downloads: print immediately (old path).
@@ -4901,6 +5019,8 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
     ctx->max_pages = max_pages > 0 ? max_pages
                                     : slack_event_history_max_pages();
     ctx->allow_downloads = allow_downloads ? 1 : 0;
+    ctx->dig_older = dig_older ? 1 : 0;
+    ctx->seeded_from_cache = 0;
     channel->history_state = 2;
 
     if (is_replies)
@@ -4962,6 +5082,8 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
             free(cached);
             cached = NULL;
 
+            ctx->seeded_from_cache = 1;
+
             if (channel->buffer)
             {
                 weechat_printf(channel->buffer,
@@ -4974,12 +5096,14 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
             {
                 /* Explicit loadhistory: page into the past from cache tip. */
                 req_latest = min_ts;
+                ctx->dig_older = 1;
             }
             else if (max_ts && max_ts[0])
             {
                 /* Lazy focus: only pull messages newer than cache. */
                 req_oldest = max_ts;
                 ctx->max_pages = 1;
+                ctx->dig_older = 0;
             }
         }
         else if (cached)
