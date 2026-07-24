@@ -55,7 +55,7 @@ extern void slack_event_download_file(struct t_weeslack_workspace *workspace,
                                        struct t_gui_buffer *buffer,
                                        const char *origin,
                                        const char *preferred_name);
-/* Auto-save message files when look.auto_download_files is on (live only). */
+/* Auto-save message files (live + focus/loadhistory; not background history). */
 extern void slack_event_auto_download_message_files(
     struct t_weeslack_workspace *workspace,
     struct t_slack_channel *channel,

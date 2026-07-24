@@ -12,6 +12,7 @@
 #include "slack_event.h"
 #include "slack_buffer.h"
 #include "slack_data.h"
+#include "slack_cache.h"
 
 /* declared in slack_http.h — ensure queue lives with plugin */
 
@@ -199,6 +200,11 @@ weeslack_rtm_connect_cb(struct t_weeslack_workspace *workspace,
     }
 
     slack_buffer_new_server(workspace);
+
+    /* History cache under weeslack/<domain|id>/cache.lmdb */
+    if (workspace->cache)
+        slack_cache_close(workspace); /* reopen if domain just became known */
+    slack_cache_open(workspace);
 
     struct json_object *url_obj;
     if (json_object_object_get_ex(json, "url", &url_obj))
@@ -3590,10 +3596,32 @@ weeslack_config_init(void)
     weeslack_config.history_max_pages = weechat_config_new_option(
         weeslack_config.file, weeslack_config.section_look,
         "history_max_pages", "integer",
-        "Max conversations.history pages on focus / loadhistory (each page = "
-        "history_fetch_count messages). Default 1 matches wee-slack. "
-        "Background history always uses 1 page. Higher values rate-limit easily",
+        "Max conversations.history pages on lazy focus (each page = "
+        "history_fetch_count messages). Default 1 (rate-limit safe). "
+        "/cslack loadhistory always fetches at least 10 pages (up to 20). "
+        "Background history always uses 1 page",
         NULL, 1, 20, "1", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.history_cache = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "history_cache", "boolean",
+        "Cache channel history in LMDB under weechat data dir "
+        "(weeslack/<team>/cache.lmdb). Seeds buffers on focus/loadhistory "
+        "and reduces conversations.history traffic",
+        NULL, 0, 0, "on", NULL, 0,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL,
+        NULL, NULL, NULL);
+
+    weeslack_config.history_cache_max = weechat_config_new_option(
+        weeslack_config.file, weeslack_config.section_look,
+        "history_cache_max", "integer",
+        "Max messages stored/loaded per channel in the LMDB history cache "
+        "(50–5000, default 500)",
+        NULL, 50, 5000, "500", NULL, 0,
         NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL, NULL);
@@ -5554,6 +5582,7 @@ weeslack_workspace_free(struct t_weeslack_workspace *workspace)
         return WEECHAT_RC_ERROR;
 
     weeslack_workspace_stop_bg_history(workspace);
+    slack_cache_close(workspace);
 
     if (workspace->prev_workspace)
         workspace->prev_workspace->next_workspace = workspace->next_workspace;

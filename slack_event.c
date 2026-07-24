@@ -14,6 +14,7 @@
 #include "slack_buffer.h"
 #include "slack_http.h"
 #include "slack_ws.h"
+#include "slack_cache.h"
 
 static char *slack_event_render_formatting(const char *text);
 static char *slack_event_format_files(struct json_object *msg_json);
@@ -38,6 +39,42 @@ static void slack_event_custom_emoji_icat(
     const char *text);
 /* defined later in bootstrap chain */
 void slack_event_fetch_emoji(struct t_weeslack_workspace *workspace);
+
+/*
+ * When processing history messages: 1 = also auto-download files + /icat
+ * (focus / loadhistory). Background history leaves this 0.
+ */
+static int g_history_auto_download = 0;
+
+/*
+ * Live messages with remote files: first pass defers printing until downloads
+ * finish; re-entry with this set prints + /icat under the [file] line.
+ */
+static int g_force_print_with_files = 0;
+
+/*
+ * Pre-download gate: fetch files first, then print + /icat under each [file].
+ * History: ctx non-NULL. Live: live_msg + live_channel set.
+ */
+struct t_slack_hist_gate
+{
+    struct t_weeslack_workspace *workspace;
+    struct t_slack_history_ctx *ctx;
+    struct json_object *live_msg;
+    struct t_slack_channel *live_channel;
+    int remaining;
+};
+
+/* Opaque until full definition later in history section. */
+struct t_slack_history_ctx;
+
+static void slack_event_hist_gate_done_one(struct t_slack_hist_gate *gate);
+static int slack_event_history_prep_message_files(
+    struct t_weeslack_workspace *workspace,
+    struct t_slack_channel *channel,
+    struct json_object *msg_json,
+    struct t_gui_buffer *buffer,
+    struct t_slack_hist_gate *gate);
 
 /* ============================================================
  * Common error checking for Slack API responses
@@ -1954,16 +1991,70 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
             free(formatted);
             free(reactions);
         }
-        /* Thread parents can still carry file shares — save/preview live. */
-        if (!history && channel->buffer)
+        /* Thread parents can still carry file shares. */
+        if ((!history || g_history_auto_download) && channel->buffer)
             slack_event_auto_download_message_files(workspace, channel,
                                                      msg_json, channel->buffer);
         free(text_owned);
         return;
     }
 
-    /* store in the display channel (may be thread channel) */
-    display_channel->messages = slack_message_prepend(display_channel->messages, msg);
+    /* store in the display channel (may be thread channel) — dedupe on re-entry */
+    {
+        struct t_slack_message *existing =
+            slack_message_search(display_channel->messages, ts);
+
+        if (existing)
+        {
+            /* Live file-defer re-entry: already modeled, only print below. */
+            slack_message_free(msg);
+            msg = existing;
+        }
+        else
+            display_channel->messages =
+                slack_message_prepend(display_channel->messages, msg);
+    }
+
+    /* LMDB write-through for live + history paint re-entry (idempotent). */
+    if (!history && channel && channel->id &&
+        channel->type != SLACK_CHANNEL_TYPE_THREAD)
+        slack_cache_put_message(workspace, channel->id, msg_json);
+
+    /*
+     * Live messages with remote files: download first, then print + /icat so
+     * Kitty lines sit under the [file] link (same as history phase 2).
+     */
+    if (!history && !g_force_print_with_files && display_channel->buffer &&
+        (weechat_config_boolean(weeslack_config.auto_download_files) ||
+         weechat_config_boolean(weeslack_config.icat_enabled)))
+    {
+        struct t_slack_hist_gate *gate = calloc(1, sizeof(*gate));
+        int rem_before;
+
+        if (gate)
+        {
+            gate->workspace = workspace;
+            gate->live_channel = display_channel;
+            gate->live_msg = json_object_get(msg_json);
+            gate->remaining = 1; /* hold while registering downloads */
+            rem_before = gate->remaining;
+            if (gate->live_msg)
+                slack_event_history_prep_message_files(
+                    workspace, display_channel, msg_json,
+                    display_channel->buffer, gate);
+            if (gate->remaining > rem_before)
+            {
+                /* At least one network download — print after they finish. */
+                free(text_owned);
+                slack_event_hist_gate_done_one(gate); /* release hold */
+                return;
+            }
+            /* Nothing to fetch — fall through and print now. */
+            if (gate->live_msg)
+                json_object_put(gate->live_msg);
+            free(gate);
+        }
+    }
 
     /* display in buffer */
     if (display_channel->buffer)
@@ -2090,11 +2181,11 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         free(ts_tag);
 
         /*
-         * Live only — history would storm the download queue.
-         * Run off the message JSON (files[] / file{}), not the formatted
-         * string, so shares still save when formatting is empty.
+         * Auto-download + /icat for live messages always; for history only
+         * when the fetch asked for it (focus / loadhistory — not background).
+         * Files[] and single file{} both handled inside the helper.
          */
-        if (!history)
+        if (!history || g_history_auto_download)
             slack_event_auto_download_message_files(workspace, channel,
                                                      msg_json,
                                                      display_channel->buffer);
@@ -4220,11 +4311,13 @@ slack_event_schedule_background_history(struct t_weeslack_workspace *workspace)
 }
 
 /* History: multi-page on the slow queue. Page size from history_fetch_count;
- * max pages from look.history_max_pages (default 1 = wee-slack; hard max 20). */
+ * lazy focus uses look.history_max_pages (default 1); /loadhistory digs deeper. */
 enum
 {
     SLACK_HISTORY_PAGE_SIZE         = 200,
     SLACK_HISTORY_MAX_PAGES_DEFAULT = 1,
+    /* Explicit /cslack loadhistory: at least this many pages (slow queue). */
+    SLACK_HISTORY_FORCE_MIN_PAGES   = 10,
     SLACK_HISTORY_MAX_PAGES_SOFT    = 20,
     SLACK_MEMBERS_PAGE_SIZE         = 200,
     SLACK_MEMBERS_MAX_PAGES_DEFAULT = 3,
@@ -4275,6 +4368,7 @@ struct t_slack_history_ctx
     int is_replies;
     int page;
     int max_pages; /* 1 for background (wee-slack); config for focus/force */
+    int allow_downloads; /* 1 = auto-download/icat files while flushing */
     int truncated;
     /* retained message objects (json_object_get) until flush */
     struct json_object **msgs;
@@ -4365,28 +4459,57 @@ slack_event_history_append_msg(struct t_slack_history_ctx *ctx,
 }
 
 static void
-slack_event_history_flush(struct t_weeslack_workspace *workspace,
-                          struct t_slack_history_ctx *ctx)
+slack_event_history_phase2_print(struct t_slack_hist_gate *gate)
 {
+    struct t_slack_history_ctx *ctx;
     struct t_slack_channel *channel;
+    struct t_weeslack_workspace *workspace;
     int i, loaded = 0;
+    int prev_auto_dl;
 
-    if (!ctx)
+    if (!gate)
         return;
-    channel = ctx->channel;
+    ctx = gate->ctx;
+    workspace = gate->workspace;
+    channel = ctx ? ctx->channel : gate->live_channel;
 
-    if (ctx->msg_count > 1)
+    /*
+     * Files are on disk. Print with auto_download so /icat runs immediately
+     * after each [file] line (print_immediately under context).
+     */
+    if (gate->live_msg)
+    {
+        int prev_force = g_force_print_with_files;
+
+        g_force_print_with_files = 1;
+        slack_event_handle_message(workspace, channel, gate->live_msg, 0);
+        g_force_print_with_files = prev_force;
+        json_object_put(gate->live_msg);
+        gate->live_msg = NULL;
+        free(gate);
+        return;
+    }
+
+    prev_auto_dl = g_history_auto_download;
+    g_history_auto_download = 1;
+
+    if (ctx && ctx->msg_count > 1)
         qsort(ctx->msgs, (size_t)ctx->msg_count, sizeof(ctx->msgs[0]),
               slack_event_history_msg_ts_cmp);
 
-    for (i = 0; i < ctx->msg_count; i++)
+    if (ctx)
     {
-        if (ctx->msgs[i])
+        for (i = 0; i < ctx->msg_count; i++)
         {
-            slack_event_handle_message(workspace, channel, ctx->msgs[i], 1);
-            loaded++;
+            if (ctx->msgs[i])
+            {
+                slack_event_handle_message(workspace, channel, ctx->msgs[i], 1);
+                loaded++;
+            }
         }
     }
+
+    g_history_auto_download = prev_auto_dl;
 
     if (channel && channel->buffer && loaded > 0)
     {
@@ -4395,9 +4518,9 @@ slack_event_history_flush(struct t_weeslack_workspace *workspace,
                         "(%d page%s%s) ---%s",
                         weechat_prefix("network"),
                         loaded,
-                        ctx->page > 0 ? ctx->page : 1,
-                        (ctx->page == 1) ? "" : "s",
-                        ctx->truncated ? "; truncated, more on Slack" : "",
+                        ctx && ctx->page > 0 ? ctx->page : 1,
+                        (ctx && ctx->page == 1) ? "" : "s",
+                        (ctx && ctx->truncated) ? "; truncated, more on Slack" : "",
                         weechat_color("reset"));
     }
 
@@ -4407,7 +4530,93 @@ slack_event_history_flush(struct t_weeslack_workspace *workspace,
         channel->history_retries = 0;
     }
 
-    slack_event_history_ctx_free(ctx);
+    if (ctx)
+        slack_event_history_ctx_free(ctx);
+    free(gate);
+}
+
+static void
+slack_event_history_flush(struct t_weeslack_workspace *workspace,
+                          struct t_slack_history_ctx *ctx)
+{
+    struct t_slack_channel *channel;
+    struct t_slack_hist_gate *gate;
+    int i;
+
+    if (!ctx)
+        return;
+    channel = ctx->channel;
+
+    if (ctx->msg_count > 1)
+        qsort(ctx->msgs, (size_t)ctx->msg_count, sizeof(ctx->msgs[0]),
+              slack_event_history_msg_ts_cmp);
+
+    /*
+     * Without downloads: print immediately (old path).
+     * With downloads: fetch files first (no /icat), then print+icat so
+     * Kitty lines sit under each [file] link instead of at buffer end.
+     */
+    if (!ctx->allow_downloads || !channel || !channel->buffer)
+    {
+        int prev_auto_dl = g_history_auto_download;
+        int loaded = 0;
+
+        g_history_auto_download = 0;
+        for (i = 0; i < ctx->msg_count; i++)
+        {
+            if (ctx->msgs[i])
+            {
+                slack_event_handle_message(workspace, channel, ctx->msgs[i], 1);
+                loaded++;
+            }
+        }
+        g_history_auto_download = prev_auto_dl;
+
+        if (channel && channel->buffer && loaded > 0)
+        {
+            weechat_printf(channel->buffer,
+                            "%s--- loaded %d messages from history "
+                            "(%d page%s%s) ---%s",
+                            weechat_prefix("network"),
+                            loaded,
+                            ctx->page > 0 ? ctx->page : 1,
+                            (ctx->page == 1) ? "" : "s",
+                            ctx->truncated ? "; truncated, more on Slack" : "",
+                            weechat_color("reset"));
+        }
+        if (channel)
+        {
+            channel->history_state = 3;
+            channel->history_retries = 0;
+        }
+        slack_event_history_ctx_free(ctx);
+        return;
+    }
+
+    gate = calloc(1, sizeof(*gate));
+    if (!gate)
+    {
+        ctx->allow_downloads = 0;
+        slack_event_history_flush(workspace, ctx);
+        return;
+    }
+    gate->workspace = workspace;
+    gate->ctx = ctx;
+    /*
+     * Hold remaining at 1 while starting jobs so early completions cannot
+     * run phase 2 before all prep downloads are registered.
+     */
+    gate->remaining = 1;
+
+    for (i = 0; i < ctx->msg_count; i++)
+    {
+        if (ctx->msgs[i])
+            slack_event_history_prep_message_files(
+                workspace, channel, ctx->msgs[i], channel->buffer, gate);
+    }
+
+    /* Release the hold; if nothing was queued, print now. */
+    slack_event_hist_gate_done_one(gate);
 }
 
 static void slack_event_history_cb(struct t_weeslack_workspace *workspace,
@@ -4418,7 +4627,8 @@ static int
 slack_event_history_request(struct t_weeslack_workspace *workspace,
                             struct t_slack_history_ctx *ctx,
                             const char *cursor,
-                            const char *latest)
+                            const char *latest,
+                            const char *oldest)
 {
     struct json_object *params;
     const char *method;
@@ -4461,6 +4671,14 @@ slack_event_history_request(struct t_weeslack_workspace *workspace,
         /* older API shape: page older than this ts (exclusive) */
         json_object_object_add(params, "latest",
                                json_object_new_string(latest));
+        json_object_object_add(params, "inclusive",
+                               json_object_new_boolean(0));
+    }
+    else if (oldest && oldest[0])
+    {
+        /* catch-up: only messages after cached max ts */
+        json_object_object_add(params, "oldest",
+                               json_object_new_string(oldest));
         json_object_object_add(params, "inclusive",
                                json_object_new_boolean(0));
     }
@@ -4550,6 +4768,9 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
             struct json_object *msg_obj =
                 json_object_array_get_idx(messages_obj, i);
             slack_event_history_append_msg(ctx, msg_obj);
+            /* LMDB write-through (channel history seed). */
+            if (!ctx->is_replies && ctx->channel && ctx->channel->id)
+                slack_cache_put_message(workspace, ctx->channel->id, msg_obj);
         }
     }
 
@@ -4611,7 +4832,8 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
 
                 json_object_put(json);
                 if (slack_event_history_request(workspace, ctx,
-                                                cursor_copy, latest_copy))
+                                                cursor_copy, latest_copy,
+                                                NULL))
                 {
                     free(cursor_copy);
                     free(latest_copy);
@@ -4639,14 +4861,23 @@ slack_event_history_cb(struct t_weeslack_workspace *workspace,
  * max_pages:
  *   0  → use look.history_max_pages
  *   >0 → hard cap for this fetch (background uses 1, like wee-slack)
+ * allow_downloads:
+ *   1 → auto-download + /icat while printing history (focus / loadhistory)
+ *   0 → text only (background history)
  */
 static void
 slack_event_history_start(struct t_weeslack_workspace *workspace,
                            struct t_slack_channel *channel,
                            int is_replies,
-                           int max_pages)
+                           int max_pages,
+                           int allow_downloads)
 {
     struct t_slack_history_ctx *ctx;
+    struct json_object **cached = NULL;
+    char *max_ts = NULL;
+    int cached_n = 0;
+    int i;
+    int catch_up_only = 0;
 
     if (!workspace || !channel || !channel->id)
         return;
@@ -4662,6 +4893,7 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
     ctx->page = 0;
     ctx->max_pages = max_pages > 0 ? max_pages
                                     : slack_event_history_max_pages();
+    ctx->allow_downloads = allow_downloads ? 1 : 0;
     channel->history_state = 2;
 
     if (is_replies)
@@ -4691,11 +4923,76 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
         }
     }
 
-    if (!slack_event_history_request(workspace, ctx, NULL, NULL))
+    /*
+     * LMDB seed: paint cached messages first (oldest→newest), then either
+     * catch-up with oldest=max_ts (one page of newer) or full fetch if empty.
+     * Skips threads in phase 1 (channel-keyed only).
+     */
+    if (!is_replies && channel->buffer && slack_cache_ready(workspace))
     {
+        int lim = weechat_config_integer(weeslack_config.history_fetch_count);
+        if (lim < 1)
+            lim = SLACK_HISTORY_PAGE_SIZE;
+        if (weeslack_config.history_cache_max)
+        {
+            int cap = weechat_config_integer(weeslack_config.history_cache_max);
+            if (cap > 0 && lim > cap)
+                lim = cap;
+        }
+        cached_n = slack_cache_load_channel(workspace, channel->id, lim,
+                                            &cached, &max_ts);
+        if (cached_n > 0 && cached)
+        {
+            int prev_dl = g_history_auto_download;
+            g_history_auto_download = allow_downloads ? 1 : 0;
+            for (i = 0; i < cached_n; i++)
+            {
+                if (cached[i])
+                {
+                    slack_event_handle_message(workspace, channel, cached[i], 1);
+                    json_object_put(cached[i]);
+                }
+            }
+            g_history_auto_download = prev_dl;
+            free(cached);
+            cached = NULL;
+
+            if (channel->buffer)
+            {
+                weechat_printf(channel->buffer,
+                                "%s--- loaded %d messages from cache ---%s",
+                                weechat_prefix("network"), cached_n,
+                                weechat_color("reset"));
+            }
+            catch_up_only = (max_ts && max_ts[0]) ? 1 : 0;
+            /* Only need API for newer messages after cache tip. */
+            if (catch_up_only)
+                ctx->max_pages = 1;
+        }
+        else if (cached)
+        {
+            free(cached);
+            cached = NULL;
+        }
+    }
+
+    if (!slack_event_history_request(workspace, ctx, NULL, NULL,
+                                      catch_up_only ? max_ts : NULL))
+    {
+        free(max_ts);
+        if (cached_n > 0)
+        {
+            /* Cache paint succeeded; mark done even if catch-up failed. */
+            channel->history_state = 3;
+            channel->history_retries = 0;
+            slack_event_history_ctx_free(ctx);
+            return;
+        }
         channel->history_state = 0;
         slack_event_history_ctx_free(ctx);
+        return;
     }
+    free(max_ts);
 }
 
 void
@@ -4710,14 +5007,14 @@ slack_event_fetch_history(struct t_weeslack_workspace *workspace,
     if (channel->history_state == 2)
         return;
 
-    /* Focus / lazy load: honor look.history_max_pages (default 1). */
+    /* Focus / lazy load: honor look.history_max_pages; download files. */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, 0);
+        slack_event_history_start(workspace, channel, 1, 0, 1);
     else
-        slack_event_history_start(workspace, channel, 0, 0);
+        slack_event_history_start(workspace, channel, 0, 0, 1);
 }
 
-/* Background history: exactly one page per channel (Python wee-slack). */
+/* Background history: one page, no file downloads (rate / multi budget). */
 static void
 slack_event_fetch_history_background(struct t_weeslack_workspace *workspace,
                                       struct t_slack_channel *channel)
@@ -4728,19 +5025,36 @@ slack_event_fetch_history_background(struct t_weeslack_workspace *workspace,
         return;
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
         return;
-    slack_event_history_start(workspace, channel, 0, 1);
+    slack_event_history_start(workspace, channel, 0, 1, 0);
 }
 
 void
 slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
                                  struct t_slack_channel *channel)
 {
-    if (!channel)
+    int pages;
+
+    if (!workspace || !channel)
         return;
+
     channel->history_state = 0;
     channel->history_retries = 0;
-    /* Force still uses config pages so /loadhistory can dig deeper. */
-    slack_event_fetch_history(workspace, channel);
+
+    /*
+     * Explicit user request: dig deeper than lazy focus (which defaults to
+     * 1 page for rate limits). Honor a higher look.history_max_pages if set;
+     * otherwise fetch at least FORCE_MIN_PAGES on the slow queue.
+     */
+    pages = slack_event_history_max_pages();
+    if (pages < SLACK_HISTORY_FORCE_MIN_PAGES)
+        pages = SLACK_HISTORY_FORCE_MIN_PAGES;
+    if (pages > SLACK_HISTORY_MAX_PAGES_SOFT)
+        pages = SLACK_HISTORY_MAX_PAGES_SOFT;
+
+    if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
+        slack_event_history_start(workspace, channel, 1, pages, 1);
+    else
+        slack_event_history_start(workspace, channel, 0, pages, 1);
 }
 
 void
@@ -4751,7 +5065,8 @@ slack_event_fetch_replies(struct t_weeslack_workspace *workspace,
         return;
     if (thread->history_state == 3 || thread->history_state == 2)
         return;
-    slack_event_history_start(workspace, thread, 1, 0);
+    /* Thread open is explicit user action — allow file previews. */
+    slack_event_history_start(workspace, thread, 1, 0, 1);
 }
 
 /* ============================================================
@@ -7859,6 +8174,8 @@ struct t_slack_dl_ctx
     int quiet; /* auto-download: less chat noise */
     /* 1 = already previewed (e.g. local path after /upload); still save file */
     int skip_icat;
+    /* Non-NULL: history prep download — count down, no icat until phase 2. */
+    struct t_slack_hist_gate *hist_gate;
 };
 
 /* ---- Kitty /icat previews (weechat-icat), Xepher-style ---- */
@@ -8427,13 +8744,32 @@ slack_event_custom_emoji_icat(struct t_weeslack_workspace *workspace,
     }
 }
 
+/* Defined with download pending queue (history multi-slot deferral). */
+static void slack_event_dl_pending_pump(void);
+
+static void slack_event_history_phase2_print(struct t_slack_hist_gate *gate);
+
+static void
+slack_event_hist_gate_done_one(struct t_slack_hist_gate *gate)
+{
+    if (!gate)
+        return;
+    if (gate->remaining > 0)
+        gate->remaining--;
+    if (gate->remaining <= 0)
+        slack_event_history_phase2_print(gate);
+}
+
 static void
 slack_event_download_done(void *user_data, int ok, long http_code)
 {
     struct t_slack_dl_ctx *ctx = user_data;
+    struct t_slack_hist_gate *gate = NULL;
 
     if (!ctx)
         return;
+
+    gate = ctx->hist_gate;
 
     if (ok)
     {
@@ -8463,6 +8799,12 @@ slack_event_download_done(void *user_data, int ok, long http_code)
     free(ctx->path);
     free(ctx->mimetype);
     free(ctx);
+
+    /* Start any downloads that waited for a multi slot. */
+    slack_event_dl_pending_pump();
+
+    if (gate)
+        slack_event_hist_gate_done_one(gate);
 }
 
 /* Sanitize a single path component (origin or filename). */
@@ -8588,6 +8930,131 @@ slack_event_download_build_path(char *path, size_t path_size,
     return 1;
 }
 
+/*
+ * When multi is full, quiet auto-downloads used to drop. Queue them and
+ * start as slots free (history can enqueue many images at once).
+ */
+struct t_slack_dl_pending
+{
+    struct t_weeslack_workspace *workspace;
+    char *url;
+    char *path;
+    char *auth;
+    char *cookie;
+    char *mimetype;
+    struct t_gui_buffer *buffer;
+    int quiet;
+    int skip_icat;
+    struct t_slack_hist_gate *hist_gate;
+    struct t_slack_dl_pending *next;
+};
+
+static struct t_slack_dl_pending *g_dl_pending_head = NULL;
+static struct t_slack_dl_pending *g_dl_pending_tail = NULL;
+static struct t_hook *g_dl_pending_timer = NULL;
+
+static void slack_event_dl_pending_pump(void);
+
+static void
+slack_event_dl_pending_free(struct t_slack_dl_pending *p)
+{
+    if (!p)
+        return;
+    free(p->url);
+    free(p->path);
+    free(p->auth);
+    free(p->cookie);
+    free(p->mimetype);
+    free(p);
+}
+
+static int
+slack_event_dl_pending_timer_cb(const void *pointer, void *data,
+                                 int remaining_calls)
+{
+    (void)pointer;
+    (void)data;
+    (void)remaining_calls;
+    slack_event_dl_pending_pump();
+    if (!g_dl_pending_head)
+    {
+        if (g_dl_pending_timer)
+        {
+            weechat_unhook(g_dl_pending_timer);
+            g_dl_pending_timer = NULL;
+        }
+        return WEECHAT_RC_ERROR;
+    }
+    return WEECHAT_RC_OK;
+}
+
+static void
+slack_event_dl_pending_ensure_timer(void)
+{
+    if (g_dl_pending_timer || !g_dl_pending_head)
+        return;
+    g_dl_pending_timer = weechat_hook_timer(
+        150, 0, 0, &slack_event_dl_pending_timer_cb, NULL, NULL);
+}
+
+static void
+slack_event_dl_pending_pump(void)
+{
+    while (g_dl_pending_head && slack_http_multi_slots_free() > 0)
+    {
+        struct t_slack_dl_pending *p = g_dl_pending_head;
+        struct t_slack_dl_ctx *ctx;
+
+        g_dl_pending_head = p->next;
+        if (!g_dl_pending_head)
+            g_dl_pending_tail = NULL;
+
+        ctx = calloc(1, sizeof(*ctx));
+        if (!ctx || !p->workspace || !p->url || !p->path)
+        {
+            slack_event_dl_pending_free(p);
+            free(ctx);
+            continue;
+        }
+        ctx->workspace = p->workspace;
+        ctx->path = strdup(p->path);
+        ctx->buffer = p->buffer;
+        ctx->mimetype = p->mimetype ? strdup(p->mimetype) : NULL;
+        ctx->quiet = p->quiet;
+        ctx->skip_icat = p->skip_icat;
+        ctx->hist_gate = p->hist_gate;
+        if (!ctx->path)
+        {
+            free(ctx->mimetype);
+            free(ctx);
+            if (p->hist_gate)
+                slack_event_hist_gate_done_one(p->hist_gate);
+            slack_event_dl_pending_free(p);
+            continue;
+        }
+
+        if (!slack_http_curl_get_file(p->url, p->path, p->auth, p->cookie,
+                                      slack_event_download_done, ctx))
+        {
+            /* Still full or start failed — requeue front and stop. */
+            free(ctx->path);
+            free(ctx->mimetype);
+            free(ctx);
+            p->next = g_dl_pending_head;
+            g_dl_pending_head = p;
+            if (!g_dl_pending_tail)
+                g_dl_pending_tail = p;
+            break;
+        }
+        slack_event_dl_pending_free(p);
+    }
+    if (!g_dl_pending_head && g_dl_pending_timer)
+    {
+        weechat_unhook(g_dl_pending_timer);
+        g_dl_pending_timer = NULL;
+    }
+}
+
 static void
 slack_event_download_file_ex(struct t_weeslack_workspace *workspace,
                               const char *url,
@@ -8596,34 +9063,100 @@ slack_event_download_file_ex(struct t_weeslack_workspace *workspace,
                               const char *preferred_name,
                               const char *mimetype,
                               int quiet,
-                              int skip_icat)
+                              int skip_icat,
+                              struct t_slack_hist_gate *hist_gate)
 {
     char path[768];
     char auth[512];
     char cookie_h[512];
     const char *cookie = NULL;
     struct t_slack_dl_ctx *ctx;
+    struct stat st;
 
     if (!workspace || !url || !url[0] || !workspace->token)
+    {
+        if (hist_gate)
+            slack_event_hist_gate_done_one(hist_gate);
         return;
+    }
 
     if (!slack_event_download_build_path(path, sizeof(path), origin,
                                           preferred_name, url))
+    {
+        if (hist_gate)
+            slack_event_hist_gate_done_one(hist_gate);
         return;
+    }
+
+    /*
+     * If we already have this preferred name (history re-fetch), reuse it
+     * for /icat instead of downloading another .1/.2 copy.
+     */
+    if (preferred_name && preferred_name[0])
+    {
+        char existing[768];
+        char name_s[256];
+        char *slash;
+        size_t dlen;
+
+        snprintf(existing, sizeof(existing), "%s", path);
+        slash = strrchr(existing, '/');
+        if (slash && slash > existing)
+        {
+            dlen = (size_t)(slash - existing);
+            snprintf(name_s, sizeof(name_s), "%s", preferred_name);
+            slack_event_sanitize_path_component(name_s);
+            if (dlen + 1 + strlen(name_s) + 1 <= sizeof(existing))
+            {
+                existing[dlen] = '\0';
+                snprintf(existing + dlen, sizeof(existing) - dlen, "/%s",
+                         name_s);
+                if (stat(existing, &st) == 0 && S_ISREG(st.st_mode) &&
+                    st.st_size > 0)
+                {
+                    if (!skip_icat)
+                        slack_event_try_icat_preview(buffer, existing,
+                                                      mimetype);
+                    /*
+                     * History prep (skip_icat + gate): file already on disk —
+                     * do not count as in-flight (caller never reserved a slot).
+                     */
+                    if (hist_gate && !skip_icat)
+                        slack_event_hist_gate_done_one(hist_gate);
+                    return;
+                }
+            }
+        }
+    }
+    else if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+    {
+        if (!skip_icat)
+            slack_event_try_icat_preview(buffer, path, mimetype);
+        if (hist_gate && !skip_icat)
+            slack_event_hist_gate_done_one(hist_gate);
+        return;
+    }
 
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
+    {
+        if (hist_gate)
+            slack_event_hist_gate_done_one(hist_gate);
         return;
+    }
     ctx->workspace = workspace;
     ctx->path = strdup(path);
     ctx->buffer = buffer;
     ctx->mimetype = (mimetype && mimetype[0]) ? strdup(mimetype) : NULL;
     ctx->quiet = quiet ? 1 : 0;
     ctx->skip_icat = skip_icat ? 1 : 0;
+    ctx->hist_gate = hist_gate;
     if (!ctx->path)
     {
         free(ctx->mimetype);
         free(ctx);
+        if (hist_gate)
+            slack_event_hist_gate_done_one(hist_gate);
         return;
     }
 
@@ -8639,6 +9172,37 @@ slack_event_download_file_ex(struct t_weeslack_workspace *workspace,
     if (!slack_http_curl_get_file(url, path, auth, cookie,
                                   slack_event_download_done, ctx))
     {
+        /* Queue for when a multi slot frees (history dump). */
+        struct t_slack_dl_pending *p = calloc(1, sizeof(*p));
+
+        if (p)
+        {
+            p->workspace = workspace;
+            p->url = strdup(url);
+            p->path = strdup(path);
+            p->auth = strdup(auth);
+            p->cookie = cookie ? strdup(cookie) : NULL;
+            p->mimetype = (mimetype && mimetype[0]) ? strdup(mimetype) : NULL;
+            p->buffer = buffer;
+            p->quiet = quiet ? 1 : 0;
+            p->skip_icat = skip_icat ? 1 : 0;
+            p->hist_gate = hist_gate;
+            if (p->url && p->path && p->auth)
+            {
+                free(ctx->path);
+                free(ctx->mimetype);
+                free(ctx);
+                if (g_dl_pending_tail)
+                    g_dl_pending_tail->next = p;
+                else
+                    g_dl_pending_head = p;
+                g_dl_pending_tail = p;
+                p->next = NULL;
+                slack_event_dl_pending_ensure_timer();
+                return;
+            }
+            slack_event_dl_pending_free(p);
+        }
         if (!quiet)
         {
             weechat_printf(buffer, "%sweeslack: could not start download",
@@ -8647,6 +9211,8 @@ slack_event_download_file_ex(struct t_weeslack_workspace *workspace,
         free(ctx->path);
         free(ctx->mimetype);
         free(ctx);
+        if (hist_gate)
+            slack_event_hist_gate_done_one(hist_gate);
         return;
     }
 
@@ -8665,7 +9231,7 @@ slack_event_download_file(struct t_weeslack_workspace *workspace,
                            const char *preferred_name)
 {
     slack_event_download_file_ex(workspace, url, buffer, origin,
-                                  preferred_name, NULL, 0, 0);
+                                  preferred_name, NULL, 0, 0, NULL);
 }
 
 void
@@ -8841,11 +9407,214 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
 
         slack_event_download_file_ex(workspace, url, buffer, origin,
                                       preferred[0] ? preferred : NULL,
-                                      mimetype, 1 /* quiet */, skip_icat);
+                                      mimetype, 1 /* quiet */, skip_icat,
+                                      NULL);
     }
 
     if (free_wrap)
         json_object_put(single_wrap);
+}
+
+/*
+ * History prep: same file selection as auto_download, but skip_icat and
+ * hist_gate so phase 2 can print+preview under each message line.
+ * Returns number of download slots reserved (in-flight + already-local).
+ */
+static int
+slack_event_history_prep_message_files(struct t_weeslack_workspace *workspace,
+                                        struct t_slack_channel *channel,
+                                        struct json_object *msg_json,
+                                        struct t_gui_buffer *buffer,
+                                        struct t_slack_hist_gate *gate)
+{
+    struct json_object *files_obj = NULL;
+    struct json_object *single_wrap = NULL;
+    int free_wrap = 0;
+    int count, i, n = 0;
+    char origin[192];
+    const char *team, *ch_name;
+    int auto_all, want_icat;
+
+    if (!workspace || !msg_json || !gate)
+        return 0;
+
+    auto_all = weechat_config_boolean(weeslack_config.auto_download_files);
+    want_icat = weechat_config_boolean(weeslack_config.icat_enabled);
+    if (!auto_all && !want_icat)
+        return 0;
+    if (!auto_all && want_icat && !slack_event_icat_available(buffer))
+        return 0;
+
+    if (json_object_object_get_ex(msg_json, "files", &files_obj) &&
+        json_object_is_type(files_obj, json_type_array))
+    {
+    }
+    else if (json_object_object_get_ex(msg_json, "file", &files_obj) &&
+             json_object_is_type(files_obj, json_type_object))
+    {
+        single_wrap = json_object_new_array();
+        if (!single_wrap)
+            return 0;
+        json_object_array_add(single_wrap, json_object_get(files_obj));
+        files_obj = single_wrap;
+        free_wrap = 1;
+    }
+    else
+        return 0;
+
+    count = json_object_array_length(files_obj);
+    if (count <= 0)
+    {
+        if (free_wrap)
+            json_object_put(single_wrap);
+        return 0;
+    }
+
+    team = workspace->name ? workspace->name : workspace->id;
+    ch_name = (channel && channel->name) ? channel->name
+        : ((channel && channel->id) ? channel->id : "misc");
+    if (team && team[0])
+        snprintf(origin, sizeof(origin), "%s.%s", team, ch_name);
+    else
+        snprintf(origin, sizeof(origin), "%s", ch_name);
+
+    for (i = 0; i < count; i++)
+    {
+        struct json_object *f = json_object_array_get_idx(files_obj, i);
+        struct json_object *obj, *mode_obj;
+        const char *url = NULL;
+        const char *title = NULL;
+        const char *name = NULL;
+        const char *filetype = NULL;
+        const char *mimetype = NULL;
+        char preferred[256];
+        int is_image;
+
+        if (!f)
+            continue;
+        if (json_object_object_get_ex(f, "mode", &mode_obj) &&
+            json_object_get_string(mode_obj) &&
+            strcmp(json_object_get_string(mode_obj), "tombstone") == 0)
+            continue;
+
+        if (json_object_object_get_ex(f, "url_private_download", &obj))
+            url = json_object_get_string(obj);
+        if ((!url || !url[0]) &&
+            json_object_object_get_ex(f, "url_private", &obj))
+            url = json_object_get_string(obj);
+        if (!url || !url[0])
+        {
+            static const char *const thumb_keys[] = {
+                "thumb_1024", "thumb_960", "thumb_720", "thumb_480",
+                "thumb_360", "thumb_160", "thumb_80", NULL
+            };
+            int t;
+
+            for (t = 0; thumb_keys[t]; t++)
+            {
+                if (json_object_object_get_ex(f, thumb_keys[t], &obj))
+                {
+                    url = json_object_get_string(obj);
+                    if (url && url[0])
+                        break;
+                }
+            }
+        }
+        if (!url || !url[0])
+            continue;
+
+        if (json_object_object_get_ex(f, "title", &obj))
+            title = json_object_get_string(obj);
+        if (json_object_object_get_ex(f, "name", &obj))
+            name = json_object_get_string(obj);
+        if (json_object_object_get_ex(f, "filetype", &obj))
+            filetype = json_object_get_string(obj);
+        if (json_object_object_get_ex(f, "mimetype", &obj))
+            mimetype = json_object_get_string(obj);
+
+        preferred[0] = '\0';
+        if (name && name[0])
+            snprintf(preferred, sizeof(preferred), "%s", name);
+        else if (title && title[0])
+        {
+            if (filetype && filetype[0] && !strstr(title, filetype))
+                snprintf(preferred, sizeof(preferred), "%s.%s", title, filetype);
+            else
+                snprintf(preferred, sizeof(preferred), "%s", title);
+        }
+
+        is_image = slack_event_is_image_mime(mimetype) ||
+                   slack_event_is_image_filetype(filetype) ||
+                   slack_event_is_image_path(preferred[0] ? preferred : url);
+        if (!auto_all && !is_image)
+            continue;
+
+        if (is_image && preferred[0] && !slack_event_is_image_path(preferred) &&
+            filetype && filetype[0] && !strstr(preferred, filetype))
+        {
+            char base[240];
+
+            snprintf(base, sizeof(base), "%s", preferred);
+            snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
+        }
+
+        /*
+         * Only reserve a gate slot when we need a network fetch. Files already
+         * on disk are used in phase 2 without counting as in-flight.
+         * skip_icat: previews run after print so lines sit under the [file].
+         */
+        {
+            char probe[768];
+            struct stat pst;
+            int have = 0;
+
+            if (slack_event_download_build_path(probe, sizeof(probe), origin,
+                                                 preferred[0] ? preferred : NULL,
+                                                 url))
+            {
+                if (preferred[0])
+                {
+                    char *sl = strrchr(probe, '/');
+                    char name_s[256];
+
+                    if (sl && sl > probe)
+                    {
+                        size_t dlen = (size_t)(sl - probe);
+
+                        snprintf(name_s, sizeof(name_s), "%s", preferred);
+                        slack_event_sanitize_path_component(name_s);
+                        if (dlen + 1 + strlen(name_s) + 1 <= sizeof(probe))
+                        {
+                            probe[dlen] = '\0';
+                            snprintf(probe + dlen, sizeof(probe) - dlen,
+                                     "/%s", name_s);
+                            if (stat(probe, &pst) == 0 && S_ISREG(pst.st_mode) &&
+                                pst.st_size > 0)
+                                have = 1;
+                        }
+                    }
+                }
+                else if (stat(probe, &pst) == 0 && S_ISREG(pst.st_mode) &&
+                         pst.st_size > 0)
+                    have = 1;
+            }
+            if (have)
+            {
+                n++;
+                continue; /* phase 2 will /icat from disk */
+            }
+        }
+
+        gate->remaining++;
+        n++;
+        slack_event_download_file_ex(workspace, url, buffer, origin,
+                                      preferred[0] ? preferred : NULL,
+                                      mimetype, 1, 1 /* skip_icat */, gate);
+    }
+
+    if (free_wrap)
+        json_object_put(single_wrap);
+    return n;
 }
 
 /* ============================================================

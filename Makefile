@@ -1,5 +1,5 @@
 # weeslack - Slack plugin for WeeChat
-# Requires: weechat-dev, json-c, openssl, libcurl
+# Requires: weechat-dev, json-c, openssl, libcurl, lmdb
 #
 # Normal build:
 #   make && make install
@@ -16,8 +16,8 @@ PLUGIN_NAME = weeslack
 PLUGIN_FILE = $(PLUGIN_NAME).so
 
 CC ?= gcc
-PKG_CFLAGS := $(shell pkg-config --cflags weechat json-c openssl libcurl)
-PKG_LIBS   := $(shell pkg-config --libs weechat json-c openssl libcurl)
+PKG_CFLAGS := $(shell pkg-config --cflags weechat json-c openssl libcurl lmdb)
+PKG_LIBS   := $(shell pkg-config --libs weechat json-c openssl libcurl lmdb)
 
 # Base flags; -O2 for release, ASAN uses -O1 -g (set below).
 CFLAGS_COMMON := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
@@ -42,7 +42,8 @@ else
   LIBDIR ?= $(HOME)/.local/share/weechat/plugins
 endif
 
-SRCS = $(PLUGIN_NAME).c slack_http.c slack_ws.c slack_data.c slack_buffer.c slack_event.c
+SRCS = $(PLUGIN_NAME).c slack_http.c slack_ws.c slack_data.c slack_buffer.c \
+	slack_event.c slack_cache.c
 OBJS = $(SRCS:.c=.o)
 
 ASAN_LIB := $(shell $(CC) -print-file-name=libasan.so)

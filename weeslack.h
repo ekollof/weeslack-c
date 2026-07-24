@@ -11,6 +11,7 @@
                     _fmt, ##__VA_ARGS__)
 
 struct t_slack_ws;
+struct t_slack_cache;
 
 struct t_weeslack_workspace
 {
@@ -36,6 +37,8 @@ struct t_weeslack_workspace
     struct t_hook *bg_history_hook;
     int bg_history_done;
     int bg_history_remaining;
+    /* LMDB history cache (slack_cache.c); NULL if disabled / not open. */
+    struct t_slack_cache *cache;
     struct t_slack_ws *ws;
     struct t_gui_buffer *server_buffer;
     struct t_weeslack_workspace *next_workspace;
@@ -102,6 +105,8 @@ struct t_weeslack_config
     struct t_config_option *background_load_all_history;
     struct t_config_option *background_history_max;
     struct t_config_option *history_max_pages;
+    struct t_config_option *history_cache;
+    struct t_config_option *history_cache_max;
     struct t_config_option *members_max_pages;
     struct t_config_option *slack_timeout;
     struct t_config_option *debug_level;

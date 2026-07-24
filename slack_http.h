@@ -111,4 +111,7 @@ extern int slack_http_curl_get_body(const char *url,
 /* Cancel all multi transfers (plugin end). */
 extern void slack_http_curl_multi_shutdown(void);
 
+/* Free multi slots before max concurrent (API + binary share the budget). */
+extern int slack_http_multi_slots_free(void);
+
 #endif

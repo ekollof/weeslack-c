@@ -13,6 +13,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <assert.h>
 
@@ -1217,6 +1218,16 @@ slack_http_multi_xfer_count(void)
     return n;
 }
 
+int
+slack_http_multi_slots_free(void)
+{
+    int n = slack_http_multi_xfer_count();
+
+    if (n >= SLACK_HTTP_MAX_CONCURRENT)
+        return 0;
+    return SLACK_HTTP_MAX_CONCURRENT - n;
+}
+
 static int
 slack_http_curl_start(struct t_slack_curl_xfer *x)
 {
@@ -1600,15 +1611,20 @@ slack_http_curl_get_file(const char *url, const char *path,
 
     if (!slack_http_curl_start(x))
     {
-        if (callback)
-            callback(user_data, 0, 0);
+        /*
+         * Multi full or add failed — do not invoke callback (caller may
+         * re-queue). Drop the empty partial file opened above.
+         */
         {
             struct curl_slist *h = NULL;
             curl_easy_getinfo(x->easy, CURLINFO_PRIVATE, (char **)&h);
             if (h)
                 curl_slist_free_all(h);
         }
+        if (x->path)
+            unlink(x->path);
         x->callback = NULL;
+        x->user_data = NULL;
         slack_http_curl_xfer_free(x);
         return 0;
     }
