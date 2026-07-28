@@ -5199,6 +5199,88 @@ weeslack_typing_bar_cb(const void *pointer, void *data,
     return out;
 }
 
+/*
+ * Resolve server buffer pointer string for buflist parent nesting.
+ * arguments: buffer pointer ("0x…") or full_name from buflist/triggers.
+ * Returns allocated pointer string (caller frees), or NULL.
+ */
+static char *
+weeslack_info_search_server_buffer_ptr_cb(const void *pointer, void *data,
+                                           const char *info_name,
+                                           const char *arguments)
+{
+    struct t_gui_buffer *buf = NULL;
+    struct t_gui_buffer *server_buf;
+    const char *plugin_name, *server, *account, *script;
+    char full[384];
+    char *out;
+    unsigned long ptr = 0;
+
+    (void)pointer;
+    (void)data;
+    (void)info_name;
+
+    if (!arguments || !arguments[0])
+        return NULL;
+
+    /* Buflist passes a buffer pointer as 0x…; also accept full_name. */
+    if (sscanf(arguments, "0x%lx", &ptr) == 1 ||
+        sscanf(arguments, "%lx", &ptr) == 1)
+        buf = (struct t_gui_buffer *)(uintptr_t)ptr;
+    if (!buf)
+        buf = weechat_buffer_search("==", arguments);
+    if (!buf)
+        return NULL;
+
+    plugin_name = weechat_buffer_get_string(buf, "plugin");
+    if (!plugin_name || !plugin_name[0])
+        plugin_name = weechat_buffer_get_string(buf, "localvar_plugin");
+    server = weechat_buffer_get_string(buf, "localvar_server");
+    account = weechat_buffer_get_string(buf, "localvar_account");
+    script = weechat_buffer_get_string(buf, "localvar_script_name");
+
+    full[0] = '\0';
+    if (plugin_name && strcmp(plugin_name, "weeslack") == 0)
+    {
+        /* weeslack.server.<team> — localvar server is sanitized team name */
+        if (server && server[0])
+            snprintf(full, sizeof(full), "weeslack.server.%s", server);
+    }
+    else if (plugin_name && strcmp(plugin_name, "xmpp") == 0)
+    {
+        if (account && account[0])
+            snprintf(full, sizeof(full), "xmpp.account.%s", account);
+    }
+    else if (script && strcmp(script, "slack") == 0)
+    {
+        /* python wee-slack: python.slack.<team> is the server buffer */
+        if (server && server[0])
+            snprintf(full, sizeof(full), "python.%s", server);
+    }
+    else if (plugin_name && plugin_name[0] && server && server[0])
+    {
+        /* irc and similar: <plugin>.server.<server> */
+        snprintf(full, sizeof(full), "%s.server.%s", plugin_name, server);
+    }
+
+    if (!full[0])
+        return NULL;
+
+    server_buf = weechat_buffer_search("==", full);
+    if (!server_buf)
+        return NULL;
+
+    /*
+     * Same form buflist expects: pointer as 0x… (info:buffer returns this).
+     * Do not call info:buffer — avoid extra indirection.
+     */
+    out = malloc(32);
+    if (!out)
+        return NULL;
+    snprintf(out, 32, "0x%lx", (unsigned long)(uintptr_t)server_buf);
+    return out;
+}
+
 int
 weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
 {
@@ -5209,6 +5291,27 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     weeslack_plugin_unloading = 0;
 
     slack_http_queue_init();
+
+    /*
+     * Buflist (group_tools) uses info:search_server_buffer_ptr to nest
+     * channels under their server. The stock trigger only matches
+     * irc|matrix|xmpp|python-slack, so weeslack buffers get an empty
+     * pointer and ${buffer[].…} SEGV's on buffer switch. Provide the
+     * info natively at high priority for weeslack (and a safe generic
+     * fallback for others so we do not break fall-through when first).
+     */
+    {
+        struct t_hook *h;
+
+        h = weechat_hook_info(
+            "search_server_buffer_ptr",
+            "Pointer of server/account buffer for a channel buffer "
+            "(buflist nesting; weeslack + generic plugin.server.NAME)",
+            "buffer pointer (0x…) or full_name",
+            &weeslack_info_search_server_buffer_ptr_cb, NULL, NULL);
+        if (h)
+            weechat_hook_set(h, "priority", "2000");
+    }
 
     weechat_hook_command(
         "cslack",
