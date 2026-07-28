@@ -2213,8 +2213,9 @@ slack_event_process_message(struct t_weeslack_workspace *workspace,
         {
             free(display_channel->last_message_ts);
             display_channel->last_message_ts = strdup(ts_tag);
-            weechat_buffer_set(display_channel->buffer,
-                               "localvar_set_slack_timestamp", ts_tag);
+            if (display_channel->buffer)
+                weechat_buffer_set(display_channel->buffer,
+                                   "localvar_set_slack_timestamp", ts_tag);
             /* also update parent when displaying a reply there */
             if (display_channel != channel && channel)
             {
@@ -5235,6 +5236,143 @@ slack_event_history_ensure_buffer(struct t_slack_channel *channel)
     }
 }
 
+/*
+ * Batched cache paint: dump at most SLACK_HIST_PAINT_BATCH messages per timer
+ * tick so WeeChat (buflist/logger/trigger) can breathe. Crashes were seen when
+ * painting 200–500 lines in one call from history_start.
+ */
+enum { SLACK_HIST_PAINT_BATCH = 20 };
+
+struct t_slack_hist_paint
+{
+    struct t_weeslack_workspace *workspace;
+    struct t_slack_channel *channel;
+    struct t_slack_history_ctx *ctx;
+    struct json_object **msgs;
+    int count;
+    int index;
+    int allow_downloads;
+    char *req_latest;
+    char *req_oldest;
+};
+
+static void
+slack_event_hist_paint_free(struct t_slack_hist_paint *p)
+{
+    int i;
+
+    if (!p)
+        return;
+    if (p->msgs)
+    {
+        for (i = p->index; i < p->count; i++)
+        {
+            if (p->msgs[i])
+                json_object_put(p->msgs[i]);
+        }
+        free(p->msgs);
+    }
+    free(p->req_latest);
+    free(p->req_oldest);
+    if (p->ctx)
+        slack_event_history_ctx_free(p->ctx);
+    free(p);
+}
+
+static int
+slack_event_hist_paint_cb(const void *pointer, void *data, int remaining_calls)
+{
+    struct t_slack_hist_paint *p = (void *)pointer;
+    int n, prev_dl;
+    struct t_slack_history_ctx *ctx;
+    char *req_latest, *req_oldest;
+
+    (void)data;
+    (void)remaining_calls;
+
+    if (!p)
+        return WEECHAT_RC_ERROR;
+
+    if (weeslack_plugin_unloading || !p->workspace || !p->channel ||
+        !p->channel->buffer)
+    {
+        if (p->channel && p->channel->history_state == 2)
+            p->channel->history_state = 0;
+        slack_event_hist_paint_free(p);
+        return WEECHAT_RC_OK;
+    }
+
+    prev_dl = g_history_auto_download;
+    g_history_auto_download = p->allow_downloads ? 1 : 0;
+    n = 0;
+    while (p->index < p->count && n < SLACK_HIST_PAINT_BATCH)
+    {
+        if (p->msgs[p->index])
+        {
+            slack_event_handle_message(p->workspace, p->channel,
+                                        p->msgs[p->index], 1);
+            json_object_put(p->msgs[p->index]);
+            p->msgs[p->index] = NULL;
+        }
+        p->index++;
+        n++;
+    }
+    g_history_auto_download = prev_dl;
+
+    if (p->index < p->count)
+    {
+        /* One-shot timers only: reschedule next batch */
+        if (!weechat_hook_timer(1, 0, 1, &slack_event_hist_paint_cb, p, NULL))
+        {
+            if (p->channel)
+                p->channel->history_state = 0;
+            slack_event_hist_paint_free(p);
+        }
+        return WEECHAT_RC_OK;
+    }
+
+    /* Finished painting — footer + API catch-up/dig-older */
+    if (p->channel->buffer && p->count > 0)
+    {
+        weechat_printf(p->channel->buffer,
+                        "%s--- loaded %d messages from cache ---%s",
+                        weechat_prefix("network"), p->count,
+                        weechat_color("reset"));
+    }
+
+    {
+        struct t_weeslack_workspace *ws = p->workspace;
+
+        ctx = p->ctx;
+        p->ctx = NULL; /* ownership moves to API / free below */
+        req_latest = p->req_latest;
+        p->req_latest = NULL;
+        req_oldest = p->req_oldest;
+        p->req_oldest = NULL;
+        free(p->msgs);
+        p->msgs = NULL;
+        free(p);
+        p = NULL;
+
+        if (!ctx)
+            return WEECHAT_RC_OK;
+
+        if (!slack_event_history_request(ws, ctx, NULL, req_latest, req_oldest))
+        {
+            /* request failed: mark done if we already painted */
+            if (ctx->channel)
+            {
+                ctx->channel->history_state = 3;
+                ctx->channel->history_retries = 0;
+            }
+            slack_event_history_ctx_free(ctx);
+        }
+        free(req_latest);
+        free(req_oldest);
+    }
+    return WEECHAT_RC_OK;
+}
+
 static void
 slack_event_history_start(struct t_weeslack_workspace *workspace,
                            struct t_slack_channel *channel,
@@ -5303,13 +5441,9 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
     }
 
     /*
-     * LMDB seed: paint cached messages, then:
-     *  - dig_older (/loadhistory): API with latest=min_ts (older pages)
-     *  - else if cache warm: oldest=max_ts catch-up (1 page of newer)
-     *  - else: full recent history
-     *
-     * With allow_downloads: two-phase seed (download files, then print+/icat)
-     * so Kitty lines land under each [file]. API request continues after paint.
+     * LMDB seed: paint cached messages in small batches (never dump hundreds
+     * of lines in one call — that reenters buflist/trigger and SEGV'd), then
+     * fire conversations.history for dig-older / catch-up.
      */
     if (!is_replies && channel->buffer && slack_cache_ready(workspace))
     {
@@ -5323,25 +5457,18 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
                                             &cached, &max_ts, &min_ts);
         if (cached_n > 0 && cached)
         {
-            int prev_dl;
+            struct t_slack_hist_paint *paint;
 
             ctx->seeded_from_cache = 1;
 
             if (dig_older && min_ts && min_ts[0])
             {
-                /* Explicit loadhistory: page into the past from cache tip. */
                 req_latest = min_ts;
                 ctx->dig_older = 1;
             }
             else if (max_ts && max_ts[0])
             {
-                /* Lazy focus: only pull messages newer than cache. */
                 req_oldest = max_ts;
-                /*
-                 * Honor history_max_pages (was hardcoded 1). Long offline
-                 * gaps need more than one page of 200 to match the full
-                 * Slack client.
-                 */
                 ctx->max_pages = slack_event_history_max_pages();
                 if (ctx->max_pages < 3)
                     ctx->max_pages = 3;
@@ -5350,33 +5477,47 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
                 ctx->dig_older = 0;
             }
 
-            /*
-             * Always paint cache immediately so the buffer is never stuck
-             * empty waiting on image downloads. Local files still /icat
-             * under [file] lines; missing files download async (may land
-             * later). Two-phase gate is reserved for smaller API flushes.
-             */
-            prev_dl = g_history_auto_download;
-            g_history_auto_download = allow_downloads ? 1 : 0;
-            for (i = 0; i < cached_n; i++)
+            paint = calloc(1, sizeof(*paint));
+            if (!paint)
             {
-                if (cached[i])
+                /* Alloc failed: free cache msgs and fall through to API only */
+                for (i = 0; i < cached_n; i++)
                 {
-                    slack_event_handle_message(workspace, channel,
-                                                cached[i], 1);
-                    json_object_put(cached[i]);
+                    if (cached[i])
+                        json_object_put(cached[i]);
                 }
+                free(cached);
+                cached = NULL;
+                cached_n = 0;
             }
-            g_history_auto_download = prev_dl;
-            free(cached);
-            cached = NULL;
-
-            if (channel->buffer)
+            else
             {
-                weechat_printf(channel->buffer,
-                                "%s--- loaded %d messages from cache ---%s",
-                                weechat_prefix("network"), cached_n,
-                                weechat_color("reset"));
+                paint->workspace = workspace;
+                paint->channel = channel;
+                paint->ctx = ctx;
+                paint->msgs = cached;
+                paint->count = cached_n;
+                paint->index = 0;
+                paint->allow_downloads = allow_downloads ? 1 : 0;
+                paint->req_latest = (req_latest && req_latest[0])
+                    ? strdup(req_latest) : NULL;
+                paint->req_oldest = (req_oldest && req_oldest[0])
+                    ? strdup(req_oldest) : NULL;
+                cached = NULL;
+                free(max_ts);
+                free(min_ts);
+                max_ts = min_ts = NULL;
+                /*
+                 * Do not free ctx — paint job owns it until API starts.
+                 * history_state stays 2 while painting.
+                 */
+                if (!weechat_hook_timer(1, 0, 1, &slack_event_hist_paint_cb,
+                                         paint, NULL))
+                {
+                    slack_event_hist_paint_free(paint);
+                    channel->history_state = 0;
+                }
+                return;
             }
         }
         else if (cached)
