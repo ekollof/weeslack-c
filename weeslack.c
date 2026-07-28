@@ -5438,6 +5438,8 @@ weechat_plugin_end(struct t_weechat_plugin *plugin)
 
     /* Cancel deferred history timer before buffers/models go away. */
     slack_event_bootstrap_quiet_cancel();
+    /* Drop pending /icat jobs (Python) before script host tears down. */
+    slack_event_icat_queue_clear();
 
     /* Stop network before tearing down buffers/models. */
     slack_http_queue_shutdown();

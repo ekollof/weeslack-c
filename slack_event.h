@@ -23,6 +23,8 @@ extern void slack_event_bootstrap_quiet(int seconds);
 extern int slack_event_in_bootstrap_quiet(void);
 /* Cancel deferred quiet-end history timer (plugin unload). */
 extern void slack_event_bootstrap_quiet_cancel(void);
+/* Drop pending deferred /icat jobs (plugin unload). */
+extern void slack_event_icat_queue_clear(void);
 /* After quiet period: enqueue history for open member channels if configured. */
 extern void slack_event_schedule_background_history(
     struct t_weeslack_workspace *workspace);

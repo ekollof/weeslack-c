@@ -8983,6 +8983,105 @@ slack_event_read_image_dimensions(const char *path,
     fclose(fp);
 }
 
+/*
+ * /icat is a Python script. Calling weechat_command("/icat") while already
+ * inside /cslack, a Python timer, or nested script API reenters CPython and
+ * has SEGV'd (strdup on garbage). Queue previews and run one per timer tick
+ * after the current call stack unwinds. Live auto-download still works; it
+ * just paints on the next tick instead of mid-handler.
+ */
+struct t_slack_icat_job
+{
+    struct t_gui_buffer *buffer;
+    char *cmd;
+    struct t_slack_icat_job *next;
+};
+
+static struct t_slack_icat_job *g_icat_head = NULL;
+static struct t_slack_icat_job *g_icat_tail = NULL;
+static struct t_hook *g_icat_timer = NULL;
+
+static void
+slack_event_icat_job_free(struct t_slack_icat_job *j)
+{
+    if (!j)
+        return;
+    free(j->cmd);
+    free(j);
+}
+
+void
+slack_event_icat_queue_clear(void)
+{
+    struct t_slack_icat_job *j, *n;
+
+    if (g_icat_timer)
+    {
+        weechat_unhook(g_icat_timer);
+        g_icat_timer = NULL;
+    }
+    for (j = g_icat_head; j; j = n)
+    {
+        n = j->next;
+        slack_event_icat_job_free(j);
+    }
+    g_icat_head = g_icat_tail = NULL;
+}
+
+static int
+slack_event_icat_timer_cb(const void *pointer, void *data, int remaining_calls)
+{
+    struct t_slack_icat_job *j;
+    struct t_gui_buffer *buf;
+
+    (void)pointer;
+    (void)data;
+    (void)remaining_calls;
+
+    j = g_icat_head;
+    if (!j)
+    {
+        if (g_icat_timer)
+        {
+            weechat_unhook(g_icat_timer);
+            g_icat_timer = NULL;
+        }
+        return WEECHAT_RC_OK;
+    }
+
+    g_icat_head = j->next;
+    if (!g_icat_head)
+        g_icat_tail = NULL;
+
+    /*
+     * Only run if the buffer is still ours. Drop the job if the user closed
+     * it or the plugin is unloading.
+     */
+    buf = j->buffer;
+    if (buf && !weeslack_plugin_unloading && slack_buffer_search(buf) &&
+        j->cmd && j->cmd[0])
+        weechat_command(buf, j->cmd);
+
+    slack_event_icat_job_free(j);
+
+    if (!g_icat_head && g_icat_timer)
+    {
+        weechat_unhook(g_icat_timer);
+        g_icat_timer = NULL;
+    }
+    return WEECHAT_RC_OK;
+}
+
+static void
+slack_event_icat_queue_ensure_timer(void)
+{
+    if (g_icat_timer || !g_icat_head)
+        return;
+    /* One preview per 50ms — keeps Kitty/Python happy under history dumps. */
+    g_icat_timer = weechat_hook_timer(50, 0, 0, &slack_event_icat_timer_cb,
+                                       NULL, NULL);
+}
+
 static void
 slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
                               const char *mimetype)
@@ -8994,15 +9093,11 @@ slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
     const char *use_path;
     size_t i, j;
     struct stat st;
+    struct t_slack_icat_job *job;
 
     if (!path || !path[0] || !buffer)
         return;
-    /*
-     * Bulk history paint (cache seed / dig-older) sets g_history_auto_download.
-     * Hundreds of synchronous /icat calls from a timer reenter WeeChat and
-     * have crashed (strdup on garbage). Download files only; skip previews.
-     */
-    if (g_history_auto_download)
+    if (weeslack_plugin_unloading)
         return;
     if (!weechat_config_boolean(weeslack_config.icat_enabled))
         return;
@@ -9055,7 +9150,24 @@ slack_event_try_icat_preview(struct t_gui_buffer *buffer, const char *path,
     snprintf(cmd, sizeof(cmd),
              "/icat -print_immediately -quiet -columns %u -rows %u %s",
              cols, rows, path_safe);
-    weechat_command(buffer, cmd);
+
+    job = calloc(1, sizeof(*job));
+    if (!job)
+        return;
+    job->buffer = buffer;
+    job->cmd = strdup(cmd);
+    if (!job->cmd)
+    {
+        free(job);
+        return;
+    }
+    if (g_icat_tail)
+        g_icat_tail->next = job;
+    else
+        g_icat_head = job;
+    g_icat_tail = job;
+    job->next = NULL;
+    slack_event_icat_queue_ensure_timer();
 }
 
 /* ---- Custom emoji → cache + /icat (when look.icat_enabled + /icat) ----
@@ -10041,13 +10153,6 @@ slack_event_auto_download_message_files(struct t_weeslack_workspace *workspace,
             if (strlen(base) + 1 + flen < sizeof(preferred))
                 snprintf(preferred, sizeof(preferred), "%s.%s", base, filetype);
         }
-
-        /*
-         * History bulk paint: never /icat (reentrancy crash). Still download
-         * so files land on disk for later manual /icat or live reuse.
-         */
-        if (g_history_auto_download)
-            skip_icat = 1;
 
         slack_event_download_file_ex(workspace, url, buffer, origin,
                                       preferred[0] ? preferred : NULL,
