@@ -221,6 +221,8 @@ struct t_slack_channel
     /* 0=not loaded, 1=queued, 2=in flight, 3=done (success or empty) */
     int history_state;
     int history_retries;
+    /* Throttle focus catch-up (conversations.history oldest=max_ts). */
+    time_t last_history_catchup;
     int members_loaded;
     /* conversations.info fetched (topic/purpose fill-in) */
     int info_fetched;

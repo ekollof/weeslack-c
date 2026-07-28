@@ -79,6 +79,8 @@ struct t_slack_hist_gate
     struct t_slack_history_ctx *continue_ctx;
     char *req_latest;
     char *req_oldest;
+    /* After dig-older repaint: catch up messages newer than cache tip. */
+    int catchup_after_paint;
     int remaining;
 };
 
@@ -98,6 +100,10 @@ static int slack_event_history_request(struct t_weeslack_workspace *workspace,
                                         const char *latest,
                                         const char *oldest);
 static void slack_event_history_ctx_free(struct t_slack_history_ctx *ctx);
+/* Defined with history fetch; used by dig-older repaint / RTM hello. */
+void slack_event_fetch_history_catchup(struct t_weeslack_workspace *workspace,
+                                        struct t_slack_channel *channel,
+                                        int force);
 
 /* ============================================================
  * Common error checking for Slack API responses
@@ -2315,6 +2321,9 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
 
     if (strcmp(type, "hello") == 0)
     {
+        struct t_gui_buffer *cur;
+        struct t_slack_buffer *sbuf;
+
         workspace->connected = 1;
         workspace->connecting = 0;
         if (workspace->ws)
@@ -2325,6 +2334,16 @@ slack_event_handle(struct t_weeslack_workspace *workspace,
                         workspace->my_user_id ? workspace->my_user_id : "?");
         /* Subscribe to presence so Here/Away nicklist can update (wee-slack). */
         slack_event_presence_subscribe(workspace);
+        /*
+         * After reconnect, fill the focused channel (if any) with messages
+         * missed while RTM was down. Other buffers catch up on focus.
+         * Avoid stampeding all open channels through conversations.history.
+         */
+        cur = weechat_current_buffer();
+        sbuf = cur ? slack_buffer_search(cur) : NULL;
+        if (sbuf && sbuf->workspace == workspace && sbuf->channel &&
+            sbuf->channel->history_state == 3)
+            slack_event_fetch_history_catchup(workspace, sbuf->channel, 1);
         return;
     }
 
@@ -4412,6 +4431,11 @@ struct t_slack_history_ctx
     int allow_downloads; /* 1 = auto-download/icat files while flushing */
     int dig_older; /* 1 = paging before cache tip; final flush repaints sorted */
     int seeded_from_cache; /* 1 = buffer already painted from LMDB */
+    /*
+     * 1 = only fetch messages newer than oldest= (no cache re-seed/repaint).
+     * Used after history_state=3 so reconnect/focus fill offline gaps.
+     */
+    int catchup_only;
     int truncated;
     /* retained message objects (json_object_get) until flush */
     struct json_object **msgs;
@@ -4547,6 +4571,7 @@ slack_event_history_phase2_print(struct t_slack_hist_gate *gate)
         struct json_object **msgs = gate->paint_msgs;
         int count = gate->paint_count;
         int do_free = gate->free_paint_msgs;
+        int do_catchup = gate->catchup_after_paint;
         struct t_slack_channel *pch = gate->paint_channel;
 
         prev_auto_dl = g_history_auto_download;
@@ -4597,6 +4622,14 @@ slack_event_history_phase2_print(struct t_slack_hist_gate *gate)
         }
         free(req_latest);
         free(req_oldest);
+
+        /*
+         * dig-older repaint finished — pull messages newer than the cache
+         * tip (missed while offline). Must run after paint so order stays
+         * oldest→newest.
+         */
+        if (do_catchup && pch)
+            slack_event_fetch_history_catchup(workspace, pch, 1);
         return;
     }
 
@@ -4671,11 +4704,13 @@ slack_event_channel_free_messages(struct t_slack_channel *channel)
  * repaint full cache oldest→newest so order is correct and unique by ts.
  * With allow_downloads: two-phase (fetch files, then print+/icat) so Kitty
  * lines sit under each [file], not at the buffer end.
+ * catchup_after: after paint, fetch messages newer than the cache tip.
  */
 static void
 slack_event_history_repaint_from_cache(struct t_weeslack_workspace *workspace,
                                         struct t_slack_channel *channel,
-                                        int allow_downloads)
+                                        int allow_downloads,
+                                        int catchup_after)
 {
     struct json_object **cached = NULL;
     char *max_ts = NULL, *min_ts = NULL;
@@ -4702,6 +4737,8 @@ slack_event_history_repaint_from_cache(struct t_weeslack_workspace *workspace,
     if (n <= 0 || !cached)
     {
         free(cached);
+        if (catchup_after)
+            slack_event_fetch_history_catchup(workspace, channel, 1);
         return;
     }
 
@@ -4722,6 +4759,8 @@ slack_event_history_repaint_from_cache(struct t_weeslack_workspace *workspace,
         weechat_printf(channel->buffer,
                         "%s--- history %d messages (sorted, deduped) ---%s",
                         weechat_prefix("network"), n, weechat_color("reset"));
+        if (catchup_after)
+            slack_event_fetch_history_catchup(workspace, channel, 1);
         return;
     }
 
@@ -4740,6 +4779,8 @@ slack_event_history_repaint_from_cache(struct t_weeslack_workspace *workspace,
         }
         g_history_auto_download = prev_dl;
         free(cached);
+        if (catchup_after)
+            slack_event_fetch_history_catchup(workspace, channel, 1);
         return;
     }
 
@@ -4751,6 +4792,7 @@ slack_event_history_repaint_from_cache(struct t_weeslack_workspace *workspace,
     gate->paint_count = n;
     gate->free_paint_msgs = 1;
     gate->paint_footer = strdup(footer);
+    gate->catchup_after_paint = catchup_after ? 1 : 0;
     gate->remaining = 1;
     for (i = 0; i < n; i++)
     {
@@ -4783,14 +4825,16 @@ slack_event_history_flush(struct t_weeslack_workspace *workspace,
      */
     if (ctx->dig_older && ctx->seeded_from_cache && channel && channel->buffer)
     {
+        int allow_dl = ctx->allow_downloads;
+
         /* Still write-through any msgs not yet put (safety). */
         for (i = 0; i < ctx->msg_count; i++)
         {
             if (ctx->msgs[i] && channel->id)
                 slack_cache_put_message(workspace, channel->id, ctx->msgs[i]);
         }
-        slack_event_history_repaint_from_cache(workspace, channel,
-                                                ctx->allow_downloads);
+        /* catchup_after=1: after paint, pull messages newer than cache tip. */
+        slack_event_history_repaint_from_cache(workspace, channel, allow_dl, 1);
         if (ctx->truncated && channel->buffer)
         {
             weechat_printf(channel->buffer,
@@ -5221,7 +5265,16 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
             {
                 /* Lazy focus: only pull messages newer than cache. */
                 req_oldest = max_ts;
-                ctx->max_pages = 1;
+                /*
+                 * Honor history_max_pages (was hardcoded 1). Long offline
+                 * gaps need more than one page of 200 to match the full
+                 * Slack client.
+                 */
+                ctx->max_pages = slack_event_history_max_pages();
+                if (ctx->max_pages < 3)
+                    ctx->max_pages = 3;
+                if (ctx->max_pages > SLACK_HISTORY_MAX_PAGES_SOFT)
+                    ctx->max_pages = SLACK_HISTORY_MAX_PAGES_SOFT;
                 ctx->dig_older = 0;
             }
 
@@ -5367,6 +5420,107 @@ slack_event_fetch_history(struct t_weeslack_workspace *workspace,
         slack_event_history_start(workspace, channel, 0, 0, 1, 0);
 }
 
+/*
+ * Fetch only messages newer than the cache tip / last painted ts.
+ * Fills gaps after reconnect or long unfocused periods without re-seeding
+ * the whole buffer (full Slack client does this on channel open).
+ *
+ * force=1: ignore focus throttle (RTM hello, after dig-older).
+ */
+void
+slack_event_fetch_history_catchup(struct t_weeslack_workspace *workspace,
+                                   struct t_slack_channel *channel,
+                                   int force)
+{
+    enum { CATCHUP_THROTTLE_SEC = 20, CATCHUP_MIN_PAGES = 3 };
+    struct t_slack_history_ctx *ctx;
+    struct json_object **tip_msgs = NULL;
+    char *max_ts = NULL;
+    char *min_ts = NULL;
+    const char *oldest = NULL;
+    int pages;
+
+    if (!workspace || !channel || !channel->id)
+        return;
+    if (!workspace->connected && !force)
+        return;
+    if (channel->history_state == 2)
+        return;
+    /* First load still goes through full fetch_history. */
+    if (!force && channel->history_state != 3)
+        return;
+    if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
+        return;
+
+    if (!force && channel->last_history_catchup > 0)
+    {
+        time_t now = time(NULL);
+        if (now >= channel->last_history_catchup &&
+            (now - channel->last_history_catchup) < CATCHUP_THROTTLE_SEC)
+            return;
+    }
+
+    if (slack_cache_ready(workspace))
+    {
+        /* limit=1: walk from newest — max_ts is the channel tip. */
+        if (slack_cache_load_channel(workspace, channel->id, 1, &tip_msgs,
+                                      &max_ts, &min_ts) > 0 &&
+            tip_msgs && tip_msgs[0])
+            json_object_put(tip_msgs[0]);
+        free(tip_msgs);
+        free(min_ts);
+        min_ts = NULL;
+    }
+
+    if (max_ts && max_ts[0])
+        oldest = max_ts;
+    else if (channel->last_message_ts && channel->last_message_ts[0])
+        oldest = channel->last_message_ts;
+    else
+    {
+        free(max_ts);
+        /* No tip known — fall back to a normal first load. */
+        if (channel->history_state == 3)
+            channel->history_state = 0;
+        slack_event_fetch_history(workspace, channel);
+        return;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+    {
+        free(max_ts);
+        return;
+    }
+    ctx->channel = channel;
+    ctx->is_replies = 0;
+    ctx->page = 0;
+    ctx->catchup_only = 1;
+    ctx->seeded_from_cache = 1;
+    ctx->dig_older = 0;
+    ctx->allow_downloads = 1;
+    pages = slack_event_history_max_pages();
+    if (pages < CATCHUP_MIN_PAGES)
+        pages = CATCHUP_MIN_PAGES;
+    if (force && pages < SLACK_HISTORY_FORCE_MIN_PAGES)
+        pages = SLACK_HISTORY_FORCE_MIN_PAGES;
+    if (pages > SLACK_HISTORY_MAX_PAGES_SOFT)
+        pages = SLACK_HISTORY_MAX_PAGES_SOFT;
+    ctx->max_pages = pages;
+
+    channel->history_state = 2;
+    channel->last_history_catchup = time(NULL);
+
+    if (!slack_event_history_request(workspace, ctx, NULL, NULL, oldest))
+    {
+        channel->history_state = 3;
+        slack_event_history_ctx_free(ctx);
+        free(max_ts);
+        return;
+    }
+    free(max_ts);
+}
+
 /* Background history: one page, no file downloads (rate / multi budget). */
 static void
 slack_event_fetch_history_background(struct t_weeslack_workspace *workspace,
@@ -5392,10 +5546,12 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
 
     channel->history_state = 0;
     channel->history_retries = 0;
+    channel->last_history_catchup = 0;
 
     /*
      * Explicit user request: dig deeper than lazy focus. dig_older=1 pages
-     * before the cache tip (latest=min_ts) when LMDB is warm.
+     * before the cache tip (latest=min_ts) when LMDB is warm. After dig
+     * repaint, catch-up also pulls messages newer than the tip.
      */
     pages = slack_event_history_max_pages();
     if (pages < SLACK_HISTORY_FORCE_MIN_PAGES)

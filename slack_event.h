@@ -27,6 +27,14 @@ extern void slack_event_schedule_background_history(
 
 extern void slack_event_fetch_history(struct t_weeslack_workspace *workspace,
                                        struct t_slack_channel *channel);
+/*
+ * Pull messages newer than cache / last painted ts (slow queue).
+ * force=1 ignores focus throttle (reconnect, after /loadhistory dig).
+ */
+extern void slack_event_fetch_history_catchup(
+    struct t_weeslack_workspace *workspace,
+    struct t_slack_channel *channel,
+    int force);
 extern void slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
                                              struct t_slack_channel *channel);
 extern void slack_event_fetch_replies(struct t_weeslack_workspace *workspace,

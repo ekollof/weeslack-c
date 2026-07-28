@@ -4093,6 +4093,15 @@ weeslack_buffer_switch_cb(const void *pointer, void *data,
             {
                 if (channel->history_state == 0)
                     slack_event_fetch_history(ws, channel);
+                else if (channel->history_state == 3)
+                {
+                    /*
+                     * Already loaded once: still pull messages newer than
+                     * the cache tip (offline / unfocused gaps). Full Slack
+                     * client always merges on channel open.
+                     */
+                    slack_event_fetch_history_catchup(ws, channel, 0);
+                }
                 if (channel->type == SLACK_CHANNEL_TYPE_CHANNEL ||
                     channel->type == SLACK_CHANNEL_TYPE_GROUP ||
                     channel->type == SLACK_CHANNEL_TYPE_MPDM)
