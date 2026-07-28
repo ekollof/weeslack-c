@@ -4182,6 +4182,10 @@ static void slack_event_fetch_history_background(
     struct t_weeslack_workspace *workspace,
     struct t_slack_channel *channel);
 
+/*
+ * After mass buffer create, buffer_switch storms must not fetch history.
+ * Quiet-end: at most text history for the *current* buffer (no downloads).
+ */
 static struct t_hook *g_bootstrap_quiet_end_hook = NULL;
 
 static int
@@ -4196,11 +4200,6 @@ slack_event_bootstrap_quiet_end_cb(const void *pointer, void *data,
     (void)remaining_calls;
     g_bootstrap_quiet_end_hook = NULL;
 
-    /*
-     * buffer_switch during quiet skips history. If the user stayed on a
-     * channel buffer the whole time, load it now so they are not stuck
-     * with an empty view until they re-focus.
-     */
     cur = weechat_current_buffer();
     sbuf = cur ? slack_buffer_search(cur) : NULL;
     if (sbuf && sbuf->workspace && sbuf->workspace->connected &&
@@ -4218,7 +4217,6 @@ slack_event_bootstrap_quiet(int seconds)
     if (until > g_bootstrap_quiet_until)
         g_bootstrap_quiet_until = until;
 
-    /* Arm one-shot when quiet ends (re-arm if quiet is extended). */
     if (g_bootstrap_quiet_end_hook)
     {
         weechat_unhook(g_bootstrap_quiet_end_hook);
@@ -5420,11 +5418,15 @@ slack_event_fetch_history(struct t_weeslack_workspace *workspace,
     if (channel->history_state == 2)
         return;
 
-    /* Focus / lazy load: honor look.history_max_pages; download files. */
+    /*
+     * Focus / lazy load: text (+ API) only. File auto-download/icat during
+     * bulk history paint has repeatedly SEGV'd (nested /icat, heap damage
+     * visible later in trigger/weechat). Live RTM still auto-downloads.
+     */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, 0, 1, 0);
+        slack_event_history_start(workspace, channel, 1, 0, 0, 0);
     else
-        slack_event_history_start(workspace, channel, 0, 0, 1, 0);
+        slack_event_history_start(workspace, channel, 0, 0, 0, 0);
 }
 
 /*
@@ -5505,7 +5507,8 @@ slack_event_fetch_history_catchup(struct t_weeslack_workspace *workspace,
     ctx->catchup_only = 1;
     ctx->seeded_from_cache = 1;
     ctx->dig_older = 0;
-    ctx->allow_downloads = 1;
+    /* Text only — same rationale as fetch_history (no bulk download/icat). */
+    ctx->allow_downloads = 0;
     pages = slack_event_history_max_pages();
     if (pages < CATCHUP_MIN_PAGES)
         pages = CATCHUP_MIN_PAGES;
@@ -5566,10 +5569,11 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
     if (pages > SLACK_HISTORY_MAX_PAGES_SOFT)
         pages = SLACK_HISTORY_MAX_PAGES_SOFT;
 
+    /* allow_downloads=0: text history only (see fetch_history comment). */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, pages, 1, 0);
+        slack_event_history_start(workspace, channel, 1, pages, 0, 0);
     else
-        slack_event_history_start(workspace, channel, 0, pages, 1, 1);
+        slack_event_history_start(workspace, channel, 0, pages, 0, 1);
 }
 
 void
@@ -5580,8 +5584,8 @@ slack_event_fetch_replies(struct t_weeslack_workspace *workspace,
         return;
     if (thread->history_state == 3 || thread->history_state == 2)
         return;
-    /* Thread open is explicit user action — allow file previews. */
-    slack_event_history_start(workspace, thread, 1, 0, 1, 0);
+    /* Thread open: text only; live shares still auto-download. */
+    slack_event_history_start(workspace, thread, 1, 0, 0, 0);
 }
 
 /* ============================================================
