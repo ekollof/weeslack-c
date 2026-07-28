@@ -4202,6 +4202,7 @@ slack_event_bootstrap_quiet_end_cb(const void *pointer, void *data,
 
     cur = weechat_current_buffer();
     sbuf = cur ? slack_buffer_search(cur) : NULL;
+    /* fetch_history itself defers paint off this timer tick. */
     if (sbuf && sbuf->workspace && sbuf->workspace->connected &&
         sbuf->channel && sbuf->channel->history_state == 0)
         slack_event_fetch_history(sbuf->workspace, sbuf->channel);
@@ -5406,6 +5407,89 @@ slack_event_history_start(struct t_weeslack_workspace *workspace,
     free(min_ts);
 }
 
+/*
+ * Never paint hundreds of history lines inside buffer_switch / signal
+ * handlers: that reenters buflist+trigger and SEGV'd (strdup garbage).
+ * Defer the real work to the next main-loop tick.
+ */
+struct t_slack_hist_defer
+{
+    struct t_weeslack_workspace *workspace;
+    struct t_slack_channel *channel;
+    int is_replies;
+    int max_pages;
+    int allow_downloads;
+    int dig_older;
+};
+
+static int
+slack_event_history_defer_cb(const void *pointer, void *data,
+                              int remaining_calls)
+{
+    struct t_slack_hist_defer *d = (void *)pointer;
+
+    (void)data;
+    (void)remaining_calls;
+
+    if (!d)
+        return WEECHAT_RC_ERROR;
+
+    if (!weeslack_plugin_unloading && d->workspace && d->channel &&
+        d->channel->id &&
+        (d->channel->history_state == 0 || d->channel->history_state == 1))
+    {
+        /* state 1 = deferred queue; start clears to 2 */
+        d->channel->history_state = 0;
+        slack_event_history_start(d->workspace, d->channel, d->is_replies,
+                                   d->max_pages, d->allow_downloads,
+                                   d->dig_older);
+    }
+    free(d);
+    return WEECHAT_RC_OK;
+}
+
+static void
+slack_event_history_start_deferred(struct t_weeslack_workspace *workspace,
+                                    struct t_slack_channel *channel,
+                                    int is_replies,
+                                    int max_pages,
+                                    int allow_downloads,
+                                    int dig_older)
+{
+    struct t_slack_hist_defer *d;
+
+    if (!workspace || !channel)
+        return;
+    if (channel->history_state == 2 || channel->history_state == 3)
+        return;
+    if (channel->history_state == 1)
+        return; /* already scheduled */
+
+    d = calloc(1, sizeof(*d));
+    if (!d)
+    {
+        /* Fall back to sync only if alloc fails */
+        slack_event_history_start(workspace, channel, is_replies, max_pages,
+                                   allow_downloads, dig_older);
+        return;
+    }
+    d->workspace = workspace;
+    d->channel = channel;
+    d->is_replies = is_replies ? 1 : 0;
+    d->max_pages = max_pages;
+    d->allow_downloads = allow_downloads ? 1 : 0;
+    d->dig_older = dig_older ? 1 : 0;
+    channel->history_state = 1; /* queued */
+
+    if (!weechat_hook_timer(1, 0, 1, &slack_event_history_defer_cb, d, NULL))
+    {
+        channel->history_state = 0;
+        free(d);
+        slack_event_history_start(workspace, channel, is_replies, max_pages,
+                                   allow_downloads, dig_older);
+    }
+}
+
 void
 slack_event_fetch_history(struct t_weeslack_workspace *workspace,
                            struct t_slack_channel *channel)
@@ -5415,18 +5499,18 @@ slack_event_fetch_history(struct t_weeslack_workspace *workspace,
 
     if (channel->history_state == 3)
         return;
-    if (channel->history_state == 2)
+    if (channel->history_state == 2 || channel->history_state == 1)
         return;
 
     /*
-     * Focus / lazy load: text (+ API) only. File auto-download/icat during
-     * bulk history paint has repeatedly SEGV'd (nested /icat, heap damage
-     * visible later in trigger/weechat). Live RTM still auto-downloads.
+     * Focus / lazy load: text (+ API) only. Defer off buffer_switch so
+     * buflist/trigger are not reentered mid-signal. Live RTM still
+     * auto-downloads.
      */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, 0, 0, 0);
+        slack_event_history_start_deferred(workspace, channel, 1, 0, 0, 0);
     else
-        slack_event_history_start(workspace, channel, 0, 0, 0, 0);
+        slack_event_history_start_deferred(workspace, channel, 0, 0, 0, 0);
 }
 
 /*
@@ -5562,6 +5646,7 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
      * Explicit user request: dig deeper than lazy focus. dig_older=1 pages
      * before the cache tip (latest=min_ts) when LMDB is warm. After dig
      * repaint, catch-up also pulls messages newer than the tip.
+     * Still deferred so /cslack loadhistory is not mid-command when painting.
      */
     pages = slack_event_history_max_pages();
     if (pages < SLACK_HISTORY_FORCE_MIN_PAGES)
@@ -5571,9 +5656,9 @@ slack_event_fetch_history_force(struct t_weeslack_workspace *workspace,
 
     /* allow_downloads=0: text history only (see fetch_history comment). */
     if (channel->type == SLACK_CHANNEL_TYPE_THREAD)
-        slack_event_history_start(workspace, channel, 1, pages, 0, 0);
+        slack_event_history_start_deferred(workspace, channel, 1, pages, 0, 0);
     else
-        slack_event_history_start(workspace, channel, 0, pages, 0, 1);
+        slack_event_history_start_deferred(workspace, channel, 0, pages, 0, 1);
 }
 
 void
