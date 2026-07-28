@@ -21,6 +21,8 @@ extern void slack_event_handle_reaction(struct t_weeslack_workspace *workspace,
 /* Suppress auto history/members for a few seconds after mass buffer create */
 extern void slack_event_bootstrap_quiet(int seconds);
 extern int slack_event_in_bootstrap_quiet(void);
+/* Cancel deferred quiet-end history timer (plugin unload). */
+extern void slack_event_bootstrap_quiet_cancel(void);
 /* After quiet period: enqueue history for open member channels if configured. */
 extern void slack_event_schedule_background_history(
     struct t_weeslack_workspace *workspace);

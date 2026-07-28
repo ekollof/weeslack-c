@@ -1591,10 +1591,12 @@ weeslack_command_cslack(const void *pointer, void *data,
              weechat_strcasecmp(argv[1], "rehistory") == 0)
     {
         struct t_weeslack_workspace *ws;
-        ws = weeslack_workspace_from_buffer(buffer);
+        struct t_gui_buffer *buf = weeslack_cmd_buffer(buffer);
+
+        ws = weeslack_workspace_from_buffer(buf);
         if (!ws || !ws->connected)
         {
-            weechat_printf(buffer, "%sweeslack: not connected",
+            weechat_printf(buf, "%sweeslack: not connected",
                             weechat_prefix("error"));
             return WEECHAT_RC_OK;
         }
@@ -1612,7 +1614,7 @@ weeslack_command_cslack(const void *pointer, void *data,
 
         if (!channel)
         {
-            weechat_printf(buffer, "%sweeslack: no channel selected, "
+            weechat_printf(buf, "%sweeslack: no channel selected, "
                             "switch to a Slack buffer or "
                             "/cslack loadhistory <channel_id>",
                             weechat_prefix("error"));
@@ -1620,7 +1622,7 @@ weeslack_command_cslack(const void *pointer, void *data,
         }
 
         slack_event_fetch_history_force(ws, channel);
-        weechat_printf(buffer, "%sweeslack: fetching history for %s...",
+        weechat_printf(buf, "%sweeslack: fetching history for %s...",
                         weechat_prefix("network"), channel->name);
     }
     else if (weechat_strcasecmp(argv[1], "typing") == 0)
@@ -5433,6 +5435,9 @@ weechat_plugin_end(struct t_weechat_plugin *plugin)
 
     /* Closing buffers on unload must not leave Slack channels remotely. */
     weeslack_plugin_unloading = 1;
+
+    /* Cancel deferred history timer before buffers/models go away. */
+    slack_event_bootstrap_quiet_cancel();
 
     /* Stop network before tearing down buffers/models. */
     slack_http_queue_shutdown();

@@ -23,23 +23,64 @@ SlackTS
 slack_ts_new(const char *ts_str)
 {
     SlackTS ts = { 0, 0 };
+    const char *dot;
+    const char *p;
+    long frac = 0;
+    int i;
 
     if (!ts_str || !ts_str[0])
         return ts;
 
-    const char *dot = strchr(ts_str, '.');
-    if (dot)
-    {
-        ts.sec = (time_t)strtol(ts_str, NULL, 10);
-        ts.usec = strtol(dot + 1, NULL, 10);
-    }
-    else
-    {
-        ts.sec = (time_t)strtol(ts_str, NULL, 10);
-        ts.usec = 0;
-    }
+    ts.sec = (time_t)strtoll(ts_str, NULL, 10);
+    dot = strchr(ts_str, '.');
+    if (!dot)
+        return ts;
 
+    /*
+     * Fractional part is a left-aligned 6-digit field, not a free integer.
+     * "…1234567" must become 123456, not 1234567 (which breaks %06ld and
+     * Slack's oldest/latest validation).
+     */
+    p = dot + 1;
+    for (i = 0; i < 6 && p[i] >= '0' && p[i] <= '9'; i++)
+        frac = frac * 10 + (p[i] - '0');
+    while (i < 6)
+    {
+        frac *= 10;
+        i++;
+    }
+    ts.usec = frac;
     return ts;
+}
+
+int
+slack_ts_normalize(const char *ts_str, char *out, size_t out_size)
+{
+    SlackTS ts;
+    char *tmp;
+
+    if (!out || out_size < 4)
+        return 0;
+    out[0] = '\0';
+    if (!ts_str || !ts_str[0])
+        return 0;
+    if (ts_str[0] < '0' || ts_str[0] > '9')
+        return 0;
+
+    ts = slack_ts_new(ts_str);
+    if (ts.sec <= 0)
+        return 0;
+    if (ts.usec < 0)
+        ts.usec = 0;
+    if (ts.usec > 999999)
+        ts.usec = 999999;
+
+    tmp = slack_ts_to_string(ts);
+    if (!tmp)
+        return 0;
+    snprintf(out, out_size, "%s", tmp);
+    free(tmp);
+    return out[0] != '\0';
 }
 
 SlackTS

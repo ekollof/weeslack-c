@@ -20,6 +20,13 @@ extern int slack_ts_eq(SlackTS a, SlackTS b);
 extern int slack_ts_is_empty(SlackTS ts);
 extern char *slack_ts_to_string(SlackTS ts);
 extern SlackTS slack_ts_zero(void);
+/*
+ * Normalize a Slack ts for API params (oldest/latest). Slack expects
+ * seconds + exactly 6 fractional digits. Cache keys / last_message_ts can
+ * carry longer fractions and trigger invalid_ts_oldest.
+ * Returns 1 and writes to out on success, 0 if unusable.
+ */
+extern int slack_ts_normalize(const char *ts_str, char *out, size_t out_size);
 
 /* ---- SlackUser ---- */
 
